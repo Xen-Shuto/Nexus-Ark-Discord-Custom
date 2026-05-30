@@ -1585,6 +1585,38 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
             "", # scenery
             gr.update(choices=[], value=None), # saved_locations
             None, # image_path
+            # --- Twitter連携同期 ---
+            gr.update(value=False),
+            gr.update(value="browser"),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=False),
+            gr.update(value=False),
+            gr.update(value=False),
+            gr.update(value=True),
+            gr.update(value=False),
+            gr.update(value=3),
+            # --- Discord Bot同期 ---
+            gr.update(value=False),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=False),
+            gr.update(value=""),
+            gr.update(value=False),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=False),
+            gr.update(value=True),
+            gr.update(value=10),
+            gr.update(value=""),
+            gr.update(value=""),
+            # -----------------------
             gr.update(selected="virtual_location_tab") # tabs
         )
 
@@ -1811,6 +1843,21 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
     t_step = _perf_log("_update_chat_tab_for_room_change: get_temp_location_ui_state", t_step)
     _perf_log("_update_chat_tab_for_room_change: total", t0)
 
+    # --- Twitter設定取得 ---
+    tw = effective_settings.get("twitter_settings", {})
+    tw_api = tw.get("api_config", {})
+    
+    # --- Discord設定取得 ---
+    ds = config_manager.get_room_discord_bot_settings(room_name)
+    ds_enabled = ds.get("enabled", False)
+    ds_token = ds.get("token", "")
+    if ds_enabled and ds_token:
+        ds_status = "Botの状態: 🟢 有効（起動中または起動対象）"
+    elif ds_token:
+        ds_status = "Botの状態: ⚪ 無効（Botトークン保存済み・チェックOFF）"
+    else:
+        ds_status = "Botの状態: ⚪ 無効"
+
     return (
         room_name, chat_history, mapping_list,
         gr.update(interactive=True, placeholder="メッセージを入力してください (Shift+Enterで送信)。添付するにはファイルをドロップまたはクリップボタンを押してください..."),
@@ -1964,7 +2011,38 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
         creative_dropdown_update, # creative_notes_file_dropdown
         research_dropdown_update, # research_notes_file_dropdown
         # --- [新規] 一時的現在地 UI 同期用 ---
-        *temp_location_state # scenery, saved_locations, image_path (3要素)
+        *temp_location_state, # scenery, saved_locations, image_path (3要素)
+        # --- Twitter連携同期 ---
+        gr.update(value=tw.get("enabled", False)),
+        gr.update(value=tw.get("auth_mode", "browser")),
+        gr.update(value=tw_api.get("api_key", ""), type="password"),
+        gr.update(value=tw_api.get("api_secret", ""), type="password"),
+        gr.update(value=tw_api.get("access_token", ""), type="password"),
+        gr.update(value=tw_api.get("access_token_secret", ""), type="password"),
+        gr.update(value=tw.get("posting_summary", "")),
+        gr.update(value=tw.get("posting_guidelines", "")),
+        gr.update(value=tw.get("auto_post", False)),
+        gr.update(value=tw.get("notify_on_approval_request", False)),
+        gr.update(value=tw.get("is_premium", False)),
+        gr.update(value=tw.get("enable_privacy_filter", True)),
+        gr.update(value=tw.get("fetch_thread_enabled", False)),
+        gr.update(value=tw.get("thread_fetch_count", 3)),
+        # --- Discord Bot同期 ---
+        gr.update(value=ds_enabled),
+        gr.update(value=ds_token, type="password"),
+        gr.update(value=", ".join([str(v) for v in ds.get("authorized_user_ids", [])])),
+        gr.update(value=", ".join([str(v) for v in ds.get("allowed_channel_ids", [])])),
+        gr.update(value=ds.get("default_channel_id", "")),
+        gr.update(value=ds.get("mention_only", False)),
+        gr.update(value=_format_discord_channel_response_modes(ds.get("channel_response_modes", {}))),
+        gr.update(value=ds.get("allow_autonomous_send", False)),
+        gr.update(value=ds.get("persona_webhook_url", ""), type="password"),
+        gr.update(value=", ".join([str(v) for v in ds.get("approval_command_allowlist", [])])),
+        gr.update(value=ds.get("voice_input_enabled", False)),
+        gr.update(value=ds.get("voice_input_confirm_transcript", True)),
+        gr.update(value=int(ds.get("voice_input_timeout_minutes", 10) or 10)),
+        gr.update(value=str(ds.get("voice_input_stt_model") or constants.DISCORD_VOICE_STT_MODEL)),
+        gr.update(value=ds_status)
     )
 
 
@@ -2056,7 +2134,8 @@ def _get_safe_dropdown_update(room_name: str, note_type: str, default_filename: 
         return gr.update()
 
 
-def handle_initial_load(room_name: str = None, expected_count: int = 211, request: gr.Request = None):
+#def handle_initial_load(room_name: str = None, expected_count: int = 211, request: gr.Request = None):
+def handle_initial_load(room_name: str = None, expected_count: int = 240, request: gr.Request = None):
     """
     【v11: 時間デフォルト対応版】
     UIセッションが開始されるたびに、UIコンポーネントの初期状態を完全に再構築する、唯一の司令塔。
@@ -9507,7 +9586,8 @@ def handle_world_builder_load(room_name: str):
         gr.update(choices=place_choices_for_selected_area, value=current_location)
     )
 
-def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_count: int, request: gr.Request = None, preserve_chat_area: bool = False):
+#def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_count: int, request: gr.Request = None, preserve_chat_area: bool = False):
+def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_count: int = 207, request: gr.Request = None, preserve_chat_area: bool = False):
     """
     【v11: 最終契約遵守版】
     ルーム変更時に、全てのUI更新と内部状態の更新を、この単一の関数で完結させる。

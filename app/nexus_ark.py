@@ -5606,7 +5606,38 @@ try:
             temp_scenery_display,
             saved_locations_dropdown,
             temp_scenery_image_display,
-            scenery_mode_tabs
+            scenery_mode_tabs,
+            # --- Twitter 設定 ---
+            twitter_enabled_checkbox,
+            twitter_auth_mode,
+            twitter_api_key,
+            twitter_api_secret,
+            twitter_access_token,
+            twitter_access_token_secret,
+            twitter_posting_summary,
+            twitter_posting_guidelines,
+            twitter_auto_post_checkbox,
+            twitter_notify_approval_checkbox,
+            twitter_premium_checkbox,
+            twitter_privacy_filter_checkbox,
+            twitter_fetch_thread_checkbox,
+            twitter_thread_fetch_count_slider,
+            # --- Discord 設定 ---
+            discord_bot_enabled_checkbox,
+            discord_bot_token_input,
+            discord_authorized_ids_input,
+            discord_allowed_channel_ids_input,
+            discord_default_channel_id_input,
+            discord_mention_only_checkbox,
+            discord_channel_response_modes_input,
+            discord_allow_autonomous_send_checkbox,
+            discord_persona_webhook_input,
+            discord_approval_ids_input,
+            discord_voice_input_enabled_checkbox,
+            discord_voice_confirm_transcript_checkbox,
+            discord_voice_timeout_slider,
+            discord_voice_stt_model_input,
+            discord_bot_status_display
         ]
 
         initial_load_outputs = [
