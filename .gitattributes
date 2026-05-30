@@ -1,1 +1,132 @@
+##############################################################
+# 改行コード管理設定
+# リポジトリは常にLF、チェックアウト時に必要に応じて変換
+##############################################################
+# デフォルト：Gitに自動判定させる
+* text=auto
 
+#
+# テキストファイル（LF強制）
+#
+
+# ソースコード
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.java text eol=lf
+*.py text eol=lf
+*.rb text eol=lf
+*.go text eol=lf
+*.rs text eol=lf
+
+# Web関連
+*.js text eol=lf
+*.ts text eol=lf
+*.jsx text eol=lf
+*.tsx text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.scss text eol=lf
+*.sass text eol=lf
+*.vue text eol=lf
+
+# マークアップ・設定ファイル
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.xml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+
+# シェルスクリプト（必ずLF）
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Dockerfile
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+
+# Makefile
+Makefile text eol=lf
+*.mk text eol=lf
+
+# Git関連
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.gitconfig text eol=lf
+
+#
+# Windows専用ファイル（CRLF強制）
+#
+
+# バッチファイル
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShellスクリプト
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Visual Studioプロジェクト
+*.sln text eol=crlf
+*.csproj text eol=crlf
+*.vbproj text eol=crlf
+
+#
+# バイナリファイル（変換しない）
+#
+
+# 画像
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.bmp binary
+*.svg binary
+*.webp binary
+
+# フォント
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+
+# 圧縮ファイル
+*.zip binary
+*.tar binary
+*.gz binary
+*.bz2 binary
+*.7z binary
+*.rar binary
+
+# オフィス文書
+*.pdf binary
+*.doc binary
+*.docx binary
+*.xls binary
+*.xlsx binary
+*.ppt binary
+*.pptx binary
+
+# 実行ファイル
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.app binary
+
+# データベース
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+
+# その他
+*.jar binary
+*.war binary
+*.ear binary
+*.class binary
+*.pyc binary
