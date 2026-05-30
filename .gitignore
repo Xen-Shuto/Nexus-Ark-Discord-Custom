@@ -222,7 +222,7 @@ __marimo__/
 # NexusArk独自
 #############################################################
 app/backups/
-app/characters/
+app/characters/*
 !app/characters/_shared/
 app/.memos/
 app/.gemini_key_states.json
