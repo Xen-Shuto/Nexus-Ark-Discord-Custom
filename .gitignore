@@ -224,8 +224,10 @@ __marimo__/
 app/backups/
 app/characters/*
 !app/characters/_shared/
+app/metadata/
 app/.memos/
 app/.gemini_key_states.json
 app/config.json
+app/nexus_ark.lock
 update_cache/
 uv.lock
