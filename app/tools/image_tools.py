@@ -3,6 +3,8 @@
 import os
 import io
 import base64
+import uuid
+import time
 import datetime
 import traceback
 from urllib.parse import quote
@@ -27,7 +29,7 @@ def _generate_with_gemini(prompt: str, model_name: str, api_key: str, save_dir: 
     except Exception as e:
         error_str = str(e)
         if "429" in error_str or "Resource Exhausted" in error_str:
-            print(f"  - 画像生成で429エラーが発生しました。キー: {api_key_name}, モデル: {model_name}")
+            print(f"  - [{room_name}] 画像生成で429エラーが発生しました。キー: {api_key_name}, モデル: {model_name}")
             # 枯渇状態を記録（有料キーの場合は内部でスキップされる）
             config_manager.mark_key_as_exhausted(api_key_name, model_name)
             return "【エラー】画像生成の制限（無料枠またはRPM制限）に達しました。しばらく待ってから再度お試しください。"
@@ -40,7 +42,7 @@ def _generate_with_gemini(prompt: str, model_name: str, api_key: str, save_dir: 
         for part in response.candidates[0].content.parts:
             if part.text:
                 image_text_response = part.text
-                print(f"  - APIからのテキスト応答: {part.text}")
+                print(f"  - [{room_name}] APIからのテキスト応答: {part.text}")
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
                 image_data = io.BytesIO(part.inline_data.data)
 
@@ -48,41 +50,64 @@ def _generate_with_gemini(prompt: str, model_name: str, api_key: str, save_dir: 
         return "【エラー】APIから画像データが返されませんでした。プロンプトが不適切か、安全フィルターにブロックされた可能性があります。"
 
     image = Image.open(image_data)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{room_name.lower()}_{timestamp}.png"
+    # 日時の文字列はAIが修正したがるので…
+    #timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    #filename = f"{room_name.lower()}_{timestamp}.png"
+
+    # --- 画像の保存ファイル名 ---
+    # uuid4の最初の8文字だけ使うなど、短くしてもユニーク性は保てます
+    unique_id = uuid.uuid4().hex[:8] 
+    # 保存用ファイル名をUNIXタイムスタンプにする
+    # これにより「時系列順」に並び、かつAIが「時刻」として認識しにくくなります。
+    # 例: 1729999999.png (2024-10-27 15:00:00相当)
+    timestamp_id = int(time.time())
+    # --- 画像の保存ファイル名 ---
+    filename = f"Gemini_{room_name.lower()}_{timestamp_id}_{unique_id}.png"
+
     save_path = os.path.join(save_dir, filename)
 
     image.save(save_path, "PNG")
-    print(f"  - 画像を保存しました: {save_path}")
+    print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
     model_comment = f"\nAI Model Comment: {image_text_response}" if image_text_response else ""
     return f"[Generated Image: {save_path}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path}]"
 
 
 
-def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: str, save_dir: str, room_name: str) -> str:
+#def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: str, save_dir: str, room_name: str) -> str:
+def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: str, save_dir: str, room_name: str, aspect_ratio: str = "square") -> str:
     """OpenAI互換API (Images API) で画像を生成する"""
     from openai import OpenAI
     import requests
     
-    print(f"  [OpenAI Image] base_url={base_url}, model={model_name}")
-    print(f"  [OpenAI Image] api_key set: {bool(api_key and len(api_key) > 5)}")
+    print(f"  [{room_name}] [OpenAI Image] base_url={base_url}, model={model_name}")
+    print(f"  [{room_name}] [OpenAI Image] api_key set: {bool(api_key and len(api_key) > 5)}")
     
     client = OpenAI(base_url=base_url, api_key=api_key)
     
     # モデルによってサイズを調整
-    size = "1024x1024"
-    if "dall-e-3" in model_name:
-        size = "1024x1024"  # DALL-E 3は1024x1024, 1792x1024, 1024x1792
+    #size = "1024x1024"
+    #if "dall-e-3" in model_name:
+    #    size = "1024x1024"  # DALL-E 3は1024x1024, 1792x1024, 1024x1792
+    if "dall-e-3" in model_name.lower():
+        size_map = {
+            "square": "1024x1024",
+            "portrait": "1024x1792",
+            "landscape": "1792x1024"
+        }
+        size = size_map.get(aspect_ratio.lower(), "1024x1024")
+    else:
+        # DALL-E 3以外のモデル以外は固定
+        size = "1024x1024"
     
     # gpt-image-1系モデルはresponse_formatをサポートしない（URLベースのみ）
     is_gpt_image = "gpt-image" in model_name.lower() or "gptimage" in model_name.lower()
     is_grok = "grok" in model_name.lower()
-    print(f"  [OpenAI Image] is_gpt_image={is_gpt_image}, is_grok={is_grok}, size={size}")
+    print(f"  [{room_name}] [OpenAI Image] is_gpt_image={is_gpt_image}, is_grok={is_grok}, size={size}")
     
     if is_gpt_image:
         # GPT Image モデル用（response_formatパラメータを渡さないが、b64_jsonで返る）
-        print(f"  [OpenAI Image] Calling images.generate (gpt-image mode, no response_format param)...")
+        print(f"  [{room_name}] [OpenAI Image] Calling images.generate (gpt-image mode, no response_format param)...")
         
         gen_params = {
             "model": model_name,
@@ -96,28 +121,28 @@ def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: 
             gen_params["size"] = size
             
         response = client.images.generate(**gen_params)
-        print(f"  [OpenAI Image] Response received")
+        print(f"  [{room_name}] [OpenAI Image] Response received")
         
         # gpt-image-1は実際にはb64_jsonで返す（urlはNone）
         if response.data and response.data[0].b64_json:
-            print(f"  [OpenAI Image] Found b64_json data, decoding...")
+            print(f"  [{room_name}] [OpenAI Image] Found b64_json data, decoding...")
             image_data = base64.b64decode(response.data[0].b64_json)
             image = Image.open(io.BytesIO(image_data))
         elif response.data and response.data[0].url:
             # フォールバック: URLがある場合
             image_url = response.data[0].url
-            print(f"  [OpenAI Image] Downloading from URL: {image_url[:100]}...")
+            print(f"  [{room_name}] [OpenAI Image] Downloading from URL: {image_url[:100]}...")
             img_response = requests.get(image_url, timeout=60)
             img_response.raise_for_status()
             image = Image.open(io.BytesIO(img_response.content))
         else:
-            print(f"  [OpenAI Image] ERROR: No image data in response")
+            print(f"  [{room_name}] [OpenAI Image] ERROR: No image data in response")
             return "【エラー】APIから画像データが返されませんでした。"
         
-        print(f"  [OpenAI Image] Image processed successfully")
+        print(f"  [{room_name}] [OpenAI Image] Image processed successfully")
     else:
         # DALL-E等（b64_json対応）
-        print(f"  [OpenAI Image] Calling images.generate (b64_json mode)...")
+        print(f"  [{room_name}] [OpenAI Image] Calling images.generate (b64_json mode)...")
         
         gen_params = {
             "model": model_name,
@@ -132,21 +157,37 @@ def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: 
             gen_params["size"] = size
             
         response = client.images.generate(**gen_params)
-        print(f"  [OpenAI Image] Response received")
+        print(f"  [{room_name}] [OpenAI Image] Response received")
         
         if not response.data or not response.data[0].b64_json:
-            print(f"  [OpenAI Image] ERROR: No b64_json in response.data")
+            print(f"  [{room_name}] [OpenAI Image] ERROR: No b64_json in response.data")
             return "【エラー】APIから画像データが返されませんでした。"
         
         image_data = base64.b64decode(response.data[0].b64_json)
         image = Image.open(io.BytesIO(image_data))
     
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{room_name.lower()}_{timestamp}.png"
+    # 日時の文字列はAIが修正したがるので…
+    #timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    #filename = f"{room_name.lower()}_{timestamp}.png"
+
+    # --- 画像の保存ファイル名 ---
+    # uuid4の最初の8文字だけ使うなど、短くしてもユニーク性は保てます
+    unique_id = uuid.uuid4().hex[:8] 
+    # 保存用ファイル名をUNIXタイムスタンプにする
+    # これにより「時系列順」に並び、かつAIが「時刻」として認識しにくくなります。
+    # 例: 1729999999.png (2024-10-27 15:00:00相当)
+    timestamp_id = int(time.time())
+    # --- 画像の保存ファイル名 ---
+    if "dall-e-3" in model_name.lower():
+        filename = f"DALL-E-3_{room_name.lower()}_{timestamp_id}_{unique_id}.png"
+    else:
+        # DALL-E 3以外のモデル
+        filename = f"OpenAI_{room_name.lower()}_{timestamp_id}_{unique_id}.png"
+
     save_path = os.path.join(save_dir, filename)
     
     image.save(save_path, "PNG")
-    print(f"  - 画像を保存しました: {save_path}")
+    print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
     revised_prompt = getattr(response.data[0], 'revised_prompt', None)
     model_comment = f"\nRevised Prompt: {revised_prompt}" if revised_prompt else ""
@@ -154,12 +195,25 @@ def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: 
 
 
 def _save_generated_image(image: Image.Image, prompt: str, save_dir: str, room_name: str, model_comment: str = "") -> str:
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{room_name.lower()}_{timestamp}.png"
+    """Pollinations.ai で生成した画像を保存する。"""
+    # 日時の文字列はAIが修正したがるので…
+    #timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    #filename = f"{room_name.lower()}_{timestamp}.png"
+
+    # --- 画像の保存ファイル名 ---
+    # uuid4の最初の8文字だけ使うなど、短くしてもユニーク性は保てます
+    unique_id = uuid.uuid4().hex[:8] 
+    # 保存用ファイル名をUNIXタイムスタンプにする
+    # これにより「時系列順」に並び、かつAIが「時刻」として認識しにくくなります。
+    # 例: 1729999999.png (2024-10-27 15:00:00相当)
+    timestamp_id = int(time.time())
+    # --- 画像の保存ファイル名 ---
+    filename = f"PollinationsAI_{room_name.lower()}_{timestamp_id}_{unique_id}.png"
+
     save_path = os.path.join(save_dir, filename)
 
     image.save(save_path, "PNG")
-    print(f"  - 画像を保存しました: {save_path}")
+    print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
     return f"[Generated Image: {save_path}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path}]"
 
@@ -184,11 +238,11 @@ def _generate_with_pollinations(prompt: str, model_name: str, api_key: str, save
         "response_format": "b64_json",
     }
 
-    print(f"  [Pollinations Image] POST {endpoint}, model={payload['model']}")
+    print(f"  [{room_name}] [Pollinations Image] POST {endpoint}, model={payload['model']}")
     response = http_requests.post(endpoint, headers=headers, json=payload, timeout=180)
 
     if response.status_code in (401, 403) and "blocked" in (response.text or "").lower():
-        print("  [Pollinations Image] POSTがブロックされたため、GET /image 経路へフォールバックします。")
+        print("  [{room_name}] [Pollinations Image] POSTがブロックされたため、GET /image 経路へフォールバックします。")
         image_url = f"https://gen.pollinations.ai/image/{quote(prompt, safe='')}"
         get_response = http_requests.get(
             image_url,
@@ -248,7 +302,7 @@ def _generate_with_huggingface(prompt: str, model_id: str, hf_token: str, save_d
     headers = {"Authorization": f"Bearer {hf_token}"}
     payload = {"inputs": prompt}
 
-    print(f"  [HuggingFace Image] model={model_id}, prompt='{prompt[:80]}...'")
+    print(f"  [{room_name}] [HuggingFace Image] model={model_id}, prompt='{prompt[:80]}...'")
 
     response = http_requests.post(api_url, headers=headers, json=payload, timeout=120)
 
@@ -269,24 +323,141 @@ def _generate_with_huggingface(prompt: str, model_id: str, hf_token: str, save_d
         return f"【エラー】Hugging Face APIから画像以外のデータが返されました (Content-Type: {content_type})。モデルがtext-to-imageタスクに対応しているか確認してください。"
 
     image = Image.open(io.BytesIO(response.content))
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{room_name.lower()}_{timestamp}.png"
+
+    # 日時の文字列はAIが修正したがるので…
+    #timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    #filename = f"{room_name.lower()}_{timestamp}.png"
+
+    # --- 画像の保存ファイル名 ---
+    # uuid4の最初の8文字だけ使うなど、短くしてもユニーク性は保てます
+    unique_id = uuid.uuid4().hex[:8] 
+    # 保存用ファイル名をUNIXタイムスタンプにする
+    # これにより「時系列順」に並び、かつAIが「時刻」として認識しにくくなります。
+    # 例: 1729999999.png (2024-10-27 15:00:00相当)
+    timestamp_id = int(time.time())
+    # --- 画像の保存ファイル名 ---
+    filename = f"HuggingFace_{room_name.lower()}_{timestamp_id}_{unique_id}.png"
+
     save_path = os.path.join(save_dir, filename)
 
     image.save(save_path, "PNG")
-    print(f"  - 画像を保存しました: {save_path}")
+    print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
     return f"[Generated Image: {save_path}]\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path}]"
 
+# --- ローカルでの画像生成 ---
+def _generate_with_local(prompt: str, save_dir: str, room_name: str, aspect_ratio: str = "square", local_sampler: str = None, local_steps: str = None, local_cfg: float = None) -> str:
+    """Stable Diffusion WebUI (A1111/Forge) API で画像を生成する"""
+    import uuid
+    
+    # 最新の設定を読み込む
+    latest_config = config_manager.load_config_file()
+    ls = latest_config.get("image_generation_local_settings", {})
+    
+    # API-URLの抽出
+    url = ls.get("url", "http://127.0.0.1:7861/sdapi/v1/txt2img")
+    
+    if not url:
+        print(f"  [{room_name}] [Local Image] API URLが未設定のため起動しません")
+        return "【エラー】ローカル画像生成のURLが設定されていません。"
+    
+    # パラメータの抽出
+    positive_prompt_prefix = ls.get("positive_prompt_prefix", "")
+    positive_prompt_append = ls.get("positive_prompt_append", "")
+    negative_prompt = ls.get("negative_prompt", "")
+    # 値がある場合はそれを使い、ない場合は設定ファイルから取得
+    sampler_name = local_sampler if local_sampler else ls.get("sampler", "Euler a")
+    steps = local_steps if local_steps else ls.get("steps", 25)
+    cfg_scale = local_cfg if local_cfg else ls.get("cfg_scale", 7.0)
+    
+    # --- ポジティブプロンプトの結合ロジック ---
+    # [Prefix] + [AIのプロンプト] + [Append] をカンマで綺麗に繋ぐ
+    prompt_parts = []
+    if positive_prompt_prefix.strip():
+        prompt_parts.append(positive_prompt_prefix.strip())
+    
+    prompt_parts.append(prompt.strip())
+    
+    if positive_prompt_append.strip():
+        prompt_parts.append(positive_prompt_append.strip())
+    
+    full_positive_prompt = ", ".join(prompt_parts)
+    
+    # 解像度設定（デフォルトは1024x1024）
+    size_map = {
+        "square": (1024, 1024),
+        "portrait": (832, 1216),
+        "landscape": (1216, 832)
+    }
+    width, height = size_map.get(aspect_ratio.lower(), (1024, 1024))
+
+    payload = {
+        "prompt": full_positive_prompt,
+        "negative_prompt": negative_prompt.strip() if negative_prompt else "",
+        "steps": int(steps),
+        "cfg_scale": float(cfg_scale),
+        "width": width, 
+        "height": height,
+        "sampler_name": sampler_name
+    }
+
+    print(f"  [{room_name}] [Local Image] Requesting: {url} | Sampler: {sampler_name}, Steps: {steps}")
+    print(f"  [{room_name}] [Local Image] Final Prompt: {full_positive_prompt[:100]}...")
+
+    try:
+        response = http_requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        
+        data = response.json()
+        img_base64 = data["images"][0]
+        img_bytes = base64.b64decode(img_base64)
+
+        # --- 画像の保存ファイル名 ---
+        # uuid4の最初の8文字だけ使うなど、短くしてもユニーク性は保てます
+        unique_id = uuid.uuid4().hex[:8] 
+        # 保存用ファイル名をUNIXタイムスタンプにする
+        # これにより「時系列順」に並び、かつAIが「時刻」として認識しにくくなります。
+        # 例: 1729999999.png (2024-10-27 15:00:00相当)
+        timestamp_id = int(time.time())
+        # --- 画像の保存ファイル名 ---
+        filename = f"Local_{room_name.lower()}_{timestamp_id}_{unique_id}.png"
+
+        save_path = os.path.join(save_dir, filename)
+
+        # --- 相対パスを絶対パスに変換 ---
+        fullpath = os.path.abspath(save_path)
+
+        with open(fullpath, "wb") as f:
+            f.write(img_bytes)
+        print(f"  - [{room_name}] 画像を保存しました: {fullpath}")
+
+        # 【重要】バックスラッシュをスラッシュに置換
+        # これにより AI が \ をエスケープしようとする挙動を物理的に防ぎます
+        fullpath_fixed = fullpath.replace("\\", "/")
+
+        return f"[Generated Image: {fullpath_fixed}]\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {fullpath_fixed}]"
+
+    except Exception as e:
+        print(f"  - [{room_name}] 画像生成中にエラーが発生しました: {e}")
+        return f"【エラー】画像生成に失敗しました。SD WebUIが '--api' を付けて起動しているか確認してください。詳細: {str(e)}"
+
 
 @tool
-def generate_image(prompt: str, room_name: str, api_key: str, api_key_name: str = None) -> str:
+#def generate_image(prompt: str, room_name: str, api_key: str, api_key_name: str = None) -> str:
+#    """
+#    ユーザーの要望や会話の文脈に応じて、情景、キャラクター、アイテムなどのイラストを生成する。
+#    成功した場合は、UIに表示するための特別な画像タグを返す。
+#    prompt: 画像生成のための詳細な指示（英語が望ましい）。
+#    """
+#    return _generate_image_impl(prompt, room_name, api_key, api_key_name)
+def generate_image(prompt: str, room_name: str, api_key: str, api_key_name: str = None, aspect_ratio: str = "square") -> str:
     """
     ユーザーの要望や会話の文脈に応じて、情景、キャラクター、アイテムなどのイラストを生成する。
     成功した場合は、UIに表示するための特別な画像タグを返す。
-    prompt: 画像生成のための詳細な指示（英語が望ましい）。
+    prompt: 画像生成のための詳細な英語指示。
+    aspect_ratio: 画像の形状。"square" (正方形 1:1), "portrait" (縦長 2:3), "landscape" (横長 3:2) から選択してください。
     """
-    return _generate_image_impl(prompt, room_name, api_key, api_key_name)
+    return _generate_image_impl(prompt, room_name, api_key, api_key_name, aspect_ratio=aspect_ratio)
 
 def _generate_image_impl(
     prompt: str, 
@@ -296,7 +467,11 @@ def _generate_image_impl(
     provider: str = None,
     model_name: str = None,
     openai_profile_name: str = None,
-    save_subdir: str = "generated_images"
+    save_subdir: str = "generated_images",
+    aspect_ratio: str = "square", # 追加
+    local_sampler_override: str = None,
+    local_steps_override: str = None,
+    local_cfg_override: float = None
 ) -> str:
     """generate_image の実体ロジック（他のツールからも呼び出し可能）"""
     # --- 最新の設定を読み込む ---
@@ -317,7 +492,7 @@ def _generate_image_impl(
         if configured_key and not configured_key.startswith("YOUR_API_KEY"):
             api_key = configured_key
             api_key_name = image_gen_key_name
-            print(f"  - 画像生成設定の専用キーを優先使用します: {api_key_name}")
+            print(f"  - [{room_name}] 画像生成設定の専用キーを優先使用します: {api_key_name}")
     
     # api_key_name が未指定の場合は逆引きで特定
     if not api_key_name:
@@ -349,10 +524,12 @@ def _generate_image_impl(
         if not model_name or model_name == latest_config.get("image_generation_model"):
             actual_model_name = latest_config.get("image_generation_huggingface_model", "black-forest-labs/FLUX.1-schnell")
 
-    print(f"--- 画像生成ツール実行 (Provider: {provider}, Model: {actual_model_name}, Key: {api_key_name}, Prompt: '{prompt[:100]}...') ---")
+    print(f"--- [{room_name}] 画像生成ツール実行 (Provider: {provider}, Model: {actual_model_name}, Key: {api_key_name}, Prompt: '{prompt[:100]}...') ---")
 
     try:
-        save_dir = os.path.join("characters", room_name, save_subdir)
+        #save_dir = os.path.join("characters", room_name, save_subdir)
+        save_subsubdir = datetime.datetime.now().strftime('%Y-%m') 
+        save_dir = os.path.join("characters", room_name, save_subdir, save_subsubdir)
         os.makedirs(save_dir, exist_ok=True)
 
         if provider == "gemini":
@@ -385,7 +562,7 @@ def _generate_image_impl(
                 poll_api_key = latest_config.get("pollinations_api_key", "")
                 if poll_api_key and "YOUR_API_KEY" not in poll_api_key:
                     openai_api_key = poll_api_key
-                    print(f"  - OpenAIプロファイルのキーが未設定のため、共通設定のPollinationsキーを使用します。")
+                    print(f"  - [{room_name}] OpenAIプロファイルのキーが未設定のため、共通設定のPollinationsキーを使用します。")
 
             if not openai_api_key or "YOUR_API_KEY" in openai_api_key:
                 return f"【エラー】プロファイル '{profile_name}' にAPIキーが設定されていません。「APIキー / Webhook管理」でAPIキーを設定してください。"
@@ -393,7 +570,8 @@ def _generate_image_impl(
             if "pollinations.ai" in openai_base_url.lower():
                 return "【エラー】Pollinations.ai は画像生成の専用プロバイダとして利用してください。プロバイダを「Pollinations.ai」に切り替えてください。"
             
-            return _generate_with_openai(prompt, openai_model, openai_base_url, openai_api_key, save_dir, room_name)
+            #return _generate_with_openai(prompt, openai_model, openai_base_url, openai_api_key, save_dir, room_name)
+            return _generate_with_openai(prompt, openai_model, openai_base_url, openai_api_key, save_dir, room_name, aspect_ratio=aspect_ratio)
         
         elif provider == "pollinations":
             # Pollinations.ai は OpenAI 互換 API
@@ -411,20 +589,33 @@ def _generate_image_impl(
                 return "【エラー】Hugging Face のAPIトークンが設定されていません。「共通設定」→「画像生成設定」でトークンを入力してください。\nトークンは https://huggingface.co/settings/tokens で取得できます。"
             return _generate_with_huggingface(prompt, hf_model, hf_token, save_dir, room_name)
         
+        # --- ローカル画像生成
+        elif provider == "local":
+            # ローカルSD用の処理
+            return _generate_with_local(
+                prompt, 
+                save_dir, 
+                room_name, 
+                aspect_ratio=aspect_ratio, 
+                local_sampler=local_sampler_override, 
+                local_steps=local_steps_override, 
+                local_cfg=local_cfg_override
+            )
+        
         else:
             return f"【エラー】不明な画像生成プロバイダ: {provider}"
 
     except httpx.RemoteProtocolError as e:
-        print(f"  - 画像生成ツールでサーバー切断エラー: {e}")
+        print(f"  - [{room_name}] 画像生成ツールでサーバー切断エラー: {e}")
         return "【エラー】サーバーが応答せずに接続を切断しました。プロンプトを簡潔にして、もう一度試してみてください。"
     except genai.errors.ServerError as e:
-        print(f"  - 画像生成ツールでサーバーエラー(500番台): {e}")
+        print(f"  - [{room_name}] 画像生成ツールでサーバーエラー(500番台): {e}")
         return "【エラー】サーバー側で内部エラー(500)が発生しました。プロンプトをよりシンプルにして、もう一度試してみてください。"
     except genai.errors.ClientError as e:
-        print(f"  - 画像生成ツールでクライアントエラー(400番台): {e}")
+        print(f"  - [{room_name}] 画像生成ツールでクライアントエラー(400番台): {e}")
         return f"【エラー】APIリクエストが無効です(400番台)。詳細: {e}"
     except Exception as e:
-        print(f"  - 画像生成ツールで予期せぬエラー: {e}")
+        print(f"  - [{room_name}] 画像生成ツールで予期せぬエラー: {e}")
         traceback.print_exc()
         return f"【エラー】画像生成中に予期せぬ問題が発生しました。詳細: {e}"
 
@@ -465,7 +656,7 @@ def generate_image_caption(image_path: str, api_key_name: str = None) -> str:
             return "（画像のキャプションを生成できませんでした）"
             
     except Exception as e:
-        print(f"--- [画像キャプション生成エラー] {e} ---")
+        print(f"--- [{room_name}] [画像キャプション生成エラー] {e} ---")
         return f"（画像キャプション生成エラー: {str(e)}）"
 
 @tool

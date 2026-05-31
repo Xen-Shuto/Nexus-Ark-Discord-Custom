@@ -410,6 +410,8 @@ def save_config_if_changed(key: str, value: Any) -> bool:
         
     config[key] = value
     _save_config_file(config)
+    print(f"[config_manager] input_Key: {key}")  # DEBUG
+    print(f"[config_manager] input_value: {value}")  # DEBUG
     print(f"[config_manager]   -> Saved to file")  # DEBUG
     
     # 【重要】メモリ上の設定も更新して、再起動なしで反映させる

@@ -1597,6 +1597,7 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
             gr.update(value=False),
             gr.update(value=False),
             gr.update(value=False),
+            gr.update(value=False),
             gr.update(value=True),
             gr.update(value=False),
             gr.update(value=3),
@@ -2022,6 +2023,7 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
         gr.update(value=tw.get("posting_summary", "")),
         gr.update(value=tw.get("posting_guidelines", "")),
         gr.update(value=tw.get("auto_post", False)),
+        gr.update(value=tw.get("approval_required_for_replies", False)),
         gr.update(value=tw.get("notify_on_approval_request", False)),
         gr.update(value=tw.get("is_premium", False)),
         gr.update(value=tw.get("enable_privacy_filter", True)),
@@ -2135,7 +2137,7 @@ def _get_safe_dropdown_update(room_name: str, note_type: str, default_filename: 
 
 
 #def handle_initial_load(room_name: str = None, expected_count: int = 211, request: gr.Request = None):
-def handle_initial_load(room_name: str = None, expected_count: int = 240, request: gr.Request = None):
+def handle_initial_load(room_name: str = None, expected_count: int = 241, request: gr.Request = None):
     """
     【v11: 時間デフォルト対応版】
     UIセッションが開始されるたびに、UIコンポーネントの初期状態を完全に再構築する、唯一の司令塔。
@@ -2243,6 +2245,7 @@ def handle_initial_load(room_name: str = None, expected_count: int = 240, reques
     available_poll_img_models = config.get("available_image_models", {}).get("pollinations", ["flux", "zimage", "klein"])
     available_hf_img_models = config.get("available_image_models", {}).get("huggingface", ["black-forest-labs/FLUX.1-schnell"])
     openai_img_settings = config.get("image_generation_openai_settings", {})
+    local_img_settings = config.get("image_generation_local_settings", {})
     legacy_notification_service = config.get("notification_service", "discord")
 
     common_settings_updates = (
@@ -2267,6 +2270,14 @@ def handle_initial_load(room_name: str = None, expected_count: int = 240, reques
         gr.update(choices=available_hf_img_models, value=config.get("image_generation_huggingface_model", "black-forest-labs/FLUX.1-schnell")),  # huggingface_image_model_dropdown
         gr.update(choices=[p[1] for p in latest_api_key_choices], value=config.get("paid_api_key_names", [])),
         gr.update(value=config.get("allow_external_connection", False)),  # [追加] 外部接続設定
+        # --- ローカル画像生成設定 (7項目) ---
+        gr.update(value=local_img_settings.get("url", "")),
+        gr.update(value=local_img_settings.get("sampler", "Euler a")),
+        gr.update(value=local_img_settings.get("steps", 25)),
+        gr.update(value=local_img_settings.get("cfg_scale", 7.0)),
+        gr.update(value=local_img_settings.get("positive_prefix", "")),
+        gr.update(value=local_img_settings.get("positive_append", "")),
+        gr.update(value=local_img_settings.get("negative_prompt", "")),
     )
 
     current_openai_profile_name = config_manager.get_active_openai_profile_name()
@@ -2473,6 +2484,9 @@ def handle_initial_chat_load(room_name: str = None, request: gr.Request = None):
     t_step = _perf_log("handle_initial_chat_load: room_manager.set_active_room_for_backup", t_step)
     _perf_log("handle_initial_chat_load: total", t0_overall)
 
+    # 設定グループを分解して取得
+    gen_updates, tw_updates, ds_updates = _get_room_settings_fast_updates(safe_initial_room, safe_initial_api_key)
+
     wm_slots_update, wm_content_update, active_wm_label = _get_working_memory_updates(safe_initial_room)
 
     result = _ensure_output_count((
@@ -2496,12 +2510,15 @@ def handle_initial_chat_load(room_name: str = None, request: gr.Request = None):
         gr.update(value=add_timestamp_val),
         onboarding_guide_update,
         onboarding_group_update,
-        *_get_room_settings_fast_updates(safe_initial_room, safe_initial_api_key),
-        get_release_notes(),
-        active_wm_label,
-        wm_slots_update,
-        wm_content_update
-    ), 82)
+        #*_get_room_settings_fast_updates(safe_initial_room, safe_initial_api_key),
+        *gen_updates,            # 21-85: 一般設定 (58 + 7 = 65項目)
+        get_release_notes(),     # 86: リリースノート
+        active_wm_label,         # 87: WMラベル
+        wm_slots_update,         # 88: WMスロット
+        wm_content_update,       # 89: WMエディタ
+        *tw_updates,             # 90-104: Twitter (15項目)
+        *ds_updates              # 105-119: Discord (15項目)
+    ), 119)
     log_memory_diagnostics(
         "initial_chat_load:end",
         safe_initial_room,
@@ -2509,7 +2526,8 @@ def handle_initial_chat_load(room_name: str = None, request: gr.Request = None):
     )
     return result
 
-def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
+#def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
+def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None) -> Tuple[list, list, list]:
     """Fast init用に、自動保存対象の個別設定コンポーネントだけを現在値へ同期する。"""
     effective_settings = config_manager.get_effective_settings(room_name)
     room_config = room_manager.get_room_config(room_name) or {}
@@ -2540,6 +2558,7 @@ def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
     openai_settings = overrides.get("openai_settings") or effective_settings.get("openai_settings") or {}
     anthropic_settings = overrides.get("anthropic_settings") or effective_settings.get("anthropic_settings") or {}
 
+    local_img_settings = config_manager.CONFIG_GLOBAL.get("image_generation_local_settings", {})
     openai_profile = openai_settings.get("profile") or config_manager.get_active_openai_profile_name()
     openai_choices = []
     if openai_profile:
@@ -2552,7 +2571,7 @@ def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
     auto_summary_enabled = bool(effective_settings.get("auto_summary_enabled", False))
     rotation_value = overrides.get("enable_api_key_rotation", None)
 
-    return (
+    general_settings = [
         gr.update(value=config_manager.tts_provider_display_from_key(tts_provider)),
         gr.update(choices=config_manager.get_tts_model_choices(tts_provider), value=tts_model),
         gr.update(choices=config_manager.get_tts_voice_choices(tts_provider), value=voice_name),
@@ -2611,7 +2630,71 @@ def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
         gr.update(value=project.get("root_path", "")),
         gr.update(value=", ".join(project.get("exclude_dirs", []))),
         gr.update(value=", ".join(project.get("exclude_files", []))),
-    )
+        gr.update(value=local_img_settings.get("url", "")),
+        gr.update(value=local_img_settings.get("sampler", "Euler a")),
+        gr.update(value=local_img_settings.get("steps", 25)),
+        gr.update(value=local_img_settings.get("cfg_scale", 7.0)),
+        gr.update(value=local_img_settings.get("positive_prefix", "")),
+        gr.update(value=local_img_settings.get("positive_append", "")),
+        gr.update(value=local_img_settings.get("negative_prompt", ""))
+    ]
+
+    # --- Twitter設定 ---
+    tw = effective_settings.get("twitter_settings", {})
+    tw_api = tw.get("api_config", {})
+
+    # --- Twitter同期 ---
+    twitter_settings = [
+        gr.update(value=tw.get("enabled", False)),
+        gr.update(value=tw.get("auth_mode", "browser")),
+        gr.update(value=tw_api.get("api_key", ""), type="password"),
+        gr.update(value=tw_api.get("api_secret", ""), type="password"),
+        gr.update(value=tw_api.get("access_token", ""), type="password"),
+        gr.update(value=tw_api.get("access_token_secret", ""), type="password"),
+        gr.update(value=tw.get("posting_summary", "")),
+        gr.update(value=tw.get("posting_guidelines", "")),
+        gr.update(value=tw.get("auto_post", False)),
+        gr.update(value=tw.get("approval_required_for_replies", True)),
+        gr.update(value=tw.get("notify_on_approval_request", False)),
+        gr.update(value=tw.get("is_premium", False)),
+        gr.update(value=tw.get("enable_privacy_filter", True)),
+        gr.update(value=tw.get("fetch_thread_enabled", False)),
+        gr.update(value=tw.get("thread_fetch_count", 3))
+    ]
+
+    # --- Discord設定 ---
+    ds = config_manager.get_room_discord_bot_settings(room_name)
+    ds_enabled = ds.get("enabled", False)
+
+    ds_token = ds.get("token", "")
+    if ds_enabled and ds_token:
+        ds_status = "Botの状態: 🟢 有効（起動中または起動対象）"
+    elif ds_token:
+        ds_status = "Botの状態: ⚪ 無効（Botトークン保存済み・チェックOFF）"
+    else:
+        ds_status = "Botの状態: ⚪ 無効"
+
+    # --- Discord同期 ---
+    discord_settings = [
+        gr.update(value=ds_enabled),
+        gr.update(value=ds_token, type="password"),
+        gr.update(value=", ".join([str(v) for v in ds.get("authorized_user_ids", [])])),
+        gr.update(value=", ".join([str(v) for v in ds.get("allowed_channel_ids", [])])),
+        gr.update(value=ds.get("default_channel_id", "")),
+        gr.update(value=ds.get("mention_only", False)),
+        gr.update(value=_format_discord_channel_response_modes(ds.get("channel_response_modes", {}))),
+        gr.update(value=ds.get("allow_autonomous_send", False)),
+        gr.update(value=ds.get("persona_webhook_url", ""), type="password"),
+        gr.update(value=", ".join([str(v) for v in ds.get("approval_command_allowlist", [])])),
+        gr.update(value=ds.get("voice_input_enabled", False)),
+        gr.update(value=ds.get("voice_input_confirm_transcript", True)),
+        gr.update(value=int(ds.get("voice_input_timeout_minutes", 10) or 10)),
+        gr.update(value=str(ds.get("voice_input_stt_model") or constants.DISCORD_VOICE_STT_MODEL)),
+        gr.update(value=ds_status),
+    ]
+
+    return general_settings, twitter_settings, discord_settings
+
 
 def handle_initial_scenery_image_load(room_name: str, api_key_name: str = None):
     """Fast init後に、既存の現在地画像だけを軽量に読み込む。"""
@@ -9586,8 +9669,7 @@ def handle_world_builder_load(room_name: str):
         gr.update(choices=place_choices_for_selected_area, value=current_location)
     )
 
-#def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_count: int, request: gr.Request = None, preserve_chat_area: bool = False):
-def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_count: int = 207, request: gr.Request = None, preserve_chat_area: bool = False):
+def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_count: int, request: gr.Request = None, preserve_chat_area: bool = False):
     """
     【v11: 最終契約遵守版】
     ルーム変更時に、全てのUI更新と内部状態の更新を、この単一の関数で完結させる。
@@ -16797,7 +16879,15 @@ def handle_save_image_generation_settings(
     pollinations_api_key: str = "",
     pollinations_model: str = "flux",
     huggingface_api_token: str = "",
-    huggingface_model: str = "black-forest-labs/FLUX.1-schnell"
+    huggingface_model: str = "black-forest-labs/FLUX.1-schnell",
+    # --- ローカル引数を追加 ---
+    local_url: str = "",
+    local_sampler: str = "Euler a",
+    local_steps: int = 25,
+    local_cfg: float = 7.0,
+    local_prefix: str = "", 
+    local_append: str = "",
+    local_negative: str = ""
 ):
     """
     画像生成設定を保存する。
@@ -16842,6 +16932,19 @@ def handle_save_image_generation_settings(
         if provider == "huggingface":
             config_manager.save_config_if_changed("huggingface_api_token", huggingface_api_token.strip() if huggingface_api_token else "")
             config_manager.save_config_if_changed("image_generation_huggingface_model", huggingface_model.strip() if huggingface_model else "black-forest-labs/FLUX.1-schnell")
+            
+        # --- ローカル設定を保存 ---
+        if provider == "local":
+            local_settings = {
+                "url": local_url.strip(),
+                "sampler": local_sampler,
+                "steps": int(local_steps),
+                "cfg_scale": float(local_cfg),
+                "positive_prefix": local_prefix,
+                "positive_append": local_append,
+                "negative_prompt": local_negative
+            }
+            config_manager.save_config_if_changed("image_generation_local_settings", local_settings)
 
         provider_labels = {"gemini": "Gemini", "openai": "OpenAI互換", "pollinations": "Pollinations.ai", "huggingface": "Hugging Face", "disabled": "無効"}
         gr.Info(f"✅ 画像生成設定を保存しました (プロバイダ: {provider_labels.get(provider, provider)})")
@@ -16863,13 +16966,19 @@ def handle_image_gen_provider_change(provider: str):
     # プロバイダの変更を即座に保存 (Gradioのレースコンディション対策)
     config_manager.save_config_if_changed("image_generation_provider", provider)
 
+    # モデルリスト取得ボタンを表示するかどうかの判定
+    # ローカル、無効以外なら表示
+    show_fetch_btn = provider not in ["local", "disabled"]
+
     return (
         gr.update(visible=(provider == "gemini")),
         gr.update(visible=(provider == "openai")),
         gr.update(visible=(provider == "pollinations")),
         gr.update(visible=(provider == "huggingface")),
         # [v2.2] APIキーはGeminiのときのみ表示 (APIキー管理はGemini向けのため)
-        gr.update(visible=(provider == "gemini"))
+        gr.update(visible=(provider == "gemini")),
+        gr.update(visible=(provider == "local")),       # ローカル設定セクション
+        gr.update(visible=show_fetch_btn)               # 「取得」ボタン
     )
 
 def handle_check_update():
@@ -18884,6 +18993,7 @@ def _twitter_save_looks_like_unloaded_defaults(
     posting_summary,
     posting_guidelines,
     auto_post,
+    approval_required_for_replies,
     notify_on_approval_request,
     is_premium,
     enable_privacy_filter,
@@ -18899,6 +19009,7 @@ def _twitter_save_looks_like_unloaded_defaults(
         not _is_blank(existing.get("posting_guidelines")),
         bool(existing.get("enabled")),
         bool(existing.get("auto_post")),
+        bool(existing.get("approval_required_for_replies")),
         bool(existing.get("notify_on_approval_request")),
         bool(existing.get("is_premium")),
         bool(existing.get("fetch_thread_enabled")),
@@ -18917,6 +19028,7 @@ def _twitter_save_looks_like_unloaded_defaults(
         and _is_blank(posting_summary)
         and _is_blank(posting_guidelines)
         and bool(auto_post) is False
+        and bool(approval_required_for_replies) is False
         and bool(notify_on_approval_request) is False
         and bool(is_premium) is False
         and bool(enable_privacy_filter) is True
@@ -18924,7 +19036,8 @@ def _twitter_save_looks_like_unloaded_defaults(
         and int(thread_fetch_count or 3) == 3
     )
 
-def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_secret, access_token, access_token_secret, posting_summary, posting_guidelines, auto_post, notify_on_approval_request, is_premium, enable_privacy_filter, fetch_thread_enabled, thread_fetch_count):
+#def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_secret, access_token, access_token_secret, posting_summary, posting_guidelines, auto_post, notify_on_approval_request, is_premium, enable_privacy_filter, fetch_thread_enabled, thread_fetch_count):
+def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_secret, access_token, access_token_secret, posting_summary, posting_guidelines, auto_post, approval_required_for_replies, notify_on_approval_request, is_premium, enable_privacy_filter, fetch_thread_enabled, thread_fetch_count):
     """Twitter連携設定を保存する"""
     print(f"DEBUG: Save Twitter settings for {room_name}")
     print(f"DEBUG: auth_mode={auth_mode}, enabled={enabled}, auto_post={auto_post}")
@@ -18951,6 +19064,7 @@ def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_sec
         posting_summary,
         posting_guidelines,
         auto_post,
+        approval_required_for_replies,
         notify_on_approval_request,
         is_premium,
         enable_privacy_filter,
@@ -18975,6 +19089,7 @@ def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_sec
             "posting_summary": posting_summary or "",
             "posting_guidelines": posting_guidelines or "",
             "auto_post": bool(auto_post),
+            "approval_required_for_replies": bool(approval_required_for_replies),
             "notify_on_approval_request": bool(notify_on_approval_request),
             "is_premium": bool(is_premium),
             "enable_privacy_filter": bool(enable_privacy_filter),
@@ -19069,6 +19184,7 @@ def handle_load_twitter_settings(room_name):
     posting_summary = twitter_settings.get("posting_summary", "")
     posting_guidelines = twitter_settings.get("posting_guidelines", "")
     auto_post = twitter_settings.get("auto_post", False)
+    approval_required_for_replies = twitter_settings.get("approval_required_for_replies", True)
     notify_on_approval_request = twitter_settings.get("notify_on_approval_request", False)
     is_premium = twitter_settings.get("is_premium", False)
     enable_privacy_filter = twitter_settings.get("enable_privacy_filter", True)
@@ -19082,6 +19198,7 @@ def handle_load_twitter_settings(room_name):
         gr.update(value=posting_summary),
         gr.update(value=posting_guidelines),
         gr.update(value=auto_post),
+        gr.update(value=approval_required_for_replies),
         gr.update(value=notify_on_approval_request),
         gr.update(value=api_config.get("api_key", ""), type="password"),
         gr.update(value=api_config.get("api_secret", ""), type="password"),
@@ -19232,13 +19349,18 @@ def handle_periodic_backup_interval_change(interval_str: str):
 def update_user_gen_model_choices(provider, profile_name):
     """プロバイダ変更時にモデルリストを更新する"""
     is_openai = (provider == "openai")
+    is_local = (provider == "local")
+
+    # 共通の戻り値パーツ
+    res_local_row = gr.update(visible=is_local)
 
     if is_openai:
         profile_choices = config_manager.get_image_openai_profile_names()
         selected_profile = profile_name if profile_name in profile_choices else (profile_choices[0] if profile_choices else None)
         # プロファイル変更時と同じロジックを流用（可視性も含む）
         model_update, visibility_update = handle_user_gen_profile_change(selected_profile)
-        return model_update, gr.update(choices=profile_choices, value=selected_profile, visible=True), visibility_update
+        #return model_update, gr.update(choices=profile_choices, value=selected_profile, visible=True), visibility_update
+        return model_update, gr.update(choices=profile_choices, value=selected_profile, visible=True), visibility_update, res_local_row
 
     models = config_manager.CONFIG_GLOBAL.get("available_image_models", {}).get(provider, [])
 
@@ -19246,7 +19368,8 @@ def update_user_gen_model_choices(provider, profile_name):
     return (
         gr.update(choices=models, value=models[0] if models else None),
         gr.update(visible=False),
-        gr.update(visible=False)
+        gr.update(visible=False),
+        res_local_row  # Local選択時のみパラメータ行を表示
     )
 
 def handle_user_gen_profile_change(profile_name):
@@ -19275,7 +19398,8 @@ def handle_user_gen_profile_change(profile_name):
 
     return gr.update(choices=models, value=models[0] if models else None), gr.update(visible=is_openrouter)
 
-def handle_user_generate_image(prompt, provider, model, profile_name, room_name, api_key_name):
+#def handle_user_generate_image(prompt, provider, model, profile_name, room_name, api_key_name):
+def handle_user_generate_image(prompt, provider, model, profile_name, room_name, api_key_name, local_aspect_ratio=None, local_sampler=None, local_steps=None, local_cfg=None):
     """ユーザー指定のパラメータで画像を生成する"""
     if not prompt or not prompt.strip():
         yield gr.update(), gr.update(), gr.update(), "【エラー】プロンプトを入力してください。"
@@ -19305,7 +19429,12 @@ def handle_user_generate_image(prompt, provider, model, profile_name, room_name,
             provider=provider,
             model_name=model,
             openai_profile_name=profile_name if provider == "openai" else None,
-            save_subdir="user_generated_images"
+            save_subdir="user_generated_images",
+            # ローカル専用パラメータのオーバライドを渡す
+            aspect_ratio=local_aspect_ratio, 
+            local_sampler_override=local_sampler,
+            local_steps_override=local_steps,
+            local_cfg_override=local_cfg
         )
 
         if "[Generated Image:" in result:

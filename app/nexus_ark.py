@@ -1885,6 +1885,7 @@ try:
                                         ("OpenAI互換", "openai"),
                                         ("Pollinations.ai (無料)", "pollinations"),
                                         ("Hugging Face", "huggingface"),
+                                        ("Local(SD WebUI)", "local"), # ←ローカルでの画像生成を追加
                                         ("無効", "disabled")
                                     ],
                                     value=current_img_provider,
@@ -1971,6 +1972,17 @@ try:
                                         allow_custom_value=True,
                                         info="Hub上のtext-to-imageモデルIDを直接入力可能"
                                     )
+
+                                # ローカル設定
+                                with gr.Column(visible=(current_img_provider == "local")) as local_image_section:
+                                    gr.Markdown("💡 **Stable Diffusion WebUI (A1111/Forge)** を `--api` 引数付きで起動しておく必要があります。")
+                                    local_sd_url_input = gr.Textbox(label="API URL", placeholder="http://127.0.0.1:7861/sdapi/v1/txt2img", type="password")
+                                    local_sd_sampler_dropdown = gr.Dropdown(choices=["Euler a", "DPM++ 2M Karras", "DPM++ SDE Karras", "UniPC"], label="サンプラー", value="Euler a", allow_custom_value=True)
+                                    local_sd_steps_slider = gr.Slider(minimum=1, maximum=150, value=25, step=1, label="ステップ数 (Steps)", interactive=True)
+                                    local_sd_cfg_slider = gr.Slider(minimum=0, maximum=30, value=7, step=0.5, label="CFGスケール", interactive=True)
+                                    local_sd_positive_prefix_input = gr.Textbox(label="固定ポジティブプロンプト (Prefix)", placeholder="masterpiece, best quality, ...", lines=2)
+                                    local_sd_positive_append_input = gr.Textbox(label="固定ポジティブプロンプト (Append)", placeholder="masterpiece, best quality, ...", lines=2)
+                                    local_sd_negative_prompt_input = gr.Textbox(label="固定ネガティブプロンプト", placeholder="nsfw, lowres, bad anatomy, ...", lines=2)
 
                                 # 一括取得ボタン
                                 with gr.Row():
@@ -3208,10 +3220,19 @@ try:
 
                             # --- [新規] ユーザー用画像生成機能 ---
                             with gr.Accordion("🖼️ 画像生成 (ユーザー用)", open=False):
+                                _conf = config_manager.CONFIG_GLOBAL
+                                _initial_img_provider = _conf.get("image_generation_provider", "gemini")
                                 with gr.Row():
                                     user_gen_image_provider = gr.Dropdown(
-                                        choices=[("Gemini", "gemini"), ("OpenAI互換", "openai"), ("Pollinations.ai", "pollinations"), ("Hugging Face", "huggingface")],
-                                        value=config_manager.CONFIG_GLOBAL.get("image_generation_provider", "gemini"),
+                                        choices=[
+                                            ("Gemini", "gemini"),
+                                            ("OpenAI互換", "openai"),
+                                            ("Pollinations.ai", "pollinations"),
+                                            ("Hugging Face", "huggingface"),
+                                            ("Local(SD WebUI)", "local")
+                                        ],
+                                        #value=config_manager.CONFIG_GLOBAL.get("image_generation_provider", "gemini"),
+                                        value=_initial_img_provider,
                                         label="プロバイダ", scale=2
                                     )
                                     # OpenAIプロファイル選択（OpenAI互換選択時のみ表示）
@@ -3251,6 +3272,18 @@ try:
                                         )
                                         user_gen_image_refresh_button = gr.Button("🔄", scale=1, variant="secondary", size="sm", elem_id="user_gen_image_refresh_btn")
                                         user_gen_free_only_checkbox = gr.Checkbox(label="無料枠のみ", value=False, visible=_initial_is_openrouter, interactive=True)
+
+                                # --- ローカル生成専用パラメータ ---
+                                _ls_defaults = _conf.get("image_generation_local_settings", {})
+                                with gr.Column(visible=(_initial_img_provider == "local")) as user_gen_local_params_row:
+
+                                    with gr.Row():
+                                        user_gen_local_sampler = gr.Dropdown(choices=["Euler a", "DPM++ 2M Karras", "DPM++ SDE Karras", "UniPC"], label="サンプラー", value=_ls_defaults.get("sampler", "Euler a") or "Euler a", allow_custom_value=True, scale=1)
+                                        user_gen_local_aspect_ratio = gr.Dropdown(choices=["square", "portrait", "landscape"], label="アスペクト比", value="square", allow_custom_value=True, scale=1)
+
+                                    with gr.Row():
+                                        user_gen_local_steps = gr.Slider(minimum=1, maximum=100, value=int(_ls_defaults.get("steps", 25) or 25), step=1, label="ステップ数", scale=1)
+                                        user_gen_local_cfg = gr.Slider(minimum=0, maximum=20, value=float(_ls_defaults.get("cfg_scale", 7.0) or 7.0), step=0.5, label="CFG", scale=1)
 
                                 # --- [新規] AIプロンプト生成補助 ---
                                 with gr.Accordion("🪄 AIでプロンプト生成", open=False):
@@ -4720,6 +4753,11 @@ try:
                                         value=_initial_twitter_settings.get("auto_post", False),
                                         info="ONにすると、ペルソナが作成した下書きはユーザーの承認を経ずに即座に投稿されます。"
                                     )
+                                    twitter_approval_required_for_replies_checkbox = gr.Checkbox(
+                                        label="引用、リプライは承認が必要",
+                                        value=_initial_twitter_settings.get("approval_required_for_replies", True),
+                                        info="ONにすると、自動投稿が有効でも引用・リプライだけは承認待ちキューに入ります。"
+                                    )
                                     twitter_notify_approval_checkbox = gr.Checkbox(
                                         label="承認要請時にスマホへ通知を送信する",
                                         value=_initial_twitter_settings.get("notify_on_approval_request", False),
@@ -5617,6 +5655,7 @@ try:
             twitter_posting_summary,
             twitter_posting_guidelines,
             twitter_auto_post_checkbox,
+            twitter_approval_required_for_replies_checkbox,
             twitter_notify_approval_checkbox,
             twitter_premium_checkbox,
             twitter_privacy_filter_checkbox,
@@ -5670,6 +5709,15 @@ try:
             huggingface_image_model_dropdown,
             paid_keys_checkbox_group,
             allow_external_connection_checkbox,
+            # --- [追加] ローカル画像生成設定 (7コンポーネント) ---
+            local_sd_url_input,
+            local_sd_sampler_dropdown,
+            local_sd_steps_slider,
+            local_sd_cfg_slider,
+            local_sd_positive_prefix_input,
+            local_sd_positive_append_input,
+            local_sd_negative_prompt_input,
+            # ------------------------------------------------
             custom_scenery_location_dropdown,
             custom_scenery_time_dropdown,
             # --- [追加] OpenAI設定UIへの反映 ---
@@ -5724,6 +5772,38 @@ try:
             active_working_memory_status,
             working_memory_slot_dropdown,
             working_memory_editor
+            ## --- Twitter同期項目を追加 ---
+            #twitter_enabled_checkbox,
+            #twitter_auth_mode,
+            #twitter_api_key,
+            #twitter_api_secret,
+            #twitter_access_token,
+            #twitter_access_token_secret,
+            #twitter_posting_summary,
+            #twitter_posting_guidelines,
+            #twitter_auto_post_checkbox,
+            #twitter_approval_required_for_replies_checkbox,
+            #twitter_notify_approval_checkbox,
+            #twitter_premium_checkbox,
+            #twitter_privacy_filter_checkbox,
+            #twitter_fetch_thread_checkbox,
+            #twitter_thread_fetch_count_slider,
+            ## --- Discord同期項目を追加 ---
+            #discord_bot_enabled_checkbox,
+            #discord_bot_token_input,
+            #discord_authorized_ids_input,
+            #discord_allowed_channel_ids_input,
+            #discord_default_channel_id_input,
+            #discord_mention_only_checkbox,
+            #discord_channel_response_modes_input,
+            #discord_allow_autonomous_send_checkbox,
+            #discord_persona_webhook_input,
+            #discord_approval_ids_input,
+            #discord_voice_input_enabled_checkbox,
+            #discord_voice_confirm_transcript_checkbox,
+            #discord_voice_timeout_slider,
+            #discord_voice_stt_model_input,
+            #discord_bot_status_display
         ]
         full_refresh_output_count = gr.State(len(unified_full_room_refresh_outputs))
 
@@ -5806,10 +5886,50 @@ try:
             room_project_root_input,
             room_project_exclude_dirs_input,
             room_project_exclude_files_input,
+            # --- ローカル画像生成設定項目を追加（7項目） ---
+            local_sd_url_input,
+            local_sd_sampler_dropdown,
+            local_sd_steps_slider,
+            local_sd_cfg_slider,
+            local_sd_positive_prefix_input,
+            local_sd_positive_append_input,
+            local_sd_negative_prompt_input,
             release_notes_markdown,
             active_working_memory_status,
             working_memory_slot_dropdown,
-            working_memory_editor
+            working_memory_editor,
+            # --- Twitter同期項目を追加 ---
+            twitter_enabled_checkbox,
+            twitter_auth_mode,
+            twitter_api_key,
+            twitter_api_secret,
+            twitter_access_token,
+            twitter_access_token_secret,
+            twitter_posting_summary,
+            twitter_posting_guidelines,
+            twitter_auto_post_checkbox,
+            twitter_approval_required_for_replies_checkbox,
+            twitter_notify_approval_checkbox,
+            twitter_premium_checkbox,
+            twitter_privacy_filter_checkbox,
+            twitter_fetch_thread_checkbox,
+            twitter_thread_fetch_count_slider,
+            # --- Discord同期項目を追加 ---
+            discord_bot_enabled_checkbox,
+            discord_bot_token_input,
+            discord_authorized_ids_input,
+            discord_allowed_channel_ids_input,
+            discord_default_channel_id_input,
+            discord_mention_only_checkbox,
+            discord_channel_response_modes_input,
+            discord_allow_autonomous_send_checkbox,
+            discord_persona_webhook_input,
+            discord_approval_ids_input,
+            discord_voice_input_enabled_checkbox,
+            discord_voice_confirm_transcript_checkbox,
+            discord_voice_timeout_slider,
+            discord_voice_stt_model_input,
+            discord_bot_status_display
         ]
 
 
@@ -8656,6 +8776,7 @@ try:
                 twitter_posting_summary,
                 twitter_posting_guidelines,
                 twitter_auto_post_checkbox,
+                twitter_approval_required_for_replies_checkbox,
                 twitter_notify_approval_checkbox,
                 twitter_api_key,
                 twitter_api_secret,
@@ -9019,7 +9140,9 @@ try:
                 current_room_name, twitter_enabled_checkbox, twitter_auth_mode,
                 twitter_api_key, twitter_api_secret, twitter_access_token, twitter_access_token_secret,
                 twitter_posting_summary, twitter_posting_guidelines,
-                twitter_auto_post_checkbox, twitter_notify_approval_checkbox,
+                twitter_auto_post_checkbox,
+                twitter_approval_required_for_replies_checkbox,
+                twitter_notify_approval_checkbox,
                 twitter_premium_checkbox, twitter_privacy_filter_checkbox,
                 twitter_fetch_thread_checkbox, twitter_thread_fetch_count_slider
             ],
@@ -9131,12 +9254,29 @@ try:
         image_gen_provider_radio.change(
             fn=ui_handlers.handle_image_gen_provider_change,
             inputs=[image_gen_provider_radio],
-            outputs=[gemini_model_section, openai_image_section, pollinations_image_section, huggingface_image_section, image_gen_api_key_dropdown]
+            outputs=[
+                gemini_model_section, 
+                openai_image_section, 
+                pollinations_image_section, 
+                huggingface_image_section, 
+                image_gen_api_key_dropdown, 
+                local_image_section,  # ←ローカルでの画像生成を追加
+                fetch_image_models_button
+            ]
         )
 
         save_image_gen_button.click(
             fn=ui_handlers.handle_save_image_generation_settings,
-            inputs=[image_gen_provider_radio, image_gen_api_key_dropdown, gemini_image_model_dropdown, openai_image_profile_dropdown, openai_image_model_dropdown, pollinations_api_key_input, pollinations_image_model_dropdown, huggingface_api_token_input, huggingface_image_model_dropdown],
+            inputs=[
+                image_gen_provider_radio, image_gen_api_key_dropdown, gemini_image_model_dropdown, 
+                openai_image_profile_dropdown, openai_image_model_dropdown, 
+                pollinations_api_key_input, pollinations_image_model_dropdown, 
+                huggingface_api_token_input, huggingface_image_model_dropdown,
+                # --- ローカル設定を追加 ---
+                local_sd_url_input, local_sd_sampler_dropdown, local_sd_steps_slider, 
+                local_sd_cfg_slider, local_sd_positive_prefix_input, 
+                local_sd_positive_append_input, local_sd_negative_prompt_input
+            ],
             outputs=None
         )
 
@@ -9508,7 +9648,12 @@ try:
         user_gen_image_provider.change(
             fn=ui_handlers.update_user_gen_model_choices,
             inputs=[user_gen_image_provider, user_gen_image_openai_profile],
-            outputs=[user_gen_image_model, user_gen_image_openai_profile, user_gen_free_only_checkbox]
+            outputs=[
+                user_gen_image_model,
+                user_gen_image_openai_profile,
+                user_gen_free_only_checkbox,
+                user_gen_local_params_row # 可視性制御用に追加
+            ]
         )
 
         user_gen_image_openai_profile.change(
@@ -9522,7 +9667,11 @@ try:
             inputs=[
                 user_gen_image_prompt, user_gen_image_provider,
                 user_gen_image_model, user_gen_image_openai_profile,
-                current_room_name, current_api_key_name_state
+                current_room_name, current_api_key_name_state,
+                user_gen_local_aspect_ratio,
+                user_gen_local_sampler,
+                user_gen_local_steps,
+                user_gen_local_cfg
             ],
             outputs=[
                 user_gen_image_path_state, user_gen_image_display,
