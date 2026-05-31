@@ -6,6 +6,7 @@ from typing import Any, List, Union, Optional, Dict, Iterator
 import os
 import json
 import re
+import random
 import time
 import datetime
 import base64
@@ -1370,6 +1371,9 @@ def invoke_nexus_agent_stream(agent_args: dict) -> Iterator[Dict[str, Any]]:
             is_503 = _is_gemini_503_error(err_str, is_429=is_429)
             limit_type = _classify_gemini_429_limit(err_str) if is_429 else "RPM"
 
+            # [独自仕様] 待機時間の設定 (65～75秒のランダム)
+            nexus_backoff_wait = random.uniform(65, 75)
+
             if not is_429 and not is_503:
                 # 429以外のエラーは通常のエラーハンドリングへ
                 err_content = f"[エラー: AIモデル実行中にエラーが発生しました: {e}]"
@@ -1389,6 +1393,13 @@ def invoke_nexus_agent_stream(agent_args: dict) -> Iterator[Dict[str, Any]]:
             paid_key_names = config_manager.CONFIG_GLOBAL.get("paid_api_key_names", [])
             clean_current_key = config_manager._clean_api_key_name(current_retry_api_key_name)
             is_paid_key = clean_current_key in paid_key_names
+
+            # [独自仕様] RPM (分間制限) の場合は同一キーで粘る
+            if is_429 and limit_type != "RPD" and retry_count < 3:
+                retry_count += 1
+                print(f"  [RPM Wait] キー '{current_retry_api_key_name}' が分間制限に達しました。{nexus_backoff_wait:.1f}秒待機して再試行します... ({retry_count}/3)")
+                time.sleep(nexus_backoff_wait)
+                continue
 
             # 429エラーかつ有料キーの場合、即座にローテーションせず少し粘る
             if is_429 and is_paid_key and retry_count < 3:
@@ -1439,6 +1450,11 @@ def invoke_nexus_agent_stream(agent_args: dict) -> Iterator[Dict[str, Any]]:
                     limit_type=limit_type
                 )
                 print(f"  [Rotation] Key '{current_retry_api_key_name}' marked as exhausted ({limit_type}) for model '{failed_model}'.")
+                
+                # [独自仕様] RPD制限などで切り替える際も、次へ行く前にお行儀よく待機する
+                if limit_type == "RPD":
+                    print(f"  [RPD Wait] 日間制限につきキーを切り替えますが、その前に {nexus_backoff_wait:.1f}秒待機します...")
+                    time.sleep(nexus_backoff_wait)
             else:
                 print(f"  [Rotation] 503 Error rotation - Rotating to NEXT key without marking '{current_retry_api_key_name}' as exhausted.")
 

@@ -2,6 +2,7 @@
 
 import json
 import os
+import random
 import time
 from typing import Any, List, Dict, Tuple, Optional
 import time 
@@ -410,8 +411,6 @@ def save_config_if_changed(key: str, value: Any) -> bool:
         
     config[key] = value
     _save_config_file(config)
-    print(f"[config_manager] input_Key: {key}")  # DEBUG
-    print(f"[config_manager] input_value: {value}")  # DEBUG
     print(f"[config_manager]   -> Saved to file")  # DEBUG
     
     # 【重要】メモリ上の設定も更新して、再起動なしで反映させる
@@ -2321,8 +2320,6 @@ def get_effective_internal_model(role: str) -> Tuple[str, str, str]:
     
 
 # --- APIキーローテーション関連 ---
-
-
 def is_key_exhausted(key_name: str, model_name: str = None) -> bool:
     """
     指定されたキー（および必要に応じて特定のモデル）が現在枯渇状態かどうかを返す。
@@ -2367,7 +2364,8 @@ def is_key_exhausted(key_name: str, model_name: str = None) -> bool:
         reset_timestamp = state.get('reset_at', 0)
         # 後方互換性と安全のため、reset_at が無い場合は24時間とする
         if not reset_timestamp:
-            reset_timestamp = exhausted_at + 24 * 3600
+            #reset_timestamp = exhausted_at + 24 * 3600
+            reset_timestamp = exhausted_at + 25 * 3600  # 安全のため25時間後とする
             
         if time.time() < reset_timestamp:
             return True # まだRPDリセット時刻（太平洋時間0時）になっていない
@@ -2377,8 +2375,12 @@ def is_key_exhausted(key_name: str, model_name: str = None) -> bool:
             save_gemini_key_states()
             return False
     else:
+        # [独自仕様] 待機時間の設定 (65～75秒のランダム)
+        rpm_wait = random.uniform(65, 75)
+
         # RPM制限の自動復帰（1分クールダウン）
-        if time.time() - exhausted_at > 60:  # 1分 (GoogleのRPM制限を考慮)
+        #if time.time() - exhausted_at > 60:  # 1分 (GoogleのRPM制限を考慮)
+        if time.time() - exhausted_at > rpm_wait:  # 1分 (RPM制限の確実な回復を待機)
             print(f"--- [API Key Rotation] Key '{applied_state_key}' auto-recovered (1分経過/RPM回復) ---")
             GEMINI_KEY_STATES[applied_state_key]['exhausted'] = False
             save_gemini_key_states()
@@ -2409,10 +2411,12 @@ def mark_key_as_exhausted(key_name: str, model_name: str = None, limit_type: str
     
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
-    # Google APIのリセット時刻: 太平洋時間0時 (UTC 08:00 または 07:00)。安全のため遅い方の08:00を使用
-    reset_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    if now >= reset_time:
-        reset_time += datetime.timedelta(days=1)
+    ## Google APIのリセット時刻: 太平洋時間0時 (UTC 08:00 または 07:00)。安全のため遅い方の08:00を使用
+    #reset_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    #if now >= reset_time:
+    #    reset_time += datetime.timedelta(days=1)
+    # [独自仕様] 太平洋時間を無視し、検知から25時間後をリセット時刻とする
+    reset_time = now + datetime.timedelta(hours=25)
     
     GEMINI_KEY_STATES[state_key] = {
         'exhausted': True,
@@ -2449,6 +2453,7 @@ def get_next_available_gemini_key(current_exhausted_key: str = None, excluded_ke
     if current_exhausted_key:
         excluded_keys.add(current_exhausted_key)
         
+    # 有料キーのセットを取得
     config = load_config_file()
     paid_key_names = set(config.get("paid_api_key_names", []))
     
@@ -2464,7 +2469,18 @@ def get_next_available_gemini_key(current_exhausted_key: str = None, excluded_ke
     # current_exhausted_key があれば、その次から探索するようにリストをシフトする（巻き戻り防止）
     if current_exhausted_key and current_exhausted_key in all_valid_keys:
         idx = all_valid_keys.index(current_exhausted_key)
-        all_valid_keys = all_valid_keys[idx+1:] + all_valid_keys[:idx+1]
+        # シフトしたリストを作成し、次回の開始キー候補とする
+        #all_valid_keys = all_valid_keys[idx+1:] + all_valid_keys[:idx+1]
+        shifted_keys = all_valid_keys[idx+1:] + all_valid_keys[:idx+1]
+        
+        # 次回の開始キー候補のうち、最初の「無料キー」を _CURRENT_STARTING_KEY_NAME に予約しておく
+        # これにより、たとえこの後有料キーが選ばれても、次回の会話はここから始まる
+        for k in shifted_keys:
+            if k not in paid_key_names:
+                global _CURRENT_STARTING_KEY_NAME
+                _CURRENT_STARTING_KEY_NAME = k
+                break
+        all_valid_keys = shifted_keys
 
     # --- フェーズ1: 未試行かつ非枯渇のキーを探す ---
     # (無料 -> 有料 の順で、まだ今回のリトライループで試していないものを優先)
