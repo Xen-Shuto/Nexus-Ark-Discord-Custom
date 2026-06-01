@@ -7,6 +7,7 @@ from twitter_manager import twitter_manager
 import config_manager
 import utils
 import room_manager
+import discord_manager
 
 logger = logging.getLogger(__name__)
 
@@ -125,50 +126,64 @@ def draft_tweet(content: str, motivation: str = "", room_name: str = "", reply_t
         
         # 承認要請の通知
         if twitter_manager.should_notify_on_approval(room_name):
-            # 通知禁止時間帯のチェック
-            effective_settings = config_manager.get_effective_settings(room_name)
-            auto_settings = effective_settings.get("autonomous_settings", {})
-            quiet_start = auto_settings.get("quiet_hours_start", "00:00")
-            quiet_end = auto_settings.get("quiet_hours_end", "07:00")
-            
-            preview = content[:50] + ("..." if len(content) > 50 else "")
-            
-            if utils.is_in_quiet_hours(quiet_start, quiet_end):
-                # 通知禁止時間帯でもログには残す
-                log_f, _, _, _, _, _, _ = room_manager.get_room_files_paths(room_name)
-                if log_f:
-                    utils.save_message_to_log(log_f, "## SYSTEM:notification_blocked", f"📱 **Twitter承認要請通知（送信されず）**\n\n「{preview}」")
-                message += "\n\n📱 通知禁止時間帯のため、スマホへの通知は抑制されました（ログには記録されました）。"
+            # --- Twitterの下書きをDiscordから承認 ---
+            ## 通知禁止時間帯のチェック
+            #effective_settings = config_manager.get_effective_settings(room_name)
+            #auto_settings = effective_settings.get("autonomous_settings", {})
+            #quiet_start = auto_settings.get("quiet_hours_start", "00:00")
+            #quiet_end = auto_settings.get("quiet_hours_end", "07:00")
+            #
+            #preview = content[:50] + ("..." if len(content) > 50 else "")
+            #
+            #if utils.is_in_quiet_hours(quiet_start, quiet_end):
+            #    # 通知禁止時間帯でもログには残す
+            #    log_f, _, _, _, _, _, _ = room_manager.get_room_files_paths(room_name)
+            #    if log_f:
+            #        utils.save_message_to_log(log_f, "## SYSTEM:notification_blocked", f"📱 **Twitter承認要請通知（送信されず）**\n\n「{preview}」")
+            #    message += "\n\n📱 通知禁止時間帯のため、スマホへの通知は抑制されました（ログには記録されました）。"
+            #else:
+            #    try:
+            #        import alarm_manager
+            #        notification_result = alarm_manager.send_notification(
+            #            room_name,
+            #            f"📝 新しいTwitter下書きが承認待ちです:\n「{preview}」",
+            #            {},
+            #            notification_kind="notification",
+            #        )
+            #        if isinstance(notification_result, dict) and notification_result.get("success"):
+            #            message += "\n\n📱 承認要請の通知をスマホに送信しました。"
+            #        else:
+            #            reason = "通知送信結果を確認できませんでした。"
+            #            if isinstance(notification_result, dict):
+            #                reason_parts = []
+            #                if notification_result.get("message"):
+            #                    reason_parts.append(str(notification_result["message"]))
+            #                if notification_result.get("status_code") is not None:
+            #                    reason_parts.append(f"HTTP {notification_result['status_code']}")
+            #                if notification_result.get("request_id"):
+            #                    reason_parts.append(f"request={notification_result['request_id']}")
+            #                errors = notification_result.get("errors") or []
+            #                if errors:
+            #                    reason_parts.append(" / ".join(str(error) for error in errors))
+            #                reason = " / ".join(reason_parts) if reason_parts else "通知送信に失敗しました。"
+            #            message += f"\n\n📱 承認要請の通知送信に失敗しました: {reason}"
+            #    except Exception as notify_err:
+            #        logger.warning(f"承認要請通知の送信に失敗: {notify_err}")
+            #        message += f"\n\n📱 承認要請の通知送信に失敗しました: {notify_err}"
+            # ----------------------------------------
+            preview = content
+            if res["is_modified"]:
+                preview = res['filtered']
+
+            discord_result = discord_manager.send_twitter_approval_request(
+                room_name, draft_id, preview, media_paths
+            )
+            if discord_result.get("success"):
+                message += "\n\n✅ Discordに承認用の操作ボタンを送信しました。"
             else:
-                try:
-                    import alarm_manager
-                    notification_result = alarm_manager.send_notification(
-                        room_name,
-                        f"📝 新しいTwitter下書きが承認待ちです:\n「{preview}」",
-                        {},
-                        notification_kind="notification",
-                    )
-                    if isinstance(notification_result, dict) and notification_result.get("success"):
-                        message += "\n\n📱 承認要請の通知をスマホに送信しました。"
-                    else:
-                        reason = "通知送信結果を確認できませんでした。"
-                        if isinstance(notification_result, dict):
-                            reason_parts = []
-                            if notification_result.get("message"):
-                                reason_parts.append(str(notification_result["message"]))
-                            if notification_result.get("status_code") is not None:
-                                reason_parts.append(f"HTTP {notification_result['status_code']}")
-                            if notification_result.get("request_id"):
-                                reason_parts.append(f"request={notification_result['request_id']}")
-                            errors = notification_result.get("errors") or []
-                            if errors:
-                                reason_parts.append(" / ".join(str(error) for error in errors))
-                            reason = " / ".join(reason_parts) if reason_parts else "通知送信に失敗しました。"
-                        message += f"\n\n📱 承認要請の通知送信に失敗しました: {reason}"
-                except Exception as notify_err:
-                    logger.warning(f"承認要請通知の送信に失敗: {notify_err}")
-                    message += f"\n\n📱 承認要請の通知送信に失敗しました: {notify_err}"
-            
+                message += f"\n\n⚠️ Discordへのボタン送信に失敗しました: {discord_result.get('error')}"
+            # ----------------------------------------
+
         return message
         
     except Exception as e:
