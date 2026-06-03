@@ -228,7 +228,9 @@ app/characters/*
 !app/characters/_shared/memory/
 !app/characters/_shared/memory/procedures/
 app/characters/_shared/memory/procedures/*
-!app/characters/_shared/memory/procedures/sample*
+!app/characters/_shared/memory/procedures/autonomy_reflect_and_close.md
+!app/characters/_shared/memory/procedures/sample_safe_context_update.md
+!app/characters/_shared/memory/procedures/skill_creation_duplicate_check.md
 app/metadata/
 app/.memos/
 app/.gemini_key_states.json
