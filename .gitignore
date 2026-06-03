@@ -223,7 +223,12 @@ __marimo__/
 #############################################################
 app/backups/
 app/characters/*
+#!app/characters/_shared/
 !app/characters/_shared/
+!app/characters/_shared/memory/
+!app/characters/_shared/memory/procedures/
+app/characters/_shared/memory/procedures/*
+!app/characters/_shared/memory/procedures/sample*
 app/metadata/
 app/.memos/
 app/.gemini_key_states.json
