@@ -1562,12 +1562,29 @@ def context_generator_node(state: AgentState):
         image_generation_enabled = False
     else:
         image_generation_enabled = True
+        #image_generation_manual_text = (
+        #    "### 1. ツール呼び出しの共通作法\n"
+        #    "`generate_image`, `plan_..._edit`, `set_current_location` を含む全てのツール呼び出しは、以下の作法に従います。\n"
+        #    "- **手順1（ツール呼び出し）:** 対応するツールを**無言で**呼び出します。この応答には、思考ブロックや会話テキストを一切含めてはなりません。\n"
+        #    "- **手順2（テキスト応答）:** ツール成功後、システムからの結果報告を受け、それを元にした思考整理と会話を生成し、ユーザーに報告します。思考ログの具体的な出力形式は【原則2】に従ってください。"
+        #)
+        #image_generation_manual_text = (
+        #    "### 1. ツール呼び出しの共通作法\n"
+        #    "`generate_image`, `plan_..._edit`, `set_current_location` を含む全てのツール呼び出しは、以下の作法に従います。\n"
+        #    "- **手順1（ツール呼び出し）:** **対応するツールの呼び出しコードのみを出力してください。** 挨拶、思考ログ、解説は一切不要です。\n"
+        #    "- **手順2（テキスト応答）:** **手順1が完了した時のみ、この手順を開始します。** 結果を元に、ユーザーへの報告と会話を生成してください。この際の思考ログ出力は【原則2】を厳守してください。"
+        #)
         image_generation_manual_text = (
-            "### 1. ツール呼び出しの共通作法\n"
-            "`generate_image`, `plan_..._edit`, `set_current_location` を含む全てのツール呼び出しは、以下の作法に従います。\n"
-            "- **手順1（ツール呼び出し）:** 対応するツールを**無言で**呼び出します。この応答には、思考ブロックや会話テキストを一切含めてはなりません。\n"
-            "- **手順2（テキスト応答）:** ツール成功後、システムからの結果報告を受け、それを元にした思考整理と会話を生成し、ユーザーに報告します。思考ログの具体的な出力形式は【原則2】に従ってください。"
+            "### 1. ツール実行プロトコル（共通仕様）\n"
+            "ツール（画像生成、ファイル編集、外部送信、移動等）を使用する場合、システムとの同期を保つため、以下の2段階プロセスを厳格に遵守してください。\n\n"
+            "- **フェーズ1：実行要請ターン（無言）**\n"
+            "  ツールが必要な場合、一切の挨拶、思考ログ（[THOUGHT]）、解説、実況テキストを排除し、**ツール呼び出し（tool_calls）のみを生成して、即座に生成を終了（Stop）してください。**\n"
+            "  呼び出しの後に1文字でもテキストが混入すると、システム側での同期が失敗し、アクションは実行されません。沈黙を維持して制御権をシステムに返却してください。\n"
+            "- **フェーズ2：結果受領後の応答ターン**\n"
+            "  システムからツールの実行結果が返された『次のターン』で、初めてその結果を元にした思考整理とユーザーへの返答を行ってください。この際の思考ログ出力は【原則2】を厳守してください。\n\n"
+            "※実行前に「実行します」と宣言することや、結果を受け取る前に「完了しました」と予測報告することは、プロトコル違反（ハルシネーション）となるため厳禁です。"
         )
+        #print(f"  - [Action Plan] [DEBUG] {image_generation_manual_text}")  # DEBUG
 
     custom_tool_catalog_text = "現在有効な拡張ツールはありません。"
     try:
@@ -1712,6 +1729,8 @@ def context_generator_node(state: AgentState):
         "find_similar_research_threads": "類似する継続研究スレッドを探す",
         "update_research_thread": "継続研究スレッドを作成・更新する",
         "request_capability": "使いたい能力カテゴリをシステムに要求する",
+        "send_discord_message": "許可されたDiscordチャンネルへメッセージや画像を送信する",
+        "send_discord_image": "許可されたDiscordチャンネルへメッセージや画像を送信する",
         "draft_tweet": "Twitter/X投稿の下書きを作成し、ユーザー承認キューに入れる（実投稿はしない）",
         "post_tweet": "承認済みTwitter/X下書きを実投稿する",
         "check_twitter_updates": "Twitter/Xのタイムライン・メンション・通知を確認する",
@@ -1770,6 +1789,35 @@ def context_generator_node(state: AgentState):
             desc += f"\n  【自律行動の指針（必ず遵守すること）】: {autonomous_guidelines}"
 
         tools_list_parts.append(f"- `{tool.name}`: {desc}")
+#    capability_catalog = f"""### 能力カタログ
+#あなたは、必要だと判断したタイミングで以下の能力カテゴリを自由に要求できます。ユーザーに頼まれていない場合でも、あなた自身の判断で使って構いません。
+#- `world`: 別の場所へ移動したい、移動先の一覧を見たい、世界設定を変更・確認したい時
+#- `memory`: 過去を思い出したい、日記・永続記憶・エンティティ記憶を読み書きしたい時
+#- `notes`: メモ・ワーキングメモリ・創作ノート・研究ノートを読み書きしたい時
+#- `web`: 何かをWeb検索したい、URLの中身を読みたい時
+#- `image`: 画像を生成したい、過去の画像を見返したい時
+#- `time`: アラーム・タイマー・ポモドーロを設定したい時
+#- `autonomy`: 次の自律行動を予約したい、行動計画を確認・取消したい、ユーザーに通知したい時
+#- `music`: 音楽を推薦したい時。再生はせず、曲名・理由・無料環境でも開ける検索リンク付きカードを作る
+#- `procedure`: Skills / 手順記憶を確認・利用・作成・改善したい時。反復作業、以前成功した作業、更新前の確認、成功パターンの保存ではこのカテゴリを要求する
+#- `watchlist`: URLの定期監視を追加・管理したい時
+#- `items`: アイテムを作って贈りたい、食べ物を作りたい、所持品を確認・使用したい、場所にものを置きたい時
+#- `chess`: チェスを遊びたい時
+#- `developer`: プロジェクトファイルを確認したい時
+#- `roblox`: Roblox/Cluster内で操作したい時（接続時のみ）
+#- `twitter`: Twitter/Xで投稿・閲覧したい時（有効時のみ）
+#- `discord`: Discordへメッセージや画像を送信したい時
+#- `custom`: ユーザーが追加したMCP/ローカルプラグインを使いたい時
+#
+#### 拡張ツールの概略
+#{custom_tool_catalog_text}
+#
+#まず `request_capability` で使いたいカテゴリと意図を宣言してください。次の思考ステップで、そのカテゴリの実ツールが提示されます。
+#補助情報（場所一覧や所持品リスト等）も自動的に付加されるため、すぐに行動できます。
+#ユーザー追加の拡張ツールを使いたい時は `custom` を要求してください。
+#Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/PC操作/開発者系など外部副作用や高リスク操作を伴うカテゴリでは、実ツール実行前に `read_capability_policy` と `request_capability_approval` を使ってください。返却statusが `approved` でない場合は実行せず、承認待ちまたは拒否として止まってください。`draft_tweet` はローカル下書き作成のみで実投稿しないため、この承認確認を挟まず直接呼び出して構いません。実行後は必要に応じて `record_capability_audit` に結果と戻し方を記録してください。
+#
+#**重要: `room_name` 引数はすべてのツールでシステムが自動的に設定します。あなたが指定する必要はありません。**"""
     capability_catalog = f"""### 能力カタログ
 あなたは、必要だと判断したタイミングで以下の能力カテゴリを自由に要求できます。ユーザーに頼まれていない場合でも、あなた自身の判断で使って構いません。
 - `world`: 別の場所へ移動したい、移動先の一覧を見たい、世界設定を変更・確認したい時
@@ -1793,8 +1841,10 @@ def context_generator_node(state: AgentState):
 ### 拡張ツールの概略
 {custom_tool_catalog_text}
 
-まず `request_capability` で使いたいカテゴリと意図を宣言してください。次の思考ステップで、そのカテゴリの実ツールが提示されます。
-補助情報（場所一覧や所持品リスト等）も自動的に付加されるため、すぐに行動できます。
+**【システム仕様：行動と発言の分離】**
+**「〜を実行します」「〜を送信します」と言葉で書くだけでは、システムは何のアクションも起こしません。** それは単なる「発言」であり、失敗とみなされます。
+アクションを起こすには、テキストを生成する前に、必ず `request_capability` または実ツールを **API（tool_calls）として物理的に呼び出してください。** 手元に目的のツールがない場合は、まず `request_capability` でそのカテゴリを要求することが唯一の解決策です。
+
 ユーザー追加の拡張ツールを使いたい時は `custom` を要求してください。
 Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/PC操作/開発者系など外部副作用や高リスク操作を伴うカテゴリでは、実ツール実行前に `read_capability_policy` と `request_capability_approval` を使ってください。返却statusが `approved` でない場合は実行せず、承認待ちまたは拒否として止まってください。`draft_tweet` はローカル下書き作成のみで実投稿しないため、この承認確認を挟まず直接呼び出して構いません。実行後は必要に応じて `record_capability_audit` に結果と戻し方を記録してください。
 
@@ -1814,7 +1864,7 @@ Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/P
         if available_expressions_dict:
             expr_names = ", ".join([f"`{name}`" for name in available_expressions_dict.keys()])
             avatar_expression_manual_text = f"""
-        ## 【原則2.51】アバター表情の制御（演技への反映）
+        ## 【原則2】アバター表情の制御（演技への反映）
         現在、あなたのアバターで使用可能な表情は以下の通りです：
         {expr_names}
 
@@ -2610,6 +2660,8 @@ def agent_node(state: AgentState):
                     "total_tokens": getattr(actual_usage, "total_tokens", None) or getattr(actual_usage, "total_token_count", 0)
                 }
 
+        #print(f"  - [GRAPH] [{room_name}] RESPONSE: {response}")  # DEBUG
+
         # [2026-05-16 MOD] ツール内容によるループ消費量の重み付け
         tool_weight = 1.0
         if getattr(response, "tool_calls", None):
@@ -3124,8 +3176,24 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
             print("  - AIからの応答を受け、ファイル書き込みを実行します. ")
 
             if is_editing_task:
+                # 1. ```json ``` ブロックの抽出を試みる
                 json_match = re.search(r'```json\s*([\s\S]*?)\s*```', edited_content_document, re.DOTALL)
-                content_to_process = json_match.group(1).strip() if json_match else edited_content_document
+                #content_to_process = json_match.group(1).strip() if json_match else edited_content_document
+                if json_match:
+                    content_to_process = json_match.group(1).strip()
+                else:
+                    # 2. ブロックがない場合、最初の '[' または '{' から末尾の対応記号までを抽出
+                    start_match = re.search(r'[\[\{]', edited_content_document)
+                    if start_match:
+                        raw_potential = edited_content_document[start_match.start():].strip()
+                        end_pos = max(raw_potential.rfind(']'), raw_potential.rfind('}'))
+                        content_to_process = raw_potential[:end_pos+1] if end_pos != -1 else raw_potential
+                    else:
+                        content_to_process = edited_content_document.strip()
+
+                if not content_to_process:
+                     raise ValueError("編集AIからの応答が空、または有効なJSON構造が含まれていないため解析できませんでした。")
+
                 instructions = json.loads(content_to_process)
 
                 if is_plan_identity_memory:
@@ -3206,6 +3274,11 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
                     tool_args["content"] = tool_args.pop("text")
                 elif "message" in tool_args and "content" not in tool_args:
                     tool_args["content"] = tool_args.pop("message")
+            # --- [Discord] 引数名の正規化 (content vs message/text) ---
+            if tool_name == "send_discord_message" or tool_name == "send_discord_image":
+                for alias in ["message", "text", "message_text"]:
+                    if alias in tool_args and "content" not in tool_args:
+                        tool_args["content"] = tool_args.pop(alias)
             if tool_name == "manage_goals":
                 tool_args = _normalize_manage_goals_tool_args(tool_args)
             # --- [Item] 引数名の正規化 (amount vs count/quantity) とデフォルト値 ---

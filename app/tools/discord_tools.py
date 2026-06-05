@@ -3,7 +3,7 @@ from langchain_core.tools import tool
 
 
 @tool
-def send_discord_message(message: str, room_name: str, channel_id: Optional[str] = None, image_paths: Optional[List[str]] = None) -> str:
+def send_discord_message(content: str, room_name: str, channel_id: Optional[str] = None, image_paths: Optional[List[str]] = None) -> str:
     """
     許可されたDiscordチャンネルへメッセージや画像を送信します。
 
@@ -12,37 +12,57 @@ def send_discord_message(message: str, room_name: str, channel_id: Optional[str]
     送信先チャンネルが許可済みの場合にのみ成功します。
 
     Args:
-        message: Discordへ送信する本文。
+        content: Discordへ送信する本文。
         room_name: (システムで自動入力)
         channel_id: 送信先チャンネルID。省略時はペルソナ設定のデフォルト送信チャンネルを使います。
         image_paths: 添付する画像ファイルパスのリスト（任意）。
     """
+    # --- DEBUG ---
+    print(f"   [Discord Tool] [{room_name}] USE: send_discord_message")
+    print(f"   [Discord Tool] [{room_name}] Channel Id: {channel_id}")
+    print(f"   [Discord Tool] [{room_name}] content: {content[0:100]}")
+    print(f"   [Discord Tool] [{room_name}] ImagePaths: {image_paths}")
+    # -------------
+
+    if not content and not image_paths:
+        return "エラー: 送信する本文または画像が指定されていません。"
+
     try:
         import discord_manager
-        result = discord_manager.send_message_to_room(room_name, message, channel_id=channel_id, image_paths=image_paths)
+        result = discord_manager.send_message_to_room(room_name, content, channel_id=channel_id, image_paths=image_paths)
         if result.get("success"):
-            return result.get("message", "Discordへ送信しました。")
+            return result.get("content", "Discordへ送信しました。")
         return f"Discord送信に失敗しました: {result.get('error', '不明なエラー')}"
     except Exception as e:
         return f"Discord送信に失敗しました: {e}"
 
 
 @tool
-def send_discord_image(message: str, image_paths: List[str], room_name: str, channel_id: Optional[str] = None) -> str:
+def send_discord_image(content: str, image_paths: List[str], room_name: str, channel_id: Optional[str] = None) -> str:
     """
     許可されたDiscordチャンネルへ画像付きメッセージを送信します。
 
     Args:
-        message: 画像に添える本文。
+        content: 画像に添える本文。
         image_paths: 添付する画像ファイルパスのリスト。
         room_name: (システムで自動入力)
         channel_id: 送信先チャンネルID。省略時はペルソナ設定のデフォルト送信チャンネルを使います。
     """
+    # --- DEBUG ---
+    print(f"   [Discord Tool] [{room_name}] USE: send_discord_image")
+    print(f"   [Discord Tool] [{room_name}] Channel Id: {channel_id}")
+    print(f"   [Discord Tool] [{room_name}] content: {content[0:100]}")
+    print(f"   [Discord Tool] [{room_name}] ImagePaths: {image_paths}")
+    # -------------
+
+    if not content and not image_paths:
+        return "エラー: 送信する本文または画像が指定されていません。"
+
     try:
         import discord_manager
-        result = discord_manager.send_message_to_room(room_name, message, channel_id=channel_id, image_paths=image_paths)
+        result = discord_manager.send_message_to_room(room_name, content, channel_id=channel_id, image_paths=image_paths)
         if result.get("success"):
-            return result.get("message", "Discordへ画像を送信しました。")
+            return result.get("content", "Discordへ画像を送信しました。")
         return f"Discord画像送信に失敗しました: {result.get('error', '不明なエラー')}"
     except Exception as e:
         return f"Discord画像送信に失敗しました: {e}"

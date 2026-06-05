@@ -1,6 +1,8 @@
 # tools/twitter_tools.py
 from typing import Optional, Dict, Any, Union, List
 import logging
+import os
+import re
 from langchain_core.tools import tool
 
 from twitter_manager import twitter_manager
@@ -32,25 +34,81 @@ def draft_tweet(content: str, motivation: str = "", room_name: str = "", reply_t
     Returns:
         処理結果のメッセージ。
     """
+    # --- DEBUG
+    print("\n" + "="*50)
+    print(f"[DRAFT_TWEET] ツイートの下書き作成して承認要請開始")
+    print(f"  - 本文: {content}")
+    print(f"  - 投稿動機: {motivation}")
+    print(f"  - 部屋名: {room_name}")
+    print(f"  - 画像のパス: {media_paths}")
+    print("="*50)
+
     try:
         # リプライ用の @ユーザー名 が本文先頭にある場合は自動で取り除く（TwitterUIが自動補完するため不要）
-        import re
         content = re.sub(r'^@[a-zA-Z0-9_]+\s*', '', content).strip()
+
+        # --- 画像パスを検知したら添付画像に置換 ---
+        hallucinated_paths = []
+        final_media_paths = []
+
+        # 1. 引数 media_paths のチェック
+        if media_paths:
+            for p in media_paths:
+                if p and os.path.exists(p):
+                    final_media_paths.append(p)
+                elif p:
+                    hallucinated_paths.append(p)
         
+        patterns = {
+            'internal': r'\[(?:VIEW_IMAGE|GENERATED_IMAGE|ファイル添付|Generated Image):\s*(.*?)\]',
+            'markdown': r'!\[.*?\]\((.*?)\)',
+            'raw_path': r'(?:^|\s|["\'])([a-zA-Z]:[\\/][^:?*<>|\s\n]+\.(?:png|jpg|jpeg|webp|gif|mp4|webm)|[^:?*<>|\s\n]+\.(?:png|jpg|jpeg|webp|gif|mp4|webm))'
+        }
+
+        # 本文内の画像パスを検知してリストに追加
+        for p_type, p_regex in patterns.items():
+            matches = re.findall(p_regex, content)
+            for match_val in matches:
+                path_clean = match_val.strip().strip('"').strip("'")
+                if path_clean and os.path.exists(path_clean):
+                    if path_clean not in final_media_paths:
+                        final_media_paths.append(path_clean)
+                    
+                    # 本文内のパスを絵文字に置換して文字数を節約
+                    content = content.replace(match_val, "")
+                else:
+                    if path_clean:
+                        hallucinated_paths.append(path_clean)
+                        content = content.replace(match_val, "")
+
+        # 独自タグとMarkdownタグを最終清掃
+        content = re.sub(patterns['internal'], '', content, flags=re.IGNORECASE)
+        content = re.sub(patterns['markdown'], '', content)
+        content = utils.clean_persona_text(content).strip()
+
+        # 枚数制限チェック（抽出後の合計で判定）
+        if len(final_media_paths) > 4:
+            return f"❌ エラー: 画像は最大4枚までしか添付できません。（現在: {len(final_media_paths)}枚検知）"
+        # ------------------------------------------
+
         # 下書き追加前に、文字数やフィルター結果を確認する
         res = twitter_manager.apply_privacy_filter(content, room_name=room_name)
         limit = twitter_manager.get_twitter_post_limit(room_name)
-        
+
         if res.get("twitter_length", 0) > limit:
             return f"❌ エラー: 文字数制限超過 (Twitter換算 {res['twitter_length']}/{limit}文字)。\n短く要約するか、不要な情報を削ってから再実行してください。"
 
-        # 枚数制限チェック
-        if media_paths and len(media_paths) > 4:
-            return "❌ エラー: 画像は最大4枚までしか添付できません。"
+        # --- 画像パスを検知したら添付画像に置換 ---
+        ## 枚数制限チェック
+        #if media_paths and len(media_paths) > 4:
+        #    return "❌ エラー: 画像は最大4枚までしか添付できません。"
+        # ------------------------------------------
 
         # リストインデックスを利用して参照元を解決
         if reply_to_list_index is not None:
-            if 0 < reply_to_list_index <= len(twitter_manager.last_fetched_tweets):
+            #if 0 < reply_to_list_index <= len(twitter_manager.last_fetched_tweets):
+            fetched = getattr(twitter_manager, 'last_fetched_tweets', [])
+            if 0 < reply_to_list_index <= len(fetched):
                 target_tweet = twitter_manager.last_fetched_tweets[reply_to_list_index - 1]
                 reply_to_url = target_tweet.get("url")
                 reply_to_id = str(target_tweet.get("id"))
@@ -61,7 +119,10 @@ def draft_tweet(content: str, motivation: str = "", room_name: str = "", reply_t
                 return f"❌ エラー: 指定されたリスト番号 ({reply_to_list_index}) は無効です。直近に取得したリストの範囲（1〜{max_len}）内で指定してください。"
 
         # 下書き追加
-        draft_id = twitter_manager.add_draft(content, room_name, reply_to_url=reply_to_url, reply_to_id=reply_to_id, media_paths=media_paths)
+        # --- 画像パスを検知したら添付画像に置換 ---
+        #draft_id = twitter_manager.add_draft(content, room_name, reply_to_url=reply_to_url, reply_to_id=reply_to_id, media_paths=media_paths)
+        draft_id = twitter_manager.add_draft(content, room_name, reply_to_url=reply_to_url, reply_to_id=reply_to_id, media_paths=final_media_paths)
+        # ------------------------------------------
         
         # --- Twitter活動記録 (External Codex) ---
         try:
@@ -78,7 +139,10 @@ def draft_tweet(content: str, motivation: str = "", room_name: str = "", reply_t
                 reply_to=reply_to_info,
                 status="pending",
                 draft_id=draft_id,
-                media_paths=media_paths # 拡張
+                # --- 画像パスを検知したら添付画像に置換 ---
+                #media_paths=media_paths # 拡張
+                media_paths=final_media_paths # 拡張
+                # ------------------------------------------
             )
         except Exception as log_err:
             logger.warning(f"Twitter活動ログの記録に失敗（投稿処理自体は継続）: {log_err}")
@@ -112,14 +176,22 @@ def draft_tweet(content: str, motivation: str = "", room_name: str = "", reply_t
         
         # --- 通常フロー（承認待ち） ---
         message = f"Twitter下書き (ID: {draft_id}) を作成し、承認キューに追加しました。"
-        if media_paths:
-            message += f"（画像 {len(media_paths)} 枚添付）"
+        # --- 画像パスを検知したら添付画像に置換 ---
+        #if media_paths:
+        #    message += f"（画像 {len(media_paths)} 枚添付）"
+        if final_media_paths:
+            message += f"（画像 {len(final_media_paths)} 枚添付）"
+        # ------------------------------------------
             
         if reply_to_url:
             message += f"\n🔗 返信先: {reply_to_url}"
             
         if res["is_modified"]:
             message += f"\n\n🚨 プライバシー保護のため、一部の文言を自動置換しました：\n「{res['filtered']}」"
+        
+        # 存在しないパスへのフィードバック
+        if hallucinated_paths:
+            message += f"\n\nℹ️ お知らせ: 指定された画像パス {', '.join(hallucinated_paths)} はシステム上で確認できなかったため、除外して下書きを作成しました。画像付きで投稿したい場合は、実在する画像パスを再確認してください。"
         
         if res["warnings"]:
             message += "\n\n⚠️ 警告：\n" + "\n".join([f"・{w}" for w in res["warnings"]])
@@ -175,9 +247,14 @@ def draft_tweet(content: str, motivation: str = "", room_name: str = "", reply_t
             if res["is_modified"]:
                 preview = res['filtered']
 
+            # --- 画像パスを検知したら添付画像に置換 ---
+            #discord_result = discord_manager.send_twitter_approval_request(
+            #    room_name, draft_id, preview, media_paths
+            #)
             discord_result = discord_manager.send_twitter_approval_request(
-                room_name, draft_id, preview, media_paths
+                room_name, draft_id, preview, final_media_paths
             )
+            # ------------------------------------------
             if discord_result.get("success"):
                 message += "\n\n✅ Discordに承認用の操作ボタンを送信しました。"
             else:
@@ -269,6 +346,9 @@ def post_tweet(draft_id: str, room_name: str = "") -> str:
     （注：このツールは通常、ユーザーの承認後にシステム内部から自動実行されるか、
     ペルソナが承認済みであることを確認して明示的に実行するために使われます）
     
+    重要：このツールで新しい投稿を作成することはできません。
+          新しくツイートしたい場合は、`post_tweet` ではなく `draft_tweet` ツールを使用して下書きから作成してください。
+    
     Args:
         draft_id: 承認済みの下書きID
         room_name: (システムで自動入力)
@@ -278,6 +358,19 @@ def post_tweet(draft_id: str, room_name: str = "") -> str:
     """
     try:
         # Phase 2: 実際の投稿実行
+        # 下書きの存在確認
+        from twitter_manager import twitter_manager
+        twitter_manager.reload()
+        pending = twitter_manager.get_pending_list()
+        draft_exists = any(str(d.get("id")) == str(draft_id) for d in pending)
+
+        if not draft_exists:
+            # AIが間違えて使用した場合、明確に「作り直せ」と指示してループを脱出させる
+            return (
+                f"❌ エラー: 指定された下書きID '{draft_id}' は存在しないか、既に処理済みです。\n"
+                "新しくツイートしたい場合は、`post_tweet` ではなく `draft_tweet` ツールを使用して下書きから作成してください。"
+            )
+
         result = twitter_manager.execute_post(draft_id)
         
         if result["success"]:

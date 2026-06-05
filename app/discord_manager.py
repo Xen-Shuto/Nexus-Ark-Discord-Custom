@@ -97,6 +97,25 @@ _unmentioned_help_claims_lock = threading.Lock()
 _group_command_claims: Dict[str, float] = {}
 _group_command_claims_lock = threading.Lock()
 
+# --- [追加] Discord専用 共通運用ルール ---
+DISCORD_COMMON_INSTRUCTION = """
+【Discord運用ルール】
+1. 画像の生成と表示について:
+   - 画像を表示させたい場合は、必ず `generate_image` 等のツールを先に実行し、その結果得られた正確なファイルパスを使用してください。
+   - ツールを実行せずに「予想されるパス」を回答に記述しても、システム側で画像を正しく添付することができません。
+   - 確実な画像送信のため、ツールの出力結果（[VIEW_IMAGE: パス] 等）をそのまま回答に含めるようにしてください。
+"""
+#DISCORD_COMMON_INSTRUCTION = """
+#【Discord運用ルール】
+#1. 画像の表示:
+#   - あなたが画像を生成（generate_imageツール等）したり、画像ファイルを指定したりした場合、そのファイルパスを必ず回答本文の中に `[VIEW_IMAGE: パス]` の形式、あるいはMarkdown形式 `![image](パス)` で含めてください。
+#   - パスが含まれていないと、システムは画像をDiscordに添付することができません。
+#
+#2. 返信の制御:
+#   - 特定の発言に対して明確に「返信（リプライ）」機能を使いたい場合は、回答のどこかに `<action:reply/>` と記述してください。
+#"""
+
+
 # 後方互換用。旧コードやUIが参照しても落ちないように残す。
 _bot_thread: Optional[threading.Thread] = None
 _bot_client: Optional["NexusDiscordClient"] = None
@@ -2168,13 +2187,18 @@ class NexusDiscordClient(discord.Client):
 
         effective_settings = config_manager.get_effective_settings(room_name)
         display_thoughts = effective_settings.get("display_thoughts", True)
+
+        # 共通ルールをユーザープロンプトの先頭に注入
+        final_prompt_parts = [DISCORD_COMMON_INSTRUCTION, user_content]
+
         agent_args = {
             "room_to_respond": room_name,
             "api_key_name": effective_settings.get("api_key_name") or config_manager.initial_api_key_name_global,
             "api_history_limit": effective_settings.get("api_history_limit_option", constants.DEFAULT_API_HISTORY_LIMIT_OPTION),
             "debug_mode": False,
             "history_log_path": log_file,
-            "user_prompt_parts": [user_content],
+            #"user_prompt_parts": [user_content],
+            "user_prompt_parts": final_prompt_parts,
             "soul_vessel_room": room_name,
             "active_participants": [],
             "active_attachments": attachments_paths,
@@ -2240,7 +2264,58 @@ class NexusDiscordClient(discord.Client):
                     except Exception as e:
                         logger.error(f"Failed to save AI response to log: {e}")
 
-                final_text = utils.clean_persona_text(full_response)
+                #final_text = utils.clean_persona_text(full_response)
+                # --- 画像パスを検知したら添付画像に置換 ---
+                final_text = full_response
+                generated_images = []
+                hallucinated_paths = []
+
+                print(f"\n[DEBUG_DISCORD] [REPLY] AI_RAW_RESPONSE:\n{full_response[0:100]}\n")  # DEBUG
+
+                patterns = {
+                    'internal': r'\[(?:VIEW_IMAGE|GENERATED_IMAGE|ファイル添付|Generated Image):\s*(.*?)\]',
+                    'markdown': r'!\[.*?\]\((.*?)\)',
+                    'raw_path': r'(?:^|\s|["\'])([a-zA-Z]:[\\/][^:?*<>|\s\n]+\.(?:png|jpg|jpeg|webp|gif|mp4|webm)|[^:?*<>|\s\n]+\.(?:png|jpg|jpeg|webp|gif|mp4|webm))'
+                }
+
+                # 応答メッセージ内の画像検知・抽出
+                for p_type, p_regex in patterns.items():
+                    matches = re.findall(p_regex, final_text)
+                    if matches:
+                        print(f"[DEBUG_DISCORD] Pattern '{p_type}' found: {matches}")  # DEBUG
+
+                    for match_val in matches:
+                        path_clean = match_val.strip().strip('"').strip("'")
+                        if path_clean and os.path.exists(path_clean):
+                            print(f"[DEBUG_DISCORD] File VALID and EXISTS: {path_clean}")  # DEBUG
+                            if path_clean not in generated_images:
+                                generated_images.append(path_clean)
+                            # 実在するパスのみ「📸」に置き換える
+                            if p_type == 'raw_path':
+                                final_text = final_text.replace(match_val, " 📸 ")
+                        else:
+                            if path_clean:
+                                print(f"[DEBUG_DISCORD] File NOT FOUND or INVALID: {path_clean}")  # DEBUG
+                                hallucinated_paths.append(path_clean)
+                                # 予測されたパスの記述は、Discord上では完全に消去して残骸を残さない
+                                final_text = final_text.replace(match_val, "")
+
+                # 独自タグとMarkdown画像タグを消去（または📸に置換）
+                final_text = re.sub(patterns['internal'], ' 📸 ', final_text, flags=re.IGNORECASE)
+                final_text = re.sub(patterns['markdown'], ' 📸 ', final_text)
+                
+                # クリーニングと体裁調整
+                final_text = utils.clean_persona_text(final_text).strip()
+                final_text = re.sub(r'\s*📸\s*', ' 📸 ', final_text).strip()
+                # ------------------------------------------
+
+                # 予測されたパスがあった場合、ログに警告を記録してAIに次回の反省を促す（思考の有無に関わらず実行）
+                if hallucinated_paths:
+                    error_log = f"ℹ️ お知らせ: 指定された画像パス {', '.join(hallucinated_paths)} はシステム上で確認できなかったため、テキストのみ送信しました。画像を送信するには、先に画像生成ツールを実行して確定したパスを取得するか、実在する画像パスを設定してください。"
+                    try:
+                        utils.save_message_to_log(log_file, "## SYSTEM:info", error_log)
+                    except: pass
+
                 if display_thoughts:
                     thoughts = utils.extract_thoughts_from_text(full_response)
                     if thoughts:
@@ -2248,10 +2323,15 @@ class NexusDiscordClient(discord.Client):
                         if quoted_thoughts:
                             final_text = f"{quoted_thoughts}\n\n{final_text}"
 
-                img_matches = re.findall(r"\[(?:VIEW_IMAGE|GENERATED_IMAGE):\s*(.*?)\]", full_response)
-                for img_path in img_matches:
-                    if os.path.exists(img_path.strip()):
-                        generated_images.append(img_path.strip())
+                print(f"[DEBUG_DISCORD] Final Text to send: {final_text}")  # DEBUG
+                print(f"[DEBUG_DISCORD] Images to attach: {generated_images}\n")  # DEBUG
+
+                # --- 画像パスを検知したら添付画像に置換 ---
+                #img_matches = re.findall(r"\[(?:VIEW_IMAGE|GENERATED_IMAGE):\s*(.*?)\]", full_response)
+                #for img_path in img_matches:
+                #    if os.path.exists(img_path.strip()):
+                #        generated_images.append(img_path.strip())
+                # ------------------------------------------
 
                 if final_text:
                     parts = _chunk_text(final_text)
@@ -2427,16 +2507,82 @@ def send_message_to_room(room_name: str, message_text: str, channel_id: Optional
         channel = client.get_channel(int(target_channel_id))
         if channel is None:
             channel = await client.fetch_channel(int(target_channel_id))
-        files = []
-        for path in image_paths or []:
-            if path and os.path.exists(path):
-                files.append(discord.File(path))
-        await channel.send(utils.clean_persona_text(message_text or ""), files=files if files else None)
+        
+        async with channel.typing():
+            # --- 画像パスを検知したら添付画像に置換 ---
+            #files = []
+            #for path in image_paths or []:
+            #    if path and os.path.exists(path):
+            #        files.append(discord.File(path))
+            #await channel.send(utils.clean_persona_text(message_text or ""), files=files if files else None)
+            # ------------------------------------------
+            # 1. 引数リスト内の画像パス存在チェック（実在するものだけを送信対象へ）
+            hallucinated_paths = []
+            initial_paths = list(image_paths) if image_paths else []
+            final_image_paths = []
+            for p in initial_paths:
+                if p and os.path.exists(p):
+                    final_image_paths.append(p)
+                elif p:
+                    hallucinated_paths.append(p)
+
+            clean_content = message_text or ""
+
+            print(f"\n[DEBUG_DISCORD] [SEND] AI_RAW_RESPONSE:\n{clean_content[0:100]}\n")  # DEBUG
+
+            patterns = {
+                'internal': r'\[(?:VIEW_IMAGE|GENERATED_IMAGE|ファイル添付|Generated Image):\s*(.*?)\]',
+                'markdown': r'!\[.*?\]\((.*?)\)',
+                'raw_path': r'(?:^|\s|["\'])([a-zA-Z]:[\\/][^:?*<>|\s\n]+\.(?:png|jpg|jpeg|webp|gif|mp4|webm)|[^:?*<>|\s\n]+\.(?:png|jpg|jpeg|webp|gif|mp4|webm))'
+            }
+
+            # 2. 本文中の画像パス存在チェック（実在するものだけを送信対象へ）
+            for p_type, p_regex in patterns.items():
+                matches = re.findall(p_regex, clean_content)
+                for match_val in matches:
+                    path_clean = match_val.strip().strip('"').strip("'")
+                    if path_clean and os.path.exists(path_clean):
+                        if path_clean not in final_image_paths:
+                            final_image_paths.append(path_clean)
+                        if p_type == 'raw_path':
+                            clean_content = clean_content.replace(match_val, " 📸 ")
+                    else:
+                        if path_clean:
+                            hallucinated_paths.append(path_clean)
+                            # 捏造箇所はテキストからも消去して残骸を残さない
+                            clean_content = clean_content.replace(match_val, "")
+
+            # 予測された画像パスがあった場合、AIにフィードバックさせる
+            if hallucinated_paths:
+                
+                # AIに返す実行結果にもエラー詳細を付加
+                session["last_error"] = f"指定された画像パス {', '.join(hallucinated_paths)} はシステム上で確認できなかったため、テキストのみ送信しました。画像を送信するには、先に画像生成ツールを実行して確定したパスを取得するか、実在する画像パスを設定してください。"
+            else:
+                session["last_error"] = None
+
+            # タグの除去とクリーニング
+            clean_content = re.sub(patterns['internal'], ' 📸 ', clean_content, flags=re.IGNORECASE)
+            clean_content = re.sub(patterns['markdown'], ' 📸 ', clean_content)
+            clean_content = utils.clean_persona_text(clean_content).strip()
+            clean_content = re.sub(r'\s*📸\s*', ' 📸 ', clean_content).strip()
+
+            files = []
+            for path in final_image_paths:
+                if path and os.path.exists(path):
+                    files.append(discord.File(path))
+            await channel.send(clean_content, files=files if files else None)
+            # ------------------------------------------
 
     future = asyncio.run_coroutine_threadsafe(_send(), session["loop"])
     try:
         future.result(timeout=20)
-        return {"success": True, "message": "Discordへ送信しました。"}
+        #return {"success": True, "message": "Discordへ送信しました。"}
+        res_msg = "Discordへ送信しました。"
+        if session.get("last_error"):
+            res_msg += f"\nℹ️ お知らせ: {session['last_error']}"
+        print(f"\n[DEBUG_DISCORD] [SEND] RESULT:\n{res_msg}\n")  # DEBUG
+        logger.info(f"Discord autonomous send message: {res_msg}")
+        return {"success": True, "message": res_msg}
     except Exception as e:
         logger.error(f"Discord autonomous send failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}

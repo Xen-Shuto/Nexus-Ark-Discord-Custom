@@ -3883,6 +3883,10 @@ def _stream_and_handle_response(
                             chatbot_history.append(_chatbot_message("assistant", "▌"))
                             streamed_text = ""  # ★重要: 毎回初期化
 
+                            # formatted_text が辞書だった場合の安全装置を追加
+                            if isinstance(formatted_text, dict):
+                                formatted_text = str(formatted_text)
+
                             # --- [v29] 思考ログの一括表示対応 ---
                             # <details> タグで囲まれた思考ログ部分と、それ以外の通常テキストを分離する
                             # 正規表現のグループ化により、デリミタ自体も保持する
@@ -13920,6 +13924,8 @@ def handle_load_chat_log_raw(
 
     log_path, _resolved_month = _resolve_chat_log_raw_path(room_name, selected_month)
     single_file = True
+
+    print(f"[DEBUG] ログ管理で開くファイル: {log_path}")
 
     if log_path and os.path.exists(log_path):
         try:
