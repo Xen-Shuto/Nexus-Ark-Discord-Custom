@@ -5942,6 +5942,10 @@ def format_history_for_gradio(
         seen_paths = set()
         for match in media_matches:
             path_str = match.group(1).strip()
+            # --- 既存バグ？ ---
+            if not path_str:
+                continue
+            # ------------------
             if path_str in seen_paths:
                 continue
             seen_paths.add(path_str)
@@ -5964,7 +5968,15 @@ def format_history_for_gradio(
                 except Exception:
                     pass
 
-            if path_obj.exists() and is_allowed:
+            # --- 既存バグ？ ---
+            #if path_obj.exists() and is_allowed:
+            try:
+                is_file = path_obj.is_file()
+            except Exception:
+                is_file = False
+
+            if is_file and is_allowed:
+            # ------------------
                 proto_history.append({"type": "media", "role": role, "responder": responder_id, "path": path_str, "log_index": i})
             else:
                 print(f"--- [警告] 無効または安全でない画像パスをスキップしました: {path_str} ---")
