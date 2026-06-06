@@ -69,15 +69,12 @@ def _generate_with_gemini(prompt: str, model_name: str, api_key: str, save_dir: 
     image.save(save_path, "PNG")
     print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
-    # --- 相対パスを絶対パスに変換 ---
-    fullpath = os.path.abspath(save_path)
-
     # 【重要】バックスラッシュをスラッシュに置換
     # これにより AI が \ をエスケープしようとする挙動を物理的に防ぎます
-    fullpath_fixed = fullpath.replace("\\", "/")
+    save_path_fixed = save_path.replace("\\", "/")
 
     model_comment = f"\nAI Model Comment: {image_text_response}" if image_text_response else ""
-    return f"[Generated Image: {fullpath_fixed}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {fullpath_fixed}]"
+    return f"[Generated Image: {save_path_fixed}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path_fixed}]"
 
 
 #def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: str, save_dir: str, room_name: str) -> str:
@@ -195,16 +192,13 @@ def _generate_with_openai(prompt: str, model_name: str, base_url: str, api_key: 
     image.save(save_path, "PNG")
     print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
-    # --- 相対パスを絶対パスに変換 ---
-    fullpath = os.path.abspath(save_path)
-
     # 【重要】バックスラッシュをスラッシュに置換
     # これにより AI が \ をエスケープしようとする挙動を物理的に防ぎます
-    fullpath_fixed = fullpath.replace("\\", "/")
+    save_path_fixed = save_path.replace("\\", "/")
 
     revised_prompt = getattr(response.data[0], 'revised_prompt', None)
     model_comment = f"\nRevised Prompt: {revised_prompt}" if revised_prompt else ""
-    return f"[Generated Image: {fullpath_fixed}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {fullpath_fixed}]"
+    return f"[Generated Image: {save_path_fixed}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path_fixed}]"
 
 
 def _save_generated_image(image: Image.Image, prompt: str, save_dir: str, room_name: str, model_comment: str = "") -> str:
@@ -228,14 +222,11 @@ def _save_generated_image(image: Image.Image, prompt: str, save_dir: str, room_n
     image.save(save_path, "PNG")
     print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
-    # --- 相対パスを絶対パスに変換 ---
-    fullpath = os.path.abspath(save_path)
-
     # 【重要】バックスラッシュをスラッシュに置換
     # これにより AI が \ をエスケープしようとする挙動を物理的に防ぎます
-    fullpath_fixed = fullpath.replace("\\", "/")
+    save_path_fixed = save_path.replace("\\", "/")
 
-    return f"[Generated Image: {fullpath_fixed}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {fullpath_fixed}]"
+    return f"[Generated Image: {save_path_fixed}]{model_comment}\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path_fixed}]"
 
 
 def _generate_with_pollinations(prompt: str, model_name: str, api_key: str, save_dir: str, room_name: str) -> str:
@@ -363,14 +354,11 @@ def _generate_with_huggingface(prompt: str, model_id: str, hf_token: str, save_d
     image.save(save_path, "PNG")
     print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
-    # --- 相対パスを絶対パスに変換 ---
-    fullpath = os.path.abspath(save_path)
-
     # 【重要】バックスラッシュをスラッシュに置換
     # これにより AI が \ をエスケープしようとする挙動を物理的に防ぎます
-    fullpath_fixed = fullpath.replace("\\", "/")
+    save_path_fixed = save_path.replace("\\", "/")
 
-    return f"[Generated Image: {fullpath_fixed}]\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {fullpath_fixed}]"
+    return f"[Generated Image: {save_path_fixed}]\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path_fixed}]"
 
 # --- ローカルでの画像生成 ---
 def _generate_with_local(prompt: str, save_dir: str, room_name: str, aspect_ratio: str = "square", local_sampler: str = None, local_steps: str = None, local_cfg: float = None) -> str:
@@ -451,18 +439,15 @@ def _generate_with_local(prompt: str, save_dir: str, room_name: str, aspect_rati
 
         save_path = os.path.join(save_dir, filename)
 
-        # --- 相対パスを絶対パスに変換 ---
-        fullpath = os.path.abspath(save_path)
-
-        with open(fullpath, "wb") as f:
+        with open(save_path, "wb") as f:
             f.write(img_bytes)
-        print(f"  - [{room_name}] 画像を保存しました: {fullpath}")
+        print(f"  - [{room_name}] 画像を保存しました: {save_path}")
 
         # 【重要】バックスラッシュをスラッシュに置換
         # これにより AI が \ をエスケープしようとする挙動を物理的に防ぎます
-        fullpath_fixed = fullpath.replace("\\", "/")
+        save_path_fixed = save_path.replace("\\", "/")
 
-        return f"[Generated Image: {fullpath_fixed}]\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {fullpath_fixed}]"
+        return f"[Generated Image: {save_path_fixed}]\n📝 Prompt: {prompt}\n画像生成完了。この画像についてコメントを添えてください。\n[VIEW_IMAGE: {save_path_fixed}]"
 
     except Exception as e:
         print(f"  - [{room_name}] 画像生成中にエラーが発生しました: {e}")
