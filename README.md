@@ -1,4 +1,4 @@
-# Nexus-Ark-Multi_0.2.9
+# Nexus-Ark-Discord-Custom (0.2.9)
 
 **元ネタはケノ氏作成の[Nexus Ark](https://github.com/kenomendako/Nexus-Ark)です。**
 
