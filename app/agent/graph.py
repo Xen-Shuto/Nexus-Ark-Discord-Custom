@@ -857,11 +857,27 @@ def retrieval_node(state: AgentState):
     # 高速なモデルを使用
     # 【マルチモデル対応】内部モデル設定（混合編成）に基づいてモデルを取得
     processing_model_name = _get_configured_internal_model_name("processing")
+    #llm_flash = LLMFactory.create_chat_model(
+    #    api_key=api_key,
+    #    generation_config={},
+    #    internal_role="processing"
+    #)
+    # temperatureを0.0から0.1に引き上げ、サーバー側のビームサーチデッドロックを防ぐ
     llm_flash = LLMFactory.create_chat_model(
         api_key=api_key,
-        generation_config={},
+        generation_config={"temperature": 0.1},
         internal_role="processing"
     )
+
+    # 不要なツール関連の内部クラッシュ（500）を防ぐため、AFCを完全に無効化する
+    if "gemini" in str(llm_flash).lower():
+        try:
+            from google.genai import types as genai_types
+            afc_config = genai_types.AutomaticFunctionCallingConfig(disable=True)
+            llm_flash = llm_flash.bind(automatic_function_calling=afc_config)
+        except Exception:
+            pass
+
     processing_model_name = _get_llm_model_name(llm_flash, processing_model_name)
 
     # プロンプトの改善（System/Human分離）
