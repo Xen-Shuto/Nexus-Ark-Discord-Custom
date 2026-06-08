@@ -217,6 +217,116 @@ def _backup_wm_file(room_name: str, slot_name: str, path: str) -> None:
     backup_filename = f"{timestamp}_{slot_name}{constants.WORKING_MEMORY_EXTENSION}.bak"
     shutil.copy2(path, os.path.join(backup_dir, backup_filename))
 
+_STANDARD_WM_SECTIONS = ["Current Intent", "Known Context", "Next Action", "Stop Condition"]
+_JSON_WM_KEY_TO_SECTION = {
+    "current_intent": "Current Intent",
+    "known_context": "Known Context",
+    "linked_goal": "Linked Goal",
+    "linked_thread": "Linked Thread",
+    "next_action": "Next Action",
+    "stop_condition": "Stop Condition",
+}
+
+def _section_from_key(key: str) -> str:
+    clean_key = str(key or "").strip().strip("'\"")
+    normalized = clean_key.replace("-", "_").replace(" ", "_").lower()
+    if normalized in _JSON_WM_KEY_TO_SECTION:
+        return _JSON_WM_KEY_TO_SECTION[normalized]
+    return clean_key.replace("_", " ").strip().title() or "Notes"
+
+def _stringify_wm_value(value) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return json.dumps(value, ensure_ascii=False, indent=2).strip()
+
+def _markdown_from_json_working_memory(raw_text: str) -> str:
+    stripped = str(raw_text or "").strip()
+    if not stripped.startswith("{"):
+        return str(raw_text or "")
+    decoder = json.JSONDecoder()
+    try:
+        parsed, end = decoder.raw_decode(stripped)
+    except Exception:
+        return str(raw_text or "")
+    if not isinstance(parsed, dict):
+        return str(raw_text or "")
+
+    blocks = []
+    for key, value in parsed.items():
+        value_text = _stringify_wm_value(value)
+        if not value_text:
+            continue
+        blocks.append(f"## {_section_from_key(key)}\n{value_text}")
+    remainder = stripped[end:].strip()
+    if remainder:
+        blocks.append(remainder)
+    return "\n\n".join(blocks)
+
+def _split_wm_markdown_sections(raw_text: str) -> tuple[str, list[tuple[str, str]]]:
+    text = _markdown_from_json_working_memory(raw_text)
+    matches = list(re.finditer(r"^##\s+(.+?)\s*$", text, re.MULTILINE))
+    if not matches:
+        return text.strip(), []
+
+    preface = text[:matches[0].start()].strip()
+    sections = []
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        sections.append((match.group(1).strip(), text[start:end].strip()))
+    return preface, sections
+
+def _rebuild_wm_markdown(preface: str, sections: list[tuple[str, str]]) -> str:
+    merged = {}
+    order = []
+    for heading, body in sections:
+        heading = _section_from_key(heading)
+        body = str(body or "").strip()
+        if not heading:
+            continue
+        if heading not in order:
+            order.append(heading)
+        # Later duplicate sections are usually fresher patch results.
+        merged[heading] = body
+
+    ordered_headings = [heading for heading in _STANDARD_WM_SECTIONS if heading in merged]
+    ordered_headings.extend(heading for heading in order if heading not in ordered_headings)
+
+    blocks = []
+    if preface and not preface.startswith("{"):
+        blocks.append(preface)
+    for heading in ordered_headings:
+        body = merged.get(heading, "").strip()
+        blocks.append(f"## {heading}\n{body}".rstrip())
+    return "\n\n".join(blocks).strip()
+
+def _normalize_working_memory_text(raw_text: str) -> str:
+    preface, sections = _split_wm_markdown_sections(raw_text)
+    if not sections:
+        return preface
+    return _rebuild_wm_markdown(preface, sections)
+
+def _extract_wm_sections_from_content(content: str) -> list[tuple[str, str]]:
+    _preface, sections = _split_wm_markdown_sections(str(content or ""))
+    return sections
+
+def _apply_working_memory_section_patch(existing: str, section: str, content: str, mode: str = "replace") -> str:
+    existing = _normalize_working_memory_text(existing)
+    preface, sections = _split_wm_markdown_sections(existing)
+    target_section = _section_from_key(section)
+    new_content = str(content or "").strip()
+
+    found = False
+    updated_sections = []
+    for heading, body in sections:
+        if _section_from_key(heading) == target_section:
+            found = True
+            body = f"{str(body).strip()}\n{new_content}".strip() if mode == "append" else new_content
+        updated_sections.append((_section_from_key(heading), body))
+    if not found:
+        updated_sections.append((target_section, new_content))
+    return _rebuild_wm_markdown(preface, updated_sections)
+
 def get_working_memory_overview(room_name: str, limit: int = 8) -> str:
     try:
         wm_dir = _get_wm_dir(room_name)
@@ -330,7 +440,7 @@ def read_working_memory(room_name: str, slot_name: str = None) -> str:
         if not os.path.exists(path):
             return f"【ワーキングメモリ '{target_slot}' はまだ作成されていません】"
         with open(path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
+            content = _normalize_working_memory_text(f.read()).strip()
             _touch_slot_metadata(room_name, target_slot)
             return content if content else f"【ワーキングメモリ '{target_slot}' は空です】"
     except Exception as e:
@@ -365,7 +475,7 @@ def update_working_memory(content: str, room_name: str, context_type: str = "CON
         _backup_wm_file(room_name, target_slot, path)
         
         with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+            f.write(_normalize_working_memory_text(content).rstrip() + "\n")
         _touch_slot_metadata(room_name, target_slot, last_context_type=context_type, last_intent=intent)
         return f"成功: ワーキングメモリのスロット '{target_slot}' を更新しました。"
     except Exception as e:
@@ -407,21 +517,13 @@ def patch_working_memory(section: str, content: str, room_name: str, mode: str =
                 existing = f.read()
         _backup_wm_file(room_name, target_slot, path)
 
-        header_pattern = re.compile(rf"(^##\s+{re.escape(section)}\s*$)", re.MULTILINE)
-        match = header_pattern.search(existing)
-        new_block = f"## {section}\n{str(content).strip()}\n"
-        if match:
-            next_header = re.search(r"^##\s+.+$", existing[match.end():], re.MULTILINE)
-            end = match.end() + next_header.start() if next_header else len(existing)
-            if mode == "append":
-                current_block = existing[match.start():end].rstrip()
-                replacement = current_block + "\n" + str(content).strip() + "\n"
-            else:
-                replacement = new_block
-            updated = existing[:match.start()] + replacement + existing[end:]
+        embedded_sections = _extract_wm_sections_from_content(content)
+        if embedded_sections:
+            updated = existing
+            for embedded_section, embedded_content in embedded_sections:
+                updated = _apply_working_memory_section_patch(updated, embedded_section, embedded_content, mode=mode)
         else:
-            sep = "\n\n" if existing.strip() else ""
-            updated = existing.rstrip() + sep + new_block
+            updated = _apply_working_memory_section_patch(existing, section, content, mode=mode)
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(updated.rstrip() + "\n")

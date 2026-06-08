@@ -100,8 +100,7 @@ def manage_open_questions(
         if not success:
             return f"【エラー】問い「{topic}」の解決マークに失敗しました。"
         
-        # 学びはInsightへ保存し、十分に具体的な場合だけエピソード記憶も生成する
-        _save_question_resolution_insight(room_name, topic, target_q.get("context", ""), reflection)
+        # 問い解決レポートはエピソード記憶へ一本化する。
         episode_created = _create_curiosity_resolved_episode(room_name, topic, target_q.get("context", ""), reflection)
         
         # Arousalスパイクを発生
@@ -140,23 +139,8 @@ def manage_open_questions(
 
 
 def _save_question_resolution_insight(room_name: str, topic: str, context: str, reflection: str = None) -> bool:
-    """問い解決から得た知見を夢日記/Insightへ保存する。"""
-    if not reflection:
-        return False
-    from resolution_memory import is_substantive_reflection, save_resolution_insight
-
-    if not is_substantive_reflection(reflection):
-        return False
-
-    return save_resolution_insight(
-        room_name=room_name,
-        trigger_topic=f"解決された問い: {topic}",
-        insight=reflection,
-        strategy=reflection,
-        log_entry=f"問い「{topic}」への回答から得た気づき",
-        source_type="question_resolution",
-        metadata={"context": context}
-    )
+    """Deprecated: question resolution reports are preserved as episodic memories only."""
+    return False
 
 
 def _create_curiosity_resolved_episode(room_name: str, topic: str, context: str, reflection: str = None) -> bool:

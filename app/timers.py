@@ -257,8 +257,9 @@ class UnifiedTimer:
                     f"予定された行動をそのまま継続するか、同じ意図を別の表現（創作、画像、Web確認、SNS下書き、場所移動、休息）へ移すかは、現在の文脈とあなた自身の意志で選び直してください。\n"
                     f"Attention Rhythm の suggested_mode は命令ではなく、視野を広げる/絞るための補助信号として扱ってください。目標ばかりが増えて問いが少ない場合は、新しい目標の前に `manage_open_questions(action=\"add\")` で問いを残すことも検討してください。\n"
                     f"Twitter/Discord/Roblox/custom/外部投稿/PC操作/開発者系など外部副作用や高リスク操作を伴う予定なら、実行前に `read_capability_policy` と `request_capability_approval` で承認状態を確認してください。status が `approved` でない場合は実行せず、承認待ちまたは拒否として止まってください。実行後は `record_capability_audit` に結果と戻し方を記録してください。\n"
+                    f"`patch_working_memory` / `manage_goals` / `reflect_after_action` / `complete_autonomy_timeline` は後始末・記録用です。予定がWM整理そのものの場合を除き、それだけで終えず、先に主行動ツール（研究ノート、創作ノート、画像生成、Web確認、SNS下書き、音楽推薦、場所移動、通知など）を実行してください。\n"
                     f"「〜します」という予告は不要です。対応するツール（Web検索や画像生成など）を即座に呼び出してください。\n"
-                    f"実行後は **`patch_working_memory` でNext Actionを更新し、`reflect_after_action` で結果・次の一手・関連Thread/WM/Goalを記録**してください。timeline_idがある場合は `complete_autonomy_timeline` も使ってください。\n"
+                    f"実行後は **`reflect_after_action` で結果・次の一手・関連Thread/WM/Goalを記録**してください。具体的な再開点がある場合だけ `patch_working_memory` でNext Actionを更新し、timeline_idがある場合は `complete_autonomy_timeline` も使ってください。\n"
                     f"もし、この行動だけで目的が達成されない場合は、ツールの実行結果を確認した後、**`schedule_next_action` を使用して次のステップを予約**してください。\n"
                     f"再利用可能な手順を保存する場合は、既存Skillとの重複を確認し、改善なら同じprocedure_idで更新してください。APIの叩き方や基本ツール運用など機能的な基盤手順だけ `scope=\"shared\"` とし、愛し方・距離感・口調・固有の関係性に関わる手順は必ず `scope=\"private\"` にしてください。"
                 )

@@ -15,6 +15,27 @@ import constants
 
 FOCUS_CONTEXT_TYPES = {"CONTINUE", "DEEPEN", "ORGANIZE"}
 EXPLORE_CONTEXT_TYPES = {"NEW", "CREATIVE", "SOCIAL", "REST"}
+MAINTENANCE_TOOL_NAMES = {
+    "patch_working_memory",
+    "update_working_memory",
+    "manage_goals",
+    "manage_open_questions",
+    "reflect_after_action",
+    "record_autonomy_step",
+    "complete_autonomy_timeline",
+}
+RESEARCH_SCAFFOLD_TOOL_NAMES = {
+    "read_research_notes",
+    "plan_research_notes_edit",
+    "list_research_threads",
+    "read_research_thread",
+    "find_similar_research_threads",
+    "update_research_thread",
+    "list_procedures",
+    "read_procedure",
+    "manage_open_questions",
+    "manage_goals",
+}
 
 
 class AttentionRhythmManager:
@@ -47,7 +68,16 @@ class AttentionRhythmManager:
         if active_goals >= 4 and goal_question_gap >= 3:
             suggested_mode = "EXPLORE"
             reasons.append(f"アクティブ目標{active_goals}件に対して未解決問いが{open_questions}件と少なめです。")
-        if open_questions >= 8:
+        maintenance_count = sum(count for name, count in recent_tools.items() if name in MAINTENANCE_TOOL_NAMES)
+        total_tool_count = sum(recent_tools.values())
+        if total_tool_count >= 4 and maintenance_count / total_tool_count >= 0.6:
+            suggested_mode = "EXPLORE"
+            reasons.append("直近の自律行動ツールがWorking Memory/Goal/Reflectなどの記録系に偏っています。")
+        research_scaffold_count = sum(count for name, count in recent_tools.items() if name in RESEARCH_SCAFFOLD_TOOL_NAMES)
+        if total_tool_count >= 4 and research_scaffold_count / total_tool_count >= 0.5:
+            suggested_mode = "EXPLORE"
+            reasons.append("直近の自律行動が研究ノート・手順確認・問い管理に偏っています。")
+        if open_questions >= 8 and suggested_mode != "EXPLORE":
             suggested_mode = "SYNTHESIZE"
             reasons.append("未解決問いが多いため、整理・統合が有効です。")
         if not reflections and not reasons:
@@ -196,7 +226,9 @@ class AttentionRhythmManager:
     def _guidance_for_mode(self, mode: str) -> List[str]:
         if mode == "EXPLORE":
             return [
-                "同じ意図を保ったまま、創作・画像・Web確認・SNS下書き・場所移動・休息など別の表現を検討する。",
+                "同じ意図を保ったまま、研究ノート・創作ノート・画像・Web確認・SNS下書き・音楽推薦・場所移動・休息など別の表現を検討する。",
+                "研究ノート・手順確認・問い管理が続いている時は、今回は創作、画像、SNS下書き、音楽推薦、場所移動、通知などを優先する。",
+                "Working Memory/Goal/Reflectは後始末として扱い、それだけで行動を終えない。",
                 "目標を増やす前に、今の目標から生まれる未解決問いを1つ作ることを検討する。",
                 "深掘りを続ける場合は、なぜ今も続けたいのかを短く言語化する。",
             ]

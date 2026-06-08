@@ -1,7 +1,10 @@
 import json
 import re
 import config_manager
+from datetime import datetime
+from pathlib import Path
 from typing import List, Callable, Dict, Optional, Set
+import constants
 import tools.roblox_webhook as roblox_webhook
 import room_manager
 
@@ -56,6 +59,43 @@ class ToolRegistry:
         self.CUSTOM_TOOL_NAMES: List[str] = []
         self.BROKER_TOOL_NAMES = ["request_capability"]
         self.SAFETY_TOOL_NAMES = ["read_capability_policy", "request_capability_approval", "record_capability_audit"]
+        self.AUTONOMY_REQUIRED_TOOL_NAMES = {
+            "request_capability",
+            "read_autonomy_context",
+            "start_autonomy_timeline",
+            "record_autonomy_step",
+            "reflect_after_action",
+            "complete_autonomy_timeline",
+        }
+        self.AUTONOMY_DIVERSITY_FAMILIES: Dict[str, Set[str]] = {
+            "research": {
+                "read_research_notes",
+                "plan_research_notes_edit",
+                "list_research_threads",
+                "read_research_thread",
+                "find_similar_research_threads",
+                "update_research_thread",
+            },
+            "procedure": {
+                "list_procedures",
+                "read_procedure",
+                "save_procedure",
+                "create_procedure_from_timeline",
+            },
+            "questions": {"manage_open_questions", "manage_goals"},
+            "working_memory": {
+                "read_working_memory",
+                "update_working_memory",
+                "patch_working_memory",
+                "switch_working_memory",
+            },
+            "social": {"draft_tweet", "check_twitter_updates", "post_tweet"},
+            "creative": {"read_creative_notes", "plan_creative_notes_edit"},
+            "image": {"generate_image", "view_past_image"},
+            "music": {"recommend_music"},
+            "world": {"list_available_locations", "set_current_location"},
+            "temporal": {"send_user_notification", "schedule_next_action"},
+        }
 
         # 現在地移動は会話中に自然発生しやすく、存在を見失うと体験品質が大きく落ちる。
         # 軽量な2ツールだけは初手でも提示する。
@@ -71,27 +111,40 @@ class ToolRegistry:
             "read_autonomy_context",
             "start_autonomy_timeline",
             "record_autonomy_step",
-            "reflect_after_action",
-            "complete_autonomy_timeline",
             "read_current_plan",
             "list_procedures",
             "read_procedure",
-            "manage_open_questions",
-            "manage_goals",
-            "read_working_memory",
-            "patch_working_memory",
-            "read_creative_notes",
-            "plan_creative_notes_edit",
             "web_search_tool",
             "read_url_tool",
+            "read_creative_notes",
+            "plan_creative_notes_edit",
+            "read_research_notes",
+            "plan_research_notes_edit",
             "generate_image",
             "view_past_image",
             "draft_tweet",
             "check_twitter_updates",
+            "recommend_music",
             "list_available_locations",
             "set_current_location",
+            "send_user_notification",
+            "schedule_next_action",
+            "manage_open_questions",
+            "manage_goals",
+            "read_working_memory",
+            "patch_working_memory",
+            "reflect_after_action",
+            "complete_autonomy_timeline",
         ]
         self.CATEGORY_ALIASES = {
+            "creative_notes": "creative",
+            "creation": "creative",
+            "writing": "creative",
+            "story": "creative",
+            "research_notes": "research",
+            "analysis": "research",
+            "sns": "twitter",
+            "social": "twitter",
             "location": "world",
             "locations": "world",
             "place": "world",
@@ -119,6 +172,16 @@ class ToolRegistry:
                 "read_diary_memory", "plan_diary_append",
                 "read_secret_diary", "plan_secret_diary_edit",
                 "read_entity_memory", "write_entity_memory", "list_entity_memories", "search_entity_memory",
+            ],
+            "creative": ["read_creative_notes", "plan_creative_notes_edit"],
+            "research": [
+                "read_research_notes", "plan_research_notes_edit",
+                "list_research_threads", "read_research_thread", "find_similar_research_threads", "update_research_thread",
+            ],
+            "working_memory": [
+                "read_working_memory", "update_working_memory", "list_working_memories", "switch_working_memory",
+                "patch_working_memory", "link_working_memory_to_research_thread", "link_working_memory_to_goal",
+                "reactivate_working_memory_slot",
             ],
             "notes": [
                 "read_full_notepad", "plan_notepad_edit",
@@ -236,6 +299,7 @@ class ToolRegistry:
                 tool_use_enabled=tool_use_enabled,
                 is_roblox_active=is_roblox_active,
                 image_generation_enabled=image_generation_enabled,
+                autonomous_action_mode=autonomous_action_mode,
             )
 
         active_tools = self.get_active_tools(room_name, tool_use_enabled=tool_use_enabled)
@@ -254,12 +318,139 @@ class ToolRegistry:
         if is_roblox_active is False:
             active_names.difference_update(self.ROBLOX_TOOL_NAMES)
 
-        selected_names = set(
-            self.AUTONOMY_DEFAULT_TOOL_NAMES if autonomous_action_mode else self.DEFAULT_TOOL_NAMES
+        if autonomous_action_mode:
+            selected_order = self._apply_autonomy_diversity_cooldown(
+                room_name,
+                self.AUTONOMY_DEFAULT_TOOL_NAMES,
+            )
+            ordered_names = [name for name in selected_order if name in active_names]
+        else:
+            selected_names = set(self.DEFAULT_TOOL_NAMES)
+            ordered_names = [name for name in ordered_active_names if name in selected_names and name in active_names]
+        return [self._all_tools_map[name] for name in ordered_names if name in self._all_tools_map]
+
+    def _apply_autonomy_diversity_cooldown(self, room_name: str, tool_names: List[str]) -> List[str]:
+        """Temporarily hide overused autonomous action families from the starter toolset."""
+        filtered_names = self._filter_autonomy_cooldown_names(room_name, set(tool_names))
+        filtered = [name for name in tool_names if name in filtered_names]
+        if len(filtered) < 8:
+            return list(tool_names)
+        return filtered
+
+    def _filter_autonomy_cooldown_names(self, room_name: str, tool_names: Set[str]) -> Set[str]:
+        saturated_families = self._recent_saturated_autonomy_families(room_name)
+        if not saturated_families:
+            return set(tool_names)
+
+        suppressed_tools: Set[str] = set()
+        for family in saturated_families:
+            suppressed_tools.update(self.AUTONOMY_DIVERSITY_FAMILIES.get(family, set()))
+        suppressed_tools.difference_update(self.AUTONOMY_REQUIRED_TOOL_NAMES)
+        return set(tool_names).difference(suppressed_tools)
+
+    def _recent_saturated_autonomy_families(self, room_name: str, limit: int = 18) -> Set[str]:
+        recent_tools = self._recent_action_tool_names(room_name, limit=limit)
+        if len(recent_tools) < 4:
+            return set()
+
+        counts: Dict[str, int] = {}
+        family_tool_count = 0
+        for tool_name in recent_tools:
+            for family, family_tools in self.AUTONOMY_DIVERSITY_FAMILIES.items():
+                if tool_name in family_tools:
+                    counts[family] = counts.get(family, 0) + 1
+                    family_tool_count += 1
+                    break
+
+        if family_tool_count < 3:
+            return set()
+
+        # Use only actual action families as the denominator. Timeline/reflect/request_capability
+        # otherwise dilute the signal and hide repeated research/question loops.
+        saturated = {
+            family
+            for family, count in counts.items()
+            if count >= 2 and count / max(family_tool_count, 1) >= 0.25
+        }
+        # If research keeps appearing with procedure/question scaffolding, cool all three together.
+        if "research" in saturated and (counts.get("procedure", 0) or counts.get("questions", 0)):
+            saturated.update({"procedure", "questions"})
+        if "questions" in saturated and (counts.get("research", 0) or counts.get("procedure", 0)):
+            saturated.update({"research", "procedure"})
+        internal_scaffold_count = sum(counts.get(family, 0) for family in {"research", "procedure", "questions", "working_memory"})
+        if internal_scaffold_count >= 4 and internal_scaffold_count / max(family_tool_count, 1) >= 0.45:
+            saturated.update({"research", "procedure", "questions", "working_memory"})
+        return saturated
+
+    def build_autonomy_capability_guidance(self, room_name: str) -> str:
+        """Return compact category guidance for autonomous turns without binding every schema."""
+        saturated = self._recent_saturated_autonomy_families(room_name)
+        if not saturated:
+            return (
+                "### 自律行動時の能力カテゴリ選択\n"
+                "- `notes` は広いカテゴリです。創作ノートなら `creative`、研究ノートなら `research`、"
+                "Working Memory整理なら `working_memory` を優先して要求してください。\n"
+                "- 直近と違う形で表現したい時は `image` / `twitter` / `music` / `world` / `web` も選べます。"
+            )
+
+        preferred = [
+            ("creative", "創作ノートを書く"),
+            ("image", "情景や作品を画像にする"),
+            ("twitter", "SNS下書きで外へ発信する"),
+            ("music", "今の空気に合う曲を推薦する"),
+            ("world", "場所を移動して状況を変える"),
+            ("web", "外部情報を確認する"),
+        ]
+        if "creative" in saturated:
+            preferred = [item for item in preferred if item[0] != "creative"]
+        if "social" in saturated:
+            preferred = [item for item in preferred if item[0] != "twitter"]
+        if "image" in saturated:
+            preferred = [item for item in preferred if item[0] != "image"]
+        if "music" in saturated:
+            preferred = [item for item in preferred if item[0] != "music"]
+        if "world" in saturated:
+            preferred = [item for item in preferred if item[0] != "world"]
+
+        saturated_labels = {
+            "research": "研究ノート",
+            "procedure": "手順確認",
+            "questions": "問い/Goal整理",
+            "working_memory": "Working Memory",
+            "social": "SNS",
+            "creative": "創作ノート",
+            "image": "画像",
+            "music": "音楽",
+            "world": "場所移動",
+            "temporal": "通知/次回予約",
+        }
+        avoid = "、".join(saturated_labels.get(name, name) for name in sorted(saturated))
+        option_lines = "\n".join(f"- `{category}`: {label}" for category, label in preferred[:4])
+        return (
+            "### 自律行動時の能力カテゴリ選択\n"
+            f"- 直近は {avoid} に寄っています。今回それが唯一の目的でない限り、"
+            "`notes` / `research` / `procedure` / `working_memory` へ戻る前に別表現を優先してください。\n"
+            "- 次の `request_capability` では、特に以下を検討してください。\n"
+            f"{option_lines}"
         )
 
-        ordered_names = [name for name in ordered_active_names if name in selected_names and name in active_names]
-        return [self._all_tools_map[name] for name in ordered_names if name in self._all_tools_map]
+    def _recent_action_tool_names(self, room_name: str, limit: int = 18) -> List[str]:
+        path = Path(constants.ROOMS_DIR) / room_name / "memory" / "run_logs" / f"action_log_{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        except Exception:
+            return []
+        names: List[str] = []
+        for line in lines:
+            try:
+                name = json.loads(line).get("tool_name", "")
+            except Exception:
+                continue
+            if name:
+                names.append(str(name))
+        return names
 
     def get_tools_for_capability(
         self,
@@ -268,6 +459,7 @@ class ToolRegistry:
         tool_use_enabled: bool = True,
         is_roblox_active: Optional[bool] = None,
         image_generation_enabled: bool = True,
+        autonomous_action_mode: bool = False,
     ) -> List[Callable]:
         active_tools = self.get_active_tools(room_name, tool_use_enabled=tool_use_enabled)
         if not tool_use_enabled:
@@ -291,6 +483,8 @@ class ToolRegistry:
         selected_names = set(self.TOOL_CATEGORIES.get(category_key, []))
         selected_names.update(self.BROKER_TOOL_NAMES)
         selected_names.update(self.SAFETY_TOOL_NAMES)
+        if autonomous_action_mode:
+            selected_names = self._filter_autonomy_cooldown_names(room_name, selected_names)
         ordered_names = [name for name in ordered_active_names if name in selected_names and name in active_names]
         return [self._all_tools_map[name] for name in ordered_names if name in self._all_tools_map]
 

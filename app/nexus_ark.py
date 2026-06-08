@@ -829,9 +829,16 @@ try:
     """
     custom_js = """
     function() {
-        // This function is intentionally left blank.
     }
     """
+    tab_probe_disable_custom_css = _env_flag("NEXUS_ARK_TAB_PROBE_DISABLE_CUSTOM_CSS", False)
+    tab_probe_disable_custom_js = _env_flag("NEXUS_ARK_TAB_PROBE_DISABLE_CUSTOM_JS", False)
+    effective_custom_css = "" if tab_probe_disable_custom_css else custom_css
+    effective_custom_js = "" if tab_probe_disable_custom_js else custom_js
+    if tab_probe_disable_custom_css:
+        print("--- [Tab Probe] custom_cssを一時無効化しています ---")
+    if tab_probe_disable_custom_js:
+        print("--- [Tab Probe] custom_jsを一時無効化しています ---")
 
     # --- [テーマ適用ロジック] ---
     # 新しいconfig_managerの関数を呼び出すように変更
@@ -1973,7 +1980,7 @@ try:
                                         info="Hub上のtext-to-imageモデルIDを直接入力可能"
                                     )
 
-                                # ローカル設定
+                                # ローカル画像生成設定 (SD WebUI)
                                 with gr.Column(visible=(current_img_provider == "local")) as local_image_section:
                                     gr.Markdown("💡 **Stable Diffusion WebUI (A1111/Forge)** を `--api` 引数付きで起動しておく必要があります。")
                                     local_sd_url_input = gr.Textbox(label="API URL", placeholder="http://127.0.0.1:7861/sdapi/v1/txt2img", type="password")
@@ -2072,6 +2079,60 @@ try:
                                     return utils.repair_and_optimize_logs()
 
                                 run_system_optimization_button.click(fn=_run_optimization_handler, outputs=[system_optimization_result])
+
+                            # --- 天気・環境連携設定 ---
+                            with gr.Accordion("🌤️ 天気・環境連携設定", open=False):
+                                gr.Markdown("居住地の天気をOpen-Meteoから自動取得し、AIペルソナの会話コンテキストや空間描写に反映させます。")
+                                weather_config = config_manager.CONFIG_GLOBAL.get("weather_settings", {})
+                                
+                                with gr.Row():
+                                    weather_city_input = gr.Textbox(
+                                        label="都市名 (日本語・英語どちらでも可)", 
+                                        placeholder="例: 東京, Tokyo, Osaka",
+                                        value=weather_config.get("city_name", ""),
+                                        scale=3
+                                    )
+                                    weather_search_btn = gr.Button("🔍 都市を検索", variant="secondary", scale=1)
+                                
+                                # 検索結果から緯度経度を選択するドロップダウン
+                                initial_choice = []
+                                current_lat = weather_config.get("latitude")
+                                current_lon = weather_config.get("longitude")
+                                if current_lat is not None and current_lon is not None:
+                                    current_display = f"{weather_config.get('city_name', '現在の設定場所')} (緯度: {current_lat:.2f}, 経度: {current_lon:.2f})"
+                                    initial_choice = [(current_display, f"{current_lat},{current_lon}|{weather_config.get('city_name')}")]
+                                
+                                weather_candidate_dropdown = gr.Dropdown(
+                                    label="検索結果（正しい場所を選んでください）",
+                                    choices=initial_choice,
+                                    value=initial_choice[0][1] if initial_choice else None,
+                                    interactive=True,
+                                    info="都市名を入力して検索ボタンを押し、リストから場所を選んでください。"
+                                )
+                                
+                                with gr.Row():
+                                    weather_lat_display = gr.Number(label="緯度 (Latitude)", value=current_lat, interactive=False)
+                                    weather_lon_display = gr.Number(label="経度 (Longitude)", value=current_lon, interactive=False)
+                                
+                                with gr.Row():
+                                    enable_weather_context_cb = gr.Checkbox(
+                                        label="ペルソナの会話へ反映", 
+                                        value=weather_config.get("enable_persona_context", False),
+                                        interactive=True
+                                    )
+                                    enable_weather_scenery_cb = gr.Checkbox(
+                                        label="情景描写にリアル天気を反映", 
+                                        value=weather_config.get("enable_scenery_reflection", False),
+                                        interactive=True
+                                    )
+                                
+                                # 初期状態のプレビューを取得
+                                initial_preview_md = ui_handlers.get_weather_status_preview_html()
+                                weather_status_preview = gr.Markdown(
+                                    value=initial_preview_md, 
+                                    elem_id="weather-status-preview"
+                                )
+                                weather_save_btn = gr.Button("天気・環境設定を保存", variant="primary")
 
                             # --- デバッグ設定 ---
                             debug_mode_checkbox = gr.Checkbox(label="デバッグモードを有効化 (デバッグコンソールにシステムプロンプトを出力)", value=config_manager.CONFIG_GLOBAL.get("debug_mode", False), interactive=True)
@@ -2241,20 +2302,40 @@ try:
                                     interactive=True,
                                     allow_custom_value=False
                                 )
-                                room_tts_model_dropdown = gr.Dropdown(
-                                    label="TTSモデル",
-                                    choices=config_manager.get_tts_model_choices("gemini"),
-                                    value="gemini-3.1-flash-tts-preview",
+                                openai_provider_names = [s["name"] for s in config_manager.get_openai_settings_list()]
+                                room_tts_profile_dropdown = gr.Dropdown(
+                                    label="使用するOpenAI互換プロファイル",
+                                    choices=openai_provider_names,
+                                    value=openai_provider_names[0] if openai_provider_names else None,
+                                    visible=False,
                                     interactive=True,
                                     allow_custom_value=True
                                 )
-                                room_voice_dropdown = gr.Dropdown(
-                                    label="声を選択（個別）",
-                                    choices=config_manager.get_tts_voice_choices("gemini"),
-                                    interactive=True,
-                                    allow_custom_value=True
-                                )
+                                with gr.Row():
+                                    room_tts_model_dropdown = gr.Dropdown(
+                                        label="TTSモデル",
+                                        choices=config_manager.get_tts_model_choices("gemini"),
+                                        value="gemini-3.1-flash-tts-preview",
+                                        interactive=True,
+                                        allow_custom_value=True,
+                                        scale=4
+                                    )
+                                    room_fetch_tts_models_button = gr.Button("📥 TTSモデル取得", variant="secondary", size="sm", scale=1)
+                                with gr.Row():
+                                    room_voice_dropdown = gr.Dropdown(
+                                        label="声を選択（個別）",
+                                        choices=config_manager.get_tts_voice_choices("gemini"),
+                                        interactive=True,
+                                        allow_custom_value=True,
+                                        scale=4
+                                    )
+                                    room_refresh_speakers_button = gr.Button("🔄 話者リスト更新", size="sm", variant="secondary", scale=1)
                                 room_voice_style_prompt_textbox = gr.Textbox(label="音声スタイル / 指示プロンプト", placeholder="例：囁くように、楽しそうに、落ち着いたトーンで", interactive=True)
+                                with gr.Accordion("🔊 ローカルTTS（VOICEVOX等）音響パラメータ調整", open=False):
+                                    room_voice_speed_slider = gr.Slider(minimum=0.5, maximum=2.0, step=0.05, value=1.0, label="話速", info="音声の速度を調整します。(デフォルト: 1.0)", interactive=True)
+                                    room_voice_pitch_slider = gr.Slider(minimum=-0.15, maximum=0.15, step=0.01, value=0.0, label="音高", info="音声の高さを調整します。(デフォルト: 0.0)", interactive=True)
+                                    room_voice_intonation_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.05, value=1.0, label="抑揚", info="音声の抑揚（メロディの強さ）を調整します。(デフォルト: 1.0)", interactive=True)
+                                    room_voice_volume_slider = gr.Slider(minimum=0.5, maximum=2.0, step=0.05, value=1.0, label="音量", info="音声の大きさを調整します。(デフォルト: 1.0)", interactive=True)
                                 with gr.Row():
                                     room_preview_text_textbox = gr.Textbox(value="こんにちは、Nexus Arkです。これは音声のテストです。", show_label=False, scale=3)
                                     room_preview_voice_button = gr.Button("試聴", scale=1)
@@ -2981,21 +3062,26 @@ try:
 
                             # --- 画像生成メニュー ---
                             with gr.Accordion("🌄情景設定・生成", open=False):
+                                _initial_time_settings = ui_handlers._load_time_settings_for_room(effective_initial_room)
+                                _initial_custom_scenery_season, _initial_custom_scenery_time = ui_handlers._get_current_time_context_ui_values(effective_initial_room)
                                 with gr.Accordion("季節・時間を指定", open=False) as time_control_accordion:
                                     gr.Markdown("（この設定はルームごとに保存されます）", elem_id="time_control_note")
                                     time_mode_radio = gr.Radio(
                                         choices=["リアル連動", "選択する"],
                                         label="モード選択",
+                                        value=_initial_time_settings.get("mode", "リアル連動"),
                                         interactive=True
                                     )
-                                    with gr.Column(visible=False) as fixed_time_controls:
+                                    with gr.Column(visible=(_initial_time_settings.get("mode", "リアル連動") == "選択する")) as fixed_time_controls:
                                         fixed_season_dropdown = gr.Dropdown(
                                             label="季節を選択",
                                             choices=["春", "夏", "秋", "冬"],
+                                            value=_initial_time_settings.get("fixed_season_ja", "秋"),
                                             interactive=True, allow_custom_value=True)
                                         fixed_time_of_day_dropdown = gr.Dropdown(
                                             label="時間帯を選択",
                                             choices=["朝", "昼", "夕方", "夜"],
+                                            value=_initial_time_settings.get("fixed_time_of_day_ja", "夜"),
                                             interactive=True, allow_custom_value=True)
                                     # ボタンを fixed_time_controls の外に移動し、常に表示されるようにする
                                     save_time_settings_button = gr.Button("このルームの時間設定を保存", variant="secondary")
@@ -3024,8 +3110,8 @@ try:
                                         choices=_loc_choices, # 上で計算したものを使用
                                         interactive=True, allow_custom_value=True)
                                     with gr.Row():
-                                        custom_scenery_season_dropdown = gr.Dropdown(label="季節", choices=["春", "夏", "秋", "冬"], value="秋", interactive=True, allow_custom_value=True)
-                                        custom_scenery_time_dropdown = gr.Dropdown(label="時間帯", choices=["早朝", "朝", "昼前", "昼下がり", "夕方", "夜", "深夜"], value="夜", interactive=True, allow_custom_value=True)
+                                        custom_scenery_season_dropdown = gr.Dropdown(label="季節", choices=["春", "夏", "秋", "冬"], value=_initial_custom_scenery_season, interactive=True, allow_custom_value=True)
+                                        custom_scenery_time_dropdown = gr.Dropdown(label="時間帯", choices=["早朝", "朝", "昼前", "昼", "昼下がり", "夕方", "夜", "深夜"], value=_initial_custom_scenery_time, interactive=True, allow_custom_value=True)
                                     custom_scenery_image_upload = gr.Image(label="画像をアップロード", type="filepath", interactive=True)
                                     register_custom_scenery_button = gr.Button("この画像を情景として登録", variant="secondary")
 
@@ -3089,8 +3175,8 @@ try:
                                     lines=1, visible=True
                                 )
 
-        with gr.Tabs():
-            with gr.TabItem("チャット"):
+        with gr.Tabs(selected="chat", elem_id="top_level_tabs", key="top_level_tabs"):
+            with gr.TabItem("チャット", id="chat", key="top_tab_chat"):
                 # サブタブ構造: 会話表示 / RAWログエディタ
                 with gr.Tabs():
                     with gr.TabItem("💬 会話") as chat_conversation_tab:
@@ -3123,13 +3209,37 @@ try:
                             )
 
                             with gr.Row():
-                                audio_player = gr.Audio(label="音声プレーヤー", visible=False, autoplay=True, interactive=False, elem_id="main_audio_player")
-                            with gr.Row(visible=False) as action_button_group:
-                                rerun_button = gr.Button("🔄 再生成")
-                                play_audio_button = gr.Button("🔊 選択した発言を再生")
-                                translate_thought_button = gr.Button("🌐 翻訳", elem_id="translate_thought_button")
-                                delete_selection_button = gr.Button("🗑️ 選択した発言を削除", variant="stop")
-                                cancel_selection_button = gr.Button("✖️ 選択をキャンセル")
+                                audio_player = gr.Audio(label="音声プレーヤー", visible=False, autoplay=True, interactive=True, elem_id="main_audio_player")
+                            with gr.Column(visible=False) as action_button_group:
+                                with gr.Row():
+                                    rerun_button = gr.Button("🔄 再生成")
+                                    play_audio_button = gr.Button("🔊 選択した発言を再生")
+                                    tts_playback_mode_dropdown = gr.Dropdown(
+                                        choices=[
+                                            ("先頭再生", "trim"),
+                                            ("分割生成", "split"),
+                                        ],
+                                        value="trim",
+                                        label="音声",
+                                        interactive=True,
+                                        scale=1,
+                                    )
+                                with gr.Row():
+                                    tts_segment_dropdown = gr.Dropdown(
+                                        choices=[],
+                                        value=None,
+                                        label="分割音声",
+                                        interactive=False,
+                                        scale=3,
+                                    )
+                                    play_tts_segment_button = gr.Button("▶️ 分割再生", interactive=False, scale=1)
+                                tts_playlist_state = gr.State(value=[])
+                                tts_playlist_index_state = gr.State(value=0)
+                                auto_play_next_trigger_btn = gr.Button(visible=False, elem_id="auto_play_next_trigger_btn")
+                                with gr.Row():
+                                    translate_thought_button = gr.Button("🌐 翻訳", elem_id="translate_thought_button")
+                                    delete_selection_button = gr.Button("🗑️ 選択した発言を削除", variant="stop")
+                                    cancel_selection_button = gr.Button("✖️ 選択をキャンセル")
 
                             chat_input_multimodal = gr.MultimodalTextbox(
                                 file_types=["image", "audio", "video", "text", ".pdf", ".md", ".py", ".json", ".html", ".css", ".js"],
@@ -3224,6 +3334,8 @@ try:
                                 _initial_img_provider = _conf.get("image_generation_provider", "gemini")
                                 with gr.Row():
                                     user_gen_image_provider = gr.Dropdown(
+                                        #choices=[("Gemini", "gemini"), ("OpenAI互換", "openai"), ("Pollinations.ai", "pollinations"), ("Hugging Face", "huggingface")],
+                                        #value=config_manager.CONFIG_GLOBAL.get("image_generation_provider", "gemini"),
                                         choices=[
                                             ("Gemini", "gemini"),
                                             ("OpenAI互換", "openai"),
@@ -3231,7 +3343,6 @@ try:
                                             ("Hugging Face", "huggingface"),
                                             ("Local(SD WebUI)", "local")
                                         ],
-                                        #value=config_manager.CONFIG_GLOBAL.get("image_generation_provider", "gemini"),
                                         value=_initial_img_provider,
                                         label="プロバイダ", scale=2
                                     )
@@ -3276,11 +3387,9 @@ try:
                                 # --- ローカル生成専用パラメータ ---
                                 _ls_defaults = _conf.get("image_generation_local_settings", {})
                                 with gr.Column(visible=(_initial_img_provider == "local")) as user_gen_local_params_row:
-
                                     with gr.Row():
                                         user_gen_local_sampler = gr.Dropdown(choices=["Euler a", "DPM++ 2M Karras", "DPM++ SDE Karras", "UniPC"], label="サンプラー", value=_ls_defaults.get("sampler", "Euler a") or "Euler a", allow_custom_value=True, scale=1)
                                         user_gen_local_aspect_ratio = gr.Dropdown(choices=["square", "portrait", "landscape"], label="アスペクト比", value="square", allow_custom_value=True, scale=1)
-
                                     with gr.Row():
                                         user_gen_local_steps = gr.Slider(minimum=1, maximum=100, value=int(_ls_defaults.get("steps", 25) or 25), step=1, label="ステップ数", scale=1)
                                         user_gen_local_cfg = gr.Slider(minimum=0, maximum=20, value=float(_ls_defaults.get("cfg_scale", 7.0) or 7.0), step=0.5, label="CFG", scale=1)
@@ -3775,7 +3884,7 @@ try:
                                 refresh_action_memory_button = gr.Button("🔄 履歴を手動更新", variant="secondary")
                         # ▲▲▲ 追加ここまで ▲▲▲
 
-            with gr.TabItem("知識") as knowledge_tab:
+            with gr.TabItem("知識", id="knowledge", key="top_tab_knowledge") as knowledge_tab:
                 gr.Markdown("## 知識ベース (RAG)\nこのルームのAIが参照する知識ドキュメントを管理します。")
 
                 with gr.Accordion("📚 知識ファイル", open=False):
@@ -3847,7 +3956,7 @@ try:
                     )
                     skill_status = gr.Textbox(label="Skillsステータス", interactive=False)
 
-            with gr.TabItem("記憶・ノート"):
+            with gr.TabItem("記憶・ノート", id="memory_notes", key="top_tab_memory_notes"):
                 gr.Markdown("## 記憶・ノート\nルームの根幹をなす記憶ファイルとノートを、ここで直接編集できます。")
                 with gr.Tabs():
                     with gr.TabItem("記憶"):
@@ -4409,7 +4518,7 @@ try:
                                     save_research_threads_index_button = gr.Button("index.jsonを保存", variant="secondary")
                                 research_threads_status = gr.Markdown("未読み込み")
 
-            with gr.TabItem("アイテム") as item_root_tab:
+            with gr.TabItem("アイテム", id="items", key="top_tab_items") as item_root_tab:
                 with gr.Tabs(selected="inventory_tab") as item_sub_tabs:
                     with gr.TabItem("インベントリ", id="inventory_tab"):
                         gr.Markdown("## 📦 インベントリ管理\nユーザーとペルソナの所持品を一括管理できます。")
@@ -4556,7 +4665,7 @@ try:
                                         food_item_save_as_new_button = gr.Button("➕ 別アイテムとして保存", variant="secondary", scale=2)
                                         load_food_item_to_editor_button = gr.Button("📝 選択中のアイテムを読込", variant="secondary", scale=1)
 
-            with gr.TabItem("ワールド・ビルダー") as world_builder_tab:
+            with gr.TabItem("ワールド・ビルダー", id="world_builder", key="top_tab_world_builder") as world_builder_tab:
                 gr.Markdown("## ワールド・ビルダー\n`world_settings.txt` の内容を、直感的に、または直接的に編集・確認できます。")
                 load_world_builder_button = gr.Button("ワールド設定を読み込む", variant="secondary")
 
@@ -4598,736 +4707,469 @@ try:
                             reload_raw_button = gr.Button("最後に保存した内容を読み込む", variant="secondary")
 
             # ===== 外部接続タブ =====
-            with gr.TabItem("外部接続") as external_connections_tab:
-                with gr.Tabs():
-                    with gr.TabItem("🐦 Twitter (X)", id="external_twitter_tab") as external_twitter_tab:
-                        _twitter_accepted = config_manager.CONFIG_GLOBAL.get("accepted_disclaimers", {}).get("twitter", False)
-                        with gr.Accordion("⚠️ 利用規約・免責事項", open=not _twitter_accepted) as twitter_disclaimer_accordion:
-                            gr.Markdown("## ⚠️ Twitter (X) 連携に関する重要事項\n"
-                                        "ブラウザモード（Cookie利用）による自動投稿は、X(Twitter)の利用規約で禁止されている「非公式なインターフェースによる自動アクセス」に該当します。この機能を利用した場合、**アカウントが永久凍結されるリスクが非常に高い**です。\n\n"
-                                        "本機能は実験的な提供であり、利用によって生じたいかなる損害（アカウント凍結・削除等）についても、開発者は一切の責任を負いません。**自己責任でご利用いただくか、可能な限り公式APIモードをご利用ください。**\n\n"
-                                        "- [X (Twitter) サービス利用規約](https://twitter.com/tos)\n"
-                                        "- [自動化のルールとポリシー](https://help.twitter.com/ja/rules-and-policies/twitter-automation)")
-                            twitter_accept_button = gr.Button("規約とリスクを理解し、自己責任で利用を開始する", variant="primary", visible=not _twitter_accepted)
+            with gr.TabItem("外部接続", id="external_connections", key="top_tab_external_connections"):
+                with gr.Tabs(selected="external_twitter"):
+                    with gr.TabItem("Twitter (X)", id="external_twitter", key="external_tab_twitter"):
+                        _initial_room_config_for_twitter = room_manager.get_room_config(effective_initial_room) or {}
+                        _initial_twitter_settings = (
+                            (_initial_room_config_for_twitter.get("override_settings", {}) or {}).get("twitter_settings", {}) or {}
+                        )
+                        _initial_twitter_api_config = _initial_twitter_settings.get("api_config", {}) or {}
+                        _initial_twitter_auth_mode = _initial_twitter_settings.get("auth_mode") or "api"
+                        with gr.Tabs(selected="twitter_approval_subtab"):
+                            with gr.TabItem("承認待ち", id="twitter_approval_subtab"):
+                                gr.Markdown("## Twitter承認")
+                                twitter_selected_draft_id_state = gr.State("")
+                                twitter_reply_url_state = gr.State("")
+                                twitter_reply_id_state = gr.State("")
+                                with gr.Row():
+                                    twitter_refresh_pending_button = gr.Button("承認待ちを更新", variant="primary")
+                                    twitter_load_selected_draft_button = gr.Button("選択した下書きを読み込む", variant="secondary")
+                                twitter_pending_df = gr.Dataframe(
+                                    label="承認待ち下書き",
+                                    headers=["ID", "時刻", "画像", "下書き内容", "警告"],
+                                    datatype=["str", "str", "str", "str", "str"],
+                                    interactive=False,
+                                    wrap=True,
+                                )
+                                twitter_draft_warnings = gr.Markdown("")
+                                twitter_reply_preview = gr.Markdown("※ 選択されていません")
+                                twitter_draft_editor = gr.Textbox(label="投稿内容", lines=6, interactive=True)
+                                twitter_media_file = gr.File(label="添付画像", file_count="multiple", interactive=True)
+                                twitter_media_gallery = gr.Gallery(label="添付プレビュー", columns=4, height=180)
+                                with gr.Row():
+                                    twitter_approve_button = gr.Button("承認して投稿", variant="primary")
+                                    twitter_reject_button = gr.Button("却下", variant="stop")
+                                twitter_approval_detail = gr.Markdown("")
 
-                        with gr.Column(visible=_twitter_accepted) as twitter_main_content:
-                            gr.Markdown("## 🐦 Twitter (X) × Nexus Ark\nペルソナによるTwitter投稿の管理を行います。")
-
-                            with gr.Tabs(elem_id="twitter_main_tabs") as twitter_main_tabs:
-                                with gr.TabItem("📋 Twitter 投稿", id="twitter_post_subtab"):
-                                    twitter_pending_df = gr.Dataframe(
-                                        headers=["ID", "時刻", "画像", "下書き内容", "警告"],
-                                        datatype=["str", "str", "str", "str", "str"],
-                                        interactive=True,
-                                        label="📋 承認待ちの下書きキュー（AI提案・手動保存分）",
-                                        wrap=True
-                                    )
+                                with gr.Accordion("投稿履歴", open=False):
                                     with gr.Row():
-                                        twitter_pending_refresh_button = gr.Button("🔄 キュー更新", variant="secondary")
-                                        twitter_load_selected_draft_button = gr.Button("📝 選択中の下書きを読込", variant="secondary")
-
-                                    gr.Markdown("---")
-                                    gr.Markdown("### 🛠️ 投稿エディタ")
-    
-                                    # リプライ先プレビュー
-                                    twitter_reply_preview = gr.Markdown("※ タイムラインから「返信」を選択するとここに情報が表示されます", visible=True)
-                                    twitter_reply_url_input = gr.Textbox(label="返信先URL (編集可能)", placeholder="https://x.com/...", lines=1)
-                                    twitter_reply_id_state = gr.State("")
-    
-                                    twitter_selected_draft_id = gr.State("")
-                                    twitter_draft_editor = gr.Textbox(label="投稿内容", lines=5, placeholder="投稿内容を入力するか、下書きを選択してください")
-                                    twitter_draft_warnings_display = gr.Markdown("")
-    
-                                    with gr.Row():
-                                        with gr.Column(scale=1):
-                                            twitter_image_uploader = gr.File(label="🖼️ 画像を添付 (最大4枚)", file_count="multiple", file_types=["image"], interactive=True)
-                                        with gr.Column(scale=2):
-                                            twitter_image_preview = gr.Gallery(label="🖼️ プレビュー", columns=4, height="150px", preview=True, object_fit="contain")
-    
-                                    with gr.Row():
-                                        twitter_approve_button = gr.Button("✅ 承認して投稿", variant="primary", scale=2)
-                                        twitter_manual_draft_button = gr.Button("✨ 下書きとして保存", variant="secondary", scale=1)
-                                        twitter_reject_button = gr.Button("🗑️ 却下（削除）", variant="stop", scale=1)
-    
-                                    # --- 履歴表示 ---
-                                    gr.Markdown("---")
-                                    twitter_history_detail = gr.Textbox(
-                                        label="📢 実行結果・選択した履歴の詳細",
-                                        interactive=False,
-                                        lines=8,
-                                        placeholder="投稿ボタンを押すか、下の履歴リストから項目を選択すると詳細が表示されます"
-                                    )
-    
-                                    twitter_selected_history_id = gr.State("")
+                                        twitter_refresh_history_button = gr.Button("履歴を更新", variant="secondary")
+                                        twitter_history_retry_button = gr.Button("選択履歴を下書きに戻す", variant="secondary")
+                                        twitter_history_delete_button = gr.Button("選択履歴を削除", variant="stop")
+                                    twitter_history_selected_id_state = gr.State("")
                                     twitter_history_df = gr.Dataframe(
+                                        label="投稿履歴",
                                         headers=["ID", "時刻", "内容", "ステータス", "URL"],
                                         datatype=["str", "str", "str", "str", "str"],
-                                        interactive=True,
-                                        label="🕰️ 過去の投稿履歴",
-                                        wrap=True
+                                        interactive=False,
+                                        wrap=True,
                                     )
+                                    twitter_history_detail = gr.Markdown("")
+
+                            with gr.TabItem("設定", id="twitter_settings_subtab"):
+                                gr.Markdown("## Twitter設定")
+                                with gr.Accordion("使い方", open=False):
+                                    gr.Markdown(
+                                        "- `承認待ち` で下書きを更新し、行を選んで読み込んでから内容を確認して投稿します。\n"
+                                        "- `設定` ではルームごとのTwitter連携設定を保存します。ブラウザ認証は規約・安定性の面で非推奨のため、通常はAPI認証を使ってください。\n"
+                                        "- ペルソナがTwitter投稿を提案する場合は下書きキューに入り、ここで人間が承認するまで投稿されません。\n"
+                                        "- Discordから承認する場合は、Discord Bot設定の承認コマンド許可ユーザーIDに自分のDiscordユーザーIDを入れてください。"
+                                    )
+                                with gr.Row():
+                                    twitter_load_settings_button = gr.Button("現在のルーム設定を読み込む", variant="secondary")
+                                    twitter_save_button = gr.Button("Twitter設定を保存", variant="primary")
+                                twitter_enabled_checkbox = gr.Checkbox(
+                                    label="Twitter連携を有効化",
+                                    value=bool(_initial_twitter_settings.get("enabled", False)),
+                                    interactive=True,
+                                )
+                                twitter_auth_mode_radio = gr.Radio(
+                                    choices=["browser", "api"],
+                                    value=_initial_twitter_auth_mode,
+                                    label="認証方式",
+                                    interactive=True,
+                                )
+                                with gr.Group(visible=(_initial_twitter_auth_mode == "browser")) as twitter_browser_auth_group:
+                                    twitter_session_status = gr.Markdown("セッション状態: 未確認")
                                     with gr.Row():
-                                        twitter_history_refresh_button = gr.Button("🔄 履歴更新", variant="secondary")
-                                        twitter_history_retry_button = gr.Button("🔄 下書きに戻して再トライ", variant="secondary")
-                                        twitter_history_delete_button = gr.Button("🗑️ 選択した履歴を削除", variant="stop")
-    
-                                with gr.TabItem("📡 フィード", id="twitter_feed_subtab"):
-                                    twitter_feed_type = gr.Radio(
-                                        choices=["タイムライン", "通知"],
-                                        value="タイムライン",
-                                        label="フィード種別",
-                                        interactive=True
-                                    )
-                                    twitter_feed_df = gr.Dataframe(
-                                        headers=["時刻", "投稿者", "内容", "URL"],
-                                        datatype=["str", "str", "str", "str"],
-                                        interactive=True,
-                                        label="📡 フィード（行を選択して返信）",
-                                        wrap=True
-                                    )
-                                    twitter_feed_refresh_button = gr.Button("🔄 フィード更新", variant="primary")
-    
-    
-    
-                                with gr.TabItem("⚙️ 設定", id="twitter_settings_subtab"):
-                                    _initial_room_config = room_manager.get_room_config(effective_initial_room) or {}
-                                    _initial_twitter_settings = (_initial_room_config.get("override_settings", {}) or {}).get("twitter_settings", {}) or {}
-                                    _initial_twitter_api_config = _initial_twitter_settings.get("api_config", {}) or {}
-                                    _initial_twitter_auth_mode = _initial_twitter_settings.get("auth_mode", "api" if _initial_twitter_settings.get("use_api") else "browser")
-                                    twitter_enabled_checkbox = gr.Checkbox(label="Twitter連携機能を有効にする", value=_initial_twitter_settings.get("enabled", False))
-                                    gr.Markdown("---")
-    
-                                    gr.Markdown("### 🔑 Twitter (X) 接続管理")
-                                    twitter_auth_mode = gr.Radio(
-                                        label="認証方式",
-                                        choices=[("ブラウザ自動化 (Cookie)", "browser"), ("Twitter API (v2)", "api")],
-                                        value=_initial_twitter_auth_mode
-                                    )
-    
-                                    with gr.Group(visible=(_initial_twitter_auth_mode == "browser")) as twitter_browser_group:
-                                        twitter_session_status_display = gr.Markdown("セッション状態: **確認中...**")
-    
-                                        with gr.Row():
-                                            twitter_login_button = gr.Button("🔑 Twitterにログイン (ブラウザ起動)", variant="primary")
-                                            twitter_refresh_session_button = gr.Button("🔄 状態を再確認")
-    
-                                        with gr.Accordion("🍪 Cookieを手動でインポート (ログインできない場合)", open=False):
-                                            gr.Markdown("WindowsのChrome等で取得した **JSON形式** のCookieをここに貼り付けてください。（EditThisCookie等の拡張機能で取得できます。）")
-                                            twitter_cookie_import_input = gr.Textbox(label="Cookie JSON", lines=5, placeholder='[{"name": "auth_token", ...}, ...]')
-                                            twitter_cookie_import_button = gr.Button("📥 Cookieをインポート", variant="secondary")
-                                            twitter_cookie_import_status = gr.Markdown("")
-    
-                                    with gr.Group(visible=(_initial_twitter_auth_mode == "api")) as twitter_api_group:
-                                        gr.Markdown("#### 🔑 API 認証情報 (v2)")
-                                        gr.Markdown(
-                                            "Twitter APIを使用するには、[Twitter Developer Portal](https://developer.twitter.com/en/portal/dashboard) でアプリを作成し、以下のキーを取得する必要があります。\n\n"
-                                            "1. Appの **User authentication settings** で `OAuth 1.0a` を有効にし、App permissions を `Read and Write` に設定してください。\n"
-                                            "2. **Keys and Tokens** タブから各キーを発行して入力してください。"
-                                        )
-                                        twitter_api_key = gr.Textbox(label="API Key (コンシューマーキー)", type="password", value=_initial_twitter_api_config.get("api_key", ""))
-                                        twitter_api_secret = gr.Textbox(label="API Key Secret (コンシューマーシークレット)", type="password", value=_initial_twitter_api_config.get("api_secret", ""))
-                                        twitter_access_token = gr.Textbox(label="Access Token (アクセストークン)", type="password", value=_initial_twitter_api_config.get("access_token", ""))
-                                        twitter_access_token_secret = gr.Textbox(label="Access Token Secret (アクセストークンシークレット)", type="password", value=_initial_twitter_api_config.get("access_token_secret", ""))
-                                        twitter_api_test_button = gr.Button("🔌 接続テスト", variant="secondary")
-                                        twitter_api_test_result = gr.Markdown("")
-                                    gr.Markdown("---")
-                                    gr.Markdown("#### 📝 自動投稿の動機付けと指針設定")
-                                    twitter_posting_summary = gr.Textbox(
-                                        label="Twitter投稿の目的（短い概要）",
-                                        placeholder="例: 日常のつぶやきや、便利な設定の共有を行います。",
-                                        info="ツールリストに表示され、ペルソナが『いつ投稿すべきか』を判断する動機になります。",
-                                        lines=2,
-                                        value=_initial_twitter_settings.get("posting_summary", "")
-                                    )
-                                    twitter_posting_guidelines = gr.Textbox(
-                                        label="Twitter投稿の指針（詳細なルール）",
-                                        placeholder="例: ポジティブな内容を心がけ、個人情報は含めません。",
-                                        info="ツール使用時にシステムプロンプトへ注入され、投稿文面のルールとして機能します。",
-                                        lines=4,
-                                        value=_initial_twitter_settings.get("posting_guidelines", "")
-                                    )
-                                    gr.Markdown("---")
-                                    gr.Markdown("#### ⚡ 投稿モード設定")
-                                    twitter_auto_post_checkbox = gr.Checkbox(
-                                        label="承認なしで自動投稿を許可する",
-                                        value=_initial_twitter_settings.get("auto_post", False),
-                                        info="ONにすると、ペルソナが作成した下書きはユーザーの承認を経ずに即座に投稿されます。"
-                                    )
-                                    twitter_approval_required_for_replies_checkbox = gr.Checkbox(
-                                        label="引用、リプライは承認が必要",
-                                        value=_initial_twitter_settings.get("approval_required_for_replies", True),
-                                        info="ONにすると、自動投稿が有効でも引用・リプライだけは承認待ちキューに入ります。"
-                                    )
-                                    twitter_notify_approval_checkbox = gr.Checkbox(
-                                        label="承認要請時にスマホへ通知を送信する",
-                                        value=_initial_twitter_settings.get("notify_on_approval_request", False),
-                                        info="自動投稿がOFFの場合、新しい下書きが作成されたときにプッシュ通知でお知らせします。"
-                                    )
-                                    twitter_premium_checkbox = gr.Checkbox(
-                                        label="Twitter Premiumアカウント（制限緩和）",
-                                        value=_initial_twitter_settings.get("is_premium", False),
-                                        info="ONにすると、文字数制限（標準140文字）が大幅に緩和されます。"
-                                    )
-                                    twitter_privacy_filter_checkbox = gr.Checkbox(
-                                        label="プライバシーフィルタを有効にする",
-                                        value=_initial_twitter_settings.get("enable_privacy_filter", True),
-                                        info="ONにすると、文字置き換え機能（redaction_rules.json）に登録された機密情報等が自動で伏せ字（***）などに置換されます。"
-                                    )
-                                    gr.Markdown("---")
-                                    gr.Markdown("#### 🧵 スレッド（会話ツリー）取得設定")
-                                    gr.Markdown("API料金や処理時間（待機時間）の増加を抑えるための設定です。")
-                                    twitter_fetch_thread_checkbox = gr.Checkbox(
-                                        label="直前のやり取り（親ツイート）を自動で取得する",
-                                        value=_initial_twitter_settings.get("fetch_thread_enabled", False),
-                                        info="ONにすると、メンションやリプライを取得した際、自動的にその前の会話の流れ（スレッド）を辿り、AIへのコンテキストとして付与します。"
-                                    )
-                                    twitter_thread_fetch_count_slider = gr.Slider(
-                                        minimum=1, maximum=10, step=1, value=_initial_twitter_settings.get("thread_fetch_count", 3),
-                                        label="一度に遡る最大件数",
-                                        info="※APIモードの場合はこの回数分の追加APIリクエストが発生するため、コストに注意してください。"
-                                    )
-                                    gr.Markdown("---")
-                                    twitter_save_settings_button = gr.Button("💾 設定を保存")
+                                        twitter_check_session_button = gr.Button("状態を再確認", variant="secondary")
+                                        twitter_login_button = gr.Button("ブラウザでログイン", variant="secondary")
+                                    twitter_cookie_input = gr.Code(label="Cookie JSON貼り付け", language="json", lines=5)
+                                    twitter_cookie_import_button = gr.Button("Cookieをインポート", variant="secondary")
+                                with gr.Group(visible=(_initial_twitter_auth_mode == "api")) as twitter_api_auth_group:
+                                    with gr.Row():
+                                        twitter_api_key_input = gr.Textbox(label="API Key", value=_initial_twitter_api_config.get("api_key", ""), type="password", interactive=True)
+                                        twitter_api_secret_input = gr.Textbox(label="API Secret", value=_initial_twitter_api_config.get("api_secret", ""), type="password", interactive=True)
+                                    with gr.Row():
+                                        twitter_access_token_input = gr.Textbox(label="Access Token", value=_initial_twitter_api_config.get("access_token", ""), type="password", interactive=True)
+                                        twitter_access_token_secret_input = gr.Textbox(label="Access Token Secret", value=_initial_twitter_api_config.get("access_token_secret", ""), type="password", interactive=True)
+                                    twitter_test_api_button = gr.Button("API接続テスト", variant="secondary")
+                                    twitter_test_result = gr.Markdown("")
+                                twitter_posting_summary_input = gr.Textbox(label="投稿方針の要約", value=_initial_twitter_settings.get("posting_summary", ""), lines=3, interactive=True)
+                                twitter_posting_guidelines_input = gr.Textbox(label="投稿ガイドライン", value=_initial_twitter_settings.get("posting_guidelines", ""), lines=5, interactive=True)
+                                with gr.Row():
+                                    twitter_auto_post_checkbox = gr.Checkbox(label="自動投稿", value=bool(_initial_twitter_settings.get("auto_post", False)), interactive=True)
+                                    twitter_approval_for_replies_checkbox = gr.Checkbox(label="引用、リプライは承認必須", value=bool(_initial_twitter_settings.get("approval_for_replies", True)), interactive=True)
+                                    twitter_notify_on_approval_checkbox = gr.Checkbox(label="承認依頼を通知", value=bool(_initial_twitter_settings.get("notify_on_approval_request", False)), interactive=True)
+                                    twitter_is_premium_checkbox = gr.Checkbox(label="X Premium", value=bool(_initial_twitter_settings.get("is_premium", False)), interactive=True)
+                                with gr.Row():
+                                    twitter_privacy_filter_checkbox = gr.Checkbox(label="プライバシーフィルタ", value=bool(_initial_twitter_settings.get("enable_privacy_filter", True)), interactive=True)
+                                    twitter_fetch_thread_checkbox = gr.Checkbox(label="返信先スレッド取得", value=bool(_initial_twitter_settings.get("fetch_thread_enabled", False)), interactive=True)
+                                    twitter_thread_fetch_count_number = gr.Number(label="取得件数", value=int(_initial_twitter_settings.get("thread_fetch_count", 3) or 3), precision=0, interactive=True)
+                                twitter_status = gr.Markdown("ルーム切替または読み込み/保存で設定を反映します。")
 
-                    with gr.TabItem("💬 Discord Bot", id="external_discord_tab") as external_discord_tab:
-                        _discord_accepted = config_manager.CONFIG_GLOBAL.get("accepted_disclaimers", {}).get("discord", False)
-                        _initial_discord_room_settings = config_manager.get_room_discord_bot_settings(effective_initial_room)
-                        with gr.Accordion("⚠️ 利用規約・免責事項", open=not _discord_accepted) as discord_disclaimer_accordion:
-                            gr.Markdown("## ⚠️ Discord 連携に関する重要事項\n"
-                                        "AIとの会話内容がDiscordのコミュニティガイドライン（ヘイトスピーチ、不適切なコンテンツ等）に抵触した場合、Discordアカウントが凍結・削除される危険性があります。\n\n"
-                                        "AIによる生成物であっても、Discordに送信された内容はすべて**ユーザー自身の責任**となります。ガイドラインを遵守した運用をお願いいたします。\n\n"
-                                        "- [Discord サービス利用規約](https://discord.com/terms)\n"
-                                        "- [Discord コミュニティガイドライン](https://discord.com/guidelines)")
-                            discord_accept_button = gr.Button("規約とリスクを理解し、自己責任で利用を開始する", variant="primary", visible=not _discord_accepted)
+                    with gr.TabItem("Discord / LINE", id="external_discord_line", key="external_tab_discord_line"):
+                        _discord_initial_settings = config_manager.get_room_discord_bot_settings(effective_initial_room)
+                        _discord_channel_modes = "\n".join(
+                            f"{channel_id}={ {'always': '常時反応', 'mention': 'メンション時のみ', 'ignore': '無視'}.get(mode, mode) }"
+                            for channel_id, mode in sorted((_discord_initial_settings.get("channel_response_modes", {}) or {}).items())
+                        )
+                        _discord_has_token = bool(_discord_initial_settings.get("token"))
+                        if _discord_initial_settings.get("enabled") and _discord_has_token:
+                            _discord_initial_status = "Botの状態: 🟢 有効（起動中または起動対象）"
+                        elif _discord_has_token:
+                            _discord_initial_status = "Botの状態: ⚪ 無効（Botトークン保存済み・有効化チェックがOFF）"
+                        else:
+                            _discord_initial_status = "Botの状態: ⚪ 無効"
 
-                        with gr.Column(visible=_discord_accepted) as discord_main_content:
-                            gr.Markdown("## 💬 Discord Bot × Nexus Ark\n"
-                                        "外出先からDiscord経由で対話したり、写真を送受信したりするための設定です。")
-
-                            with gr.Accordion("📖 セットアップ手順", open=False):
+                        with gr.Accordion("Discord Bot", open=True):
+                            with gr.Accordion("設定方法", open=False):
                                 gr.Markdown(
                                     "### 1. Botの作成とトークンの取得\n"
                                     "- [Discord Developer Portal](https://discord.com/developers/applications) にアクセスし、`New Application` を作成します。\n"
-                                    "- 左メニュー `Bot` を選択し、**Reset Token** を押してトークンをコピーして下の「Botトークン」欄に貼り付けます。\n\n"
-                                    "### 2. 権限（Intents）の設定 【重要】\n"
-                                    "- 同じ `Bot` ページ内の下部にある **Privileged Gateway Intents** セクションを探します。\n"
-                                    "- **MESSAGE CONTENT INTENT** を **ON** にしてください（これを忘れると、AIがメッセージを読み取れず反応しません）。\n\n"
+                                    "- 左メニュー `Bot` を選択し、**Reset Token** を押してトークンをコピーして `Bot Token` 欄に貼り付けます。\n\n"
+                                    "### 2. 権限（Intents）の設定\n"
+                                    "- 同じ `Bot` ページ下部の **Privileged Gateway Intents** を開きます。\n"
+                                    "- **MESSAGE CONTENT INTENT** をONにしてください。これがOFFだと、Botが通常メッセージ本文を読めず反応できません。\n\n"
                                     "### 3. Botをサーバーに招待する\n"
-                                    "- 左メニュー `OAuth2` -> `URL Generator` を選択します。\n"
-                                    "- `bot` スコープにチェックを入れます。スラッシュコマンド候補も使う場合は `applications.commands` にもチェックを入れます。\n"
-                                    "- `Bot Permissions`（Botの権限）では、テスト用サーバーなら **管理者** にチェックを入れるのが最も簡単です。管理者を使わず権限を絞る場合は、**チャンネルを表示**、**メッセージを送る**、**メッセージ履歴を読む**、**ファイルを添付**、**スラッシュコマンドを使用**、音声入力用に **接続**、必要に応じて **発言** にチェックを入れます。\n"
-                                    "- **管理者** を付けている場合、上記の個別のBot権限は基本的に不要です。ただし、スラッシュコマンド候補を表示するには、権限欄ではなくスコープ側の `applications.commands` チェックが必要です。\n"
-                                    "- 生成されたURLをブラウザで開き、自分のサーバーにBotを追加します。\n\n"
-                                    "### 4. 許可ユーザーIDの確認\n"
-                                    "- Discordアプリの設定 -> 詳細設定 -> **開発者モード** をONにします。\n"
-                                    "- 自分のアイコンを右クリックして「ユーザーIDをコピー」し、下の「許可ユーザーID」欄に貼り付けます。\n\n"
-                                    "### 5. チャンネルIDの確認\n"
-                                    "- 開発者モードをONにした状態で、Discordサーバー内の対象チャンネルを右クリックします。\n"
-                                    "- 「チャンネルIDをコピー」を選び、下の「許可チャンネルID」または「デフォルト送信チャンネルID」に貼り付けます。\n"
-                                    "- **許可チャンネルID**: Botが反応してよいチャンネルを制限します。複数ある場合はカンマ区切りで入力します。空欄の場合は、許可ユーザーからの発言であれば全チャンネルを処理します。\n"
-                                    "- **デフォルト送信チャンネルID**: 自律行動時にAIがメッセージや画像を送る先です。自律送信を使わない場合は空欄でも構いません。"
+                                    "- 左メニュー `OAuth2` -> `URL Generator` を開きます。\n"
+                                    "- `Scopes` は `bot` と `applications.commands` を選びます。\n"
+                                    "- 通常のBot招待では `applications.commands.permissions.update` は選びません。選ぶとリダイレクトURIが必要な別用途の認可フローになります。\n"
+                                    "- `Bot Permissions` は、テスト用サーバーなら **管理者** が最も簡単です。権限を絞る場合は、**チャンネルを見る**、**メッセージを送信**、**メッセージ履歴を読む**、**ファイルを添付**、**スラッシュコマンドを使用** を許可してください。\n"
+                                    "- 生成されたURLからBotをサーバーへ招待します。\n\n"
+                                    "### 4. ユーザーIDとチャンネルIDを取得する\n"
+                                    "- Discordの `ユーザー設定` -> `詳細設定` で **開発者モード** をONにします。\n"
+                                    "- 自分のアイコンを右クリックして「ユーザーIDをコピー」し、`許可ユーザーID` に入力します。\n"
+                                    "- 対象チャンネルを右クリックして「チャンネルIDをコピー」し、`許可チャンネルID` や `既定チャンネルID` に入力します。\n\n"
+                                    "### 5. ルーム個別Botとして保存する\n"
+                                    "- `このルームのDiscord Botを有効化` をONにし、必要なIDや反応モードを入力して保存します。\n"
+                                    "- 同じBot Tokenを複数ルームで共有しないでください。1 Bot Token = 1 ペルソナを前提にしています。\n"
+                                    "- 保存後、Bot起動状態の反映にはNexus Arkの再起動が必要になる場合があります。"
                                 )
-    
-                            with gr.Accordion("🎮 Discordでの使い方", open=False):
+                            with gr.Accordion("使い方", open=False):
                                 gr.Markdown(
-                                    "### コマンドと操作\n"
-                                    "- **コマンド一覧**: `/help` または `/commands` と送信すると、Discord上で利用できるコマンド一覧を確認できます。\n"
-                                    "- **応答の再生成**: `/retry` と送信すると、直前のAIの応答を削除して新しく生成し直します。APIエラー時や、別の回答が見たい時に便利です。\n"
-                                    "- **ルームの切り替え**: ペルソナ専用BotではBotとルームが固定されるため `/room` は無効です。旧共通Bot利用時のみ `/room ルーム名` で切り替えできます。\n"
-                                    "- **Botへのメンション**: Discordの入力欄で `@Bot名` と入力し、候補から話しかけたいBotを選んで送信します。複数ペルソナBotを同じチャンネルに置く場合は、「メンションされた時だけ反応する」をONにすると誤反応を防げます。ONの場合、`/retry` などのコマンドも `@Bot名 /retry` または `/retry @Bot名` のように対象Botをメンションして送信してください。\n"
-                                    "- **グループ会話**: 複数のペルソナBotを同じチャンネルに招待し、`/group start @BotA @BotB` で開始、`/group end` で終了、`/group status` で状態確認できます。`rounds:2` を付けると最大2巡まで自動継続します（上限3巡）。\n"
-                                    "- **Twitter下書き操作**: `/tw drafts`, `/tw show ID`, `/tw approve ID`, `/tw reject ID` で、このペルソナのTwitter下書きを確認・承認・却下できます。\n"
-                                    "- **ログ確認**: Discordの入力欄で `/log ` と入力して候補を開き、`mode` で「最新のユーザー発言以降」「最新ログ」「今日」を選びます。`limit` は最新ログなどの最大件数です。従来のメッセージ入力としては `/log since_me`, `/log latest 20`, `/log today` も使えます。\n"
-                                    "- **画像解析**: 画像を添付して送信すると、AIが内容を認識して返信します。"
+                                    "- ルームごとにDiscord Bot Tokenを設定できます。複数ペルソナを使う場合は、各ルームに別Bot Tokenを設定してください。\n"
+                                    "- `許可ユーザーID` を指定すると、指定ユーザーからの操作だけを受け付けます。\n"
+                                    "- `許可チャンネルID` を指定すると、対象チャンネルだけで反応します。空欄なら制限しません。\n"
+                                    "- `チャンネル別反応モード` は `チャンネルID=メンション時のみ`、`チャンネルID=常時反応`、`チャンネルID=無視` のように1行ずつ指定します。\n"
+                                    "- `承認コマンド許可ユーザーID` は、DiscordからTwitter下書きを承認/却下するユーザーを限定するための設定です。\n"
+                                    "- Botの招待時は `bot` と `applications.commands` scopeを付けてください。"
                                 )
+                            discord_bot_enabled_checkbox = gr.Checkbox(label="このルームのDiscord Botを有効化", value=bool(_discord_initial_settings.get("enabled", False)), interactive=True)
+                            discord_bot_token_input = gr.Textbox(label="Bot Token", value=_discord_initial_settings.get("token", ""), type="password", interactive=True)
+                            discord_bot_auth_ids_input = gr.Textbox(label="許可ユーザーID（カンマ区切り）", value=", ".join([str(v) for v in _discord_initial_settings.get("authorized_user_ids", [])]), interactive=True)
+                            discord_bot_allowed_channels_input = gr.Textbox(label="許可チャンネルID（カンマ区切り）", value=", ".join([str(v) for v in _discord_initial_settings.get("allowed_channel_ids", [])]), interactive=True)
+                            with gr.Row():
+                                discord_bot_default_channel_input = gr.Textbox(label="既定チャンネルID", value=_discord_initial_settings.get("default_channel_id", ""), interactive=True)
+                                discord_bot_mention_only_checkbox = gr.Checkbox(label="メンション時のみ反応", value=bool(_discord_initial_settings.get("mention_only", False)), interactive=True)
+                            discord_bot_channel_modes_input = gr.Textbox(
+                                label="チャンネル別反応モード",
+                                value=_discord_channel_modes,
+                                placeholder="123456789=メンション時のみ",
+                                lines=3,
+                                interactive=True,
+                            )
+                            discord_bot_allow_autonomous_send_checkbox = gr.Checkbox(label="自律送信を許可", value=bool(_discord_initial_settings.get("allow_autonomous_send", False)), interactive=True)
+                            discord_bot_persona_webhook_input = gr.Textbox(label="ペルソナWebhook URL", value=_discord_initial_settings.get("persona_webhook_url", ""), type="password", interactive=True)
+                            discord_bot_approval_ids_input = gr.Textbox(label="承認コマンド許可ユーザーID（カンマ区切り）", value=", ".join([str(v) for v in _discord_initial_settings.get("approval_command_allowlist", [])]), interactive=True)
+                            discord_bot_voice_input_enabled_checkbox = gr.Checkbox(value=bool(_discord_initial_settings.get("voice_input_enabled", False)), visible=False)
+                            discord_bot_voice_confirm_checkbox = gr.Checkbox(value=bool(_discord_initial_settings.get("voice_input_confirm_transcript", True)), visible=False)
+                            discord_bot_voice_timeout_input = gr.Number(value=int(_discord_initial_settings.get("voice_input_timeout_minutes", 10) or 10), precision=0, visible=False)
+                            discord_bot_voice_stt_model_input = gr.Textbox(value=str(_discord_initial_settings.get("voice_input_stt_model") or constants.DISCORD_VOICE_STT_MODEL), visible=False)
+                            with gr.Row():
+                                discord_bot_load_button = gr.Button("現在のルーム設定を読み込む", variant="secondary")
+                                discord_bot_save_button = gr.Button("Discord Bot設定を保存", variant="primary")
+                                discord_bot_stop_button = gr.Button("Discord Botを停止", variant="stop")
+                            discord_bot_status = gr.Markdown(_discord_initial_status)
 
-                            with gr.Accordion("🔁 旧共通Bot設定から移行", open=False):
+                        with gr.Accordion("LINE Bot", open=False):
+                            with gr.Accordion("設定方法", open=False):
                                 gr.Markdown(
-                                    "以前の共通Discord Bot設定を、選択したペルソナ専用Bot設定へコピーします。"
-                                    "移行後は旧共通Botを無効化し、他のペルソナは必要に応じて別Botトークンで新規設定してください。"
+                                    "### 注意\n"
+                                    "- LINE Botは外部からアクセスできるHTTPS URLが必要です。ドメイン固定のTunnelを使わない場合、PC再起動やTunnel再起動のたびにLINE側Webhook URLの更新が必要になることがあります。\n\n"
+                                    "### 1. LINE Developersでプロバイダーを作成する\n"
+                                    "- [LINE Developersコンソール](https://developers.line.biz/console/) にアクセスします。\n"
+                                    "- 「新規プロバイダー作成」を選び、任意のプロバイダー名（例: NexusArk）で作成します。\n\n"
+                                    "### 2. Messaging APIチャネルを作成する\n"
+                                    "- 作成したプロバイダーで **新規チャネル作成** -> **Messaging API** を選択します。\n"
+                                    "- チャネル名、説明、業種などを入力し、規約に同意して作成します。\n"
+                                    "- すでにLINE公式アカウントマネージャーでアカウント作成済みの場合は、[LINE公式アカウントマネージャー](https://manager.line.biz/) の `設定` -> `Messaging API` から連携してください。\n\n"
+                                    "### 3. TokenとSecretを取得する\n"
+                                    "- LINE Developersで対象チャネルを開き、**チャネル基本設定（Basic settings）** の **Channel secret** をコピーして `Channel Secret` 欄へ貼り付けます。\n"
+                                    "- **Messaging API設定** タブの下部で **Channel access token** を発行し、`Channel Access Token` 欄へ貼り付けます。\n\n"
+                                    "### 4. 許可ユーザーIDを設定する\n"
+                                    "- **チャネル基本設定** の下部にある **Your user ID** をコピーし、`許可ユーザーID` 欄へ入力します。\n"
+                                    "- 複数ユーザーを許可する場合はカンマ区切りで入力します。空欄にするとユーザー制限なしになります。\n\n"
+                                    "### 5. Webhook URLを設定する\n"
+                                    "- LINE Bot受信用サーバーは既定で `http://localhost:7862` です。外部公開にはCloudflare Tunnel、Tailscale Funnel、ngrokなどを使ってHTTPS URLを用意します。\n"
+                                    "- Cloudflare Tunnelの簡易例: `cloudflared tunnel --url http://localhost:7862`\n"
+                                    "- 表示された `https://...trycloudflare.com` などのURLを、LINE Developersの **Messaging API設定** -> **Webhook URL** に入力します。\n"
+                                    "- Webhook URLの末尾パスが必要な環境では、LINE Bot実装の案内や起動ログに表示されるURLを優先してください。\n"
+                                    "- Webhookを **有効** にし、検証ボタンで疎通を確認します。\n\n"
+                                    "### 6. LINE公式アカウント側の応答設定を調整する\n"
+                                    "- [LINE公式アカウントマネージャー](https://manager.line.biz/) の `設定` -> `応答設定` で、**あいさつメッセージ** と **応答メッセージ** をOFFにします。\n"
+                                    "- これを残すと、Nexus ArkのAI返信とLINE側自動応答が二重に届くことがあります。\n\n"
+                                    "### 7. Nexus Ark側で保存する\n"
+                                    "- `LINE Botを有効化` をONにし、Token/Secret/許可ユーザーID/紐付けルームを設定して保存します。\n"
+                                    "- 保存後、Bot起動状態の反映にはNexus Arkの再起動が必要になる場合があります。"
                                 )
-                                discord_global_migration_status = gr.Markdown(
-                                    ui_handlers._format_global_discord_migration_status()
+                            with gr.Accordion("使い方", open=False):
+                                gr.Markdown(
+                                    "- LINE DevelopersでMessaging APIチャンネルを作成し、Channel Access TokenとChannel Secretを入力します。\n"
+                                    "- Webhook URLはNexus ArkのLINE Botサーバーへ向けます。外部から使う場合はCloudflare TunnelやTailscale FunnelなどでHTTPS公開してください。\n"
+                                    "- `許可ユーザーID` を指定すると、そのLINEユーザーからのメッセージだけを受け付けます。空欄なら制限しません。\n"
+                                    "- `紐付けルーム` を自動にすると、Nexus Ark UIで選択中のルームと連動します。固定したい場合は対象ルームを選んでください。\n"
+                                    "- 設定保存後、Botの起動状態を反映するにはNexus Arkの再起動が必要になる場合があります。"
                                 )
-                                discord_global_migration_room = gr.Dropdown(
-                                    label="旧共通Bot設定を残す移行先ルーム",
-                                    choices=room_list_on_startup,
-                                    value=effective_initial_room,
+                            line_bot_enabled_checkbox = gr.Checkbox(
+                                label="LINE Botを有効化",
+                                value=bool(config_manager.CONFIG_GLOBAL.get("line_bot_enabled", False)),
+                                interactive=True,
+                            )
+                            line_channel_access_token_input = gr.Textbox(
+                                label="Channel Access Token",
+                                value=config_manager.CONFIG_GLOBAL.get("line_channel_access_token", ""),
+                                type="password",
+                                interactive=True,
+                            )
+                            line_channel_secret_input = gr.Textbox(
+                                label="Channel Secret",
+                                value=config_manager.CONFIG_GLOBAL.get("line_channel_secret", ""),
+                                type="password",
+                                interactive=True,
+                            )
+                            line_authorized_user_ids_input = gr.Textbox(
+                                label="許可ユーザーID（カンマ区切り）",
+                                value=", ".join(config_manager.CONFIG_GLOBAL.get("line_authorized_user_ids", [])),
+                                interactive=True,
+                            )
+                            line_linked_room_dropdown = gr.Dropdown(
+                                label="紐付けルーム",
+                                choices=[("自動（現在のUIと連動）", "自動（現在のUIと連動）"), *room_list_on_startup],
+                                value=config_manager.CONFIG_GLOBAL.get("line_bot_linked_room") or "自動（現在のUIと連動）",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            with gr.Row():
+                                line_bot_save_button = gr.Button("LINE Bot設定を保存", variant="primary")
+                                line_bot_stop_button = gr.Button("LINE Botを停止", variant="stop")
+                            line_bot_status = gr.Markdown("サーバー状態: 未読み込み")
+
+                    with gr.TabItem("拡張ツール", id="external_custom_tools", key="external_tab_custom_tools"):
+                        gr.Markdown("## 拡張ツール")
+                        _custom_tools_settings = config_manager.CONFIG_GLOBAL.get("custom_tools_settings", {}) or {}
+                        custom_tools_enabled_checkbox = gr.Checkbox(
+                            label="拡張ツール機能を有効化",
+                            value=bool(_custom_tools_settings.get("enabled", False)),
+                            interactive=True,
+                        )
+                        with gr.Tabs():
+                            with gr.TabItem("ローカルプラグイン", id="custom_tools_local_plugins"):
+                                local_plugin_file_dropdown = gr.Dropdown(
+                                    label="ローカルプラグイン",
+                                    choices=[],
+                                    value=None,
                                     interactive=True,
                                     allow_custom_value=True,
                                 )
                                 with gr.Row():
-                                    migrate_global_discord_button = gr.Button("旧共通Bot設定をこのルームへ移行", variant="secondary")
-                                    copy_global_discord_common_button = gr.Button("トークン以外の共通項目だけコピー")
-                                discord_global_migration_result = gr.Markdown("")
-    
-                            discord_bot_enabled_checkbox = gr.Checkbox(
-                                label="このペルソナ専用のDiscord Botを有効化する",
-                                value=_initial_discord_room_settings.get("enabled", False),
-                                interactive=True,
-                                info="Discord Botと現在のペルソナを1:1で紐付けます。同じBotトークンを複数ペルソナで共有することはできません。"
-                            )
-                            discord_bot_token_input = gr.Textbox(
-                                label="Bot トークン",
-                                type="password",
-                                placeholder="MTAx...",
-                                value=_initial_discord_room_settings.get("token", ""),
-                                interactive=True
-                            )
-                            discord_authorized_ids_input = gr.Textbox(
-                                label="許可ユーザーID (カンマ区切り)",
-                                placeholder="123456789012345678, 987654321098765432",
-                                value=", ".join([str(aid) for aid in _initial_discord_room_settings.get("authorized_user_ids", [])]),
-                                interactive=True,
-                                info="ご自身のDiscordユーザーIDを入力してください（設定>詳細設定>開発者モードをONにしてプロフィールを右クリックでコピー可能）。"
-                            )
-                            discord_allowed_channel_ids_input = gr.Textbox(
-                                label="許可チャンネルID (カンマ区切り)",
-                                placeholder="123456789012345678, 987654321098765432",
-                                value=", ".join([str(cid) for cid in _initial_discord_room_settings.get("allowed_channel_ids", [])]),
-                                interactive=True,
-                                info="空欄の場合は、許可ユーザーからの発言であれば全チャンネルを処理します。"
-                            )
-                            discord_default_channel_id_input = gr.Textbox(
-                                label="デフォルト送信チャンネルID",
-                                placeholder="123456789012345678",
-                                value=_initial_discord_room_settings.get("default_channel_id", ""),
-                                interactive=True,
-                                info="自律行動時のDiscord送信先として使用します。"
-                            )
-                            discord_mention_only_checkbox = gr.Checkbox(
-                                label="メンションされた時だけ反応する",
-                                value=_initial_discord_room_settings.get("mention_only", False),
-                                interactive=True,
-                                info="全チャンネル共通の既定値です。チャンネル別反応モードが設定されている場合は、そちらが優先されます。"
-                            )
-                            discord_channel_response_modes_input = gr.Textbox(
-                                label="チャンネル別反応モード（任意）",
-                                value=ui_handlers._format_discord_channel_response_modes(_initial_discord_room_settings.get("channel_response_modes", {})),
-                                lines=4,
-                                interactive=True,
-                                placeholder="123456789012345678=常時反応\n234567890123456789=メンション時のみ\n345678901234567890=無視",
-                                info="1行に1チャンネルずつ「チャンネルID=常時反応 / メンション時のみ / 無視」で指定します。単独チャンネルは常時反応、複合チャンネルはメンション時のみがおすすめです。"
-                            )
-                            discord_allow_autonomous_send_checkbox = gr.Checkbox(
-                                label="自律行動時のDiscord送信を許可する",
-                                value=_initial_discord_room_settings.get("allow_autonomous_send", False),
-                                interactive=True,
-                                info="ONの場合のみ、AIツールからデフォルトチャンネルへメッセージや画像を送信できます。"
-                            )
-                            discord_persona_webhook_input = gr.Textbox(
-                                label="ペルソナ専用Webhook URL（任意）",
-                                type="password",
-                                value=_initial_discord_room_settings.get("persona_webhook_url", ""),
-                                interactive=True,
-                                info="共通Webhookより優先して、このペルソナ専用通知に使います。"
-                            )
-                            discord_approval_ids_input = gr.Textbox(
-                                label="Twitter承認コマンド許可ユーザーID (任意・カンマ区切り)",
-                                value=", ".join([str(aid) for aid in _initial_discord_room_settings.get("approval_command_allowlist", [])]),
-                                interactive=True,
-                                info="空欄の場合は、許可ユーザーID全員がTwitter下書き承認/却下コマンドを使えます。"
-                            )
-                            with gr.Accordion("🎙️ Discord音声入力（Beta）", open=False, visible=False):
-                                gr.Markdown(
-                                    "Discordボイスチャンネルで話した内容を文字起こしし、このペルソナへの通常メッセージとして送ります。"
-                                    "MVPではペルソナの返信はDiscordテキストで返します。"
-                                )
-                                discord_voice_input_enabled_checkbox = gr.Checkbox(
-                                    label="Discord音声入力を許可する",
-                                    value=_initial_discord_room_settings.get("voice_input_enabled", False),
-                                    interactive=True,
-                                    info="ONにしたうえで、Discordで `/voice join` を実行すると開始できます。"
-                                )
-                                discord_voice_confirm_transcript_checkbox = gr.Checkbox(
-                                    label="文字起こし結果をDiscordに表示する",
-                                    value=_initial_discord_room_settings.get("voice_input_confirm_transcript", True),
-                                    interactive=True,
-                                    info="誤認識に気づきやすくするため、通常はONがおすすめです。"
-                                )
-                                discord_voice_timeout_slider = gr.Slider(
-                                    label="音声入力の自動停止（分）",
-                                    minimum=1,
-                                    maximum=60,
-                                    step=1,
-                                    value=int(_initial_discord_room_settings.get("voice_input_timeout_minutes", 10) or 10),
-                                    interactive=True,
-                                    info="指定時間が経過するとBotがボイスチャンネルから退出します。"
-                                )
-                                discord_voice_stt_model_input = gr.Textbox(
-                                    label="STTモデル",
-                                    value=_initial_discord_room_settings.get("voice_input_stt_model", constants.DISCORD_VOICE_STT_MODEL),
-                                    interactive=True,
-                                    info="Geminiモデル名、または OpenAI Whisper を使う場合は openai:whisper-1 を指定します。"
-                                )
-    
-                            with gr.Row():
-                                save_discord_bot_settings_button = gr.Button("💾 設定を保存してBotを再起動", variant="primary")
-                                stop_discord_bot_button = gr.Button("🛑 Botを停止", variant="stop")
-    
-                            discord_bot_status_display = gr.Markdown(f"Botの状態: {'🟢 有効（起動中または起動対象）' if _initial_discord_room_settings.get('enabled') and _initial_discord_room_settings.get('token') else '⚪ 無効'}")
-
-                    with gr.TabItem("📱 LINE 連携", id="external_line_tab"):
-                        _line_accepted = config_manager.CONFIG_GLOBAL.get("accepted_disclaimers", {}).get("line", False)
-                        with gr.Accordion("⚠️ 利用規約・免責事項", open=not _line_accepted) as line_disclaimer_accordion:
-                            gr.Markdown("## ⚠️ LINE 連携に関する運用上の注意\n"
-                                        "LINE公式アカウント（Messaging API）を利用する場合、送信される内容はすべてLINEの利用規約およびガイドラインに従う必要があります。\n\n"
-                                        "特筆すべき点として、**一度送信されたメッセージは後から取消・修正ができません**。AIによる生成物が規約（公序良俗違反、過度な送信など）に抵触した場合、**アカウントが永久停止されるリスク**があります。\n\n"
-                                        "本機能の利用により生じたアカウントの停止等の不利益について、開発者は一切の責任を負いません。十分にご注意の上で運用してください。\n\n"
-                                        "- [LINE公式アカウント利用規約](https://terms2.line.me/official_account_terms_jp)\n"
-                                        "- [LINE公式アカウントガイドライン](https://terms2.line.me/official_account_guideline_jp)")
-                            line_accept_button = gr.Button("規約とリスクを理解し、自己責任で利用を開始する", variant="primary", visible=not _line_accepted)
-
-                        with gr.Column(visible=_line_accepted) as line_main_content:
-                            gr.Markdown("## 📱 LINE Messaging API × Nexus Ark\n"
-                                        "LINEの公式アカウント機能を使って、Nexus Arkとメッセージや画像のやり取りを行うための設定です。")
-
-                            with gr.Accordion("📖 セットアップ手順", open=False):
-                                gr.Markdown(
-                                    "### ＊注意：ドメインをお持ちでない場合、Tunnelを閉じたり、PCを再起動したりするたび一部設定の更新が必要になります。\n"
-                                    "### 1. LINE Developersへの登録とプロバイダー作成\n"
-                                    "- [LINE Developersコンソール](https://developers.line.biz/console/) にアクセスします。\n"
-                                    "  *(※LINEとヤフーの統合により「LINEヤフー Business ID」のログイン画面にリダイレクトされます。そのままログイン・アカウント作成を進めてください)*\n"
-                                    "- 「新規プロバイダー作成」を選択し、任意のプロバイダー名（例: NexusArk）を入力して作成します。\n\n"
-    
-                                    "### 2. Messaging APIチャネルの作成\n"
-                                    "- 作成したプロバイダーの画面で **「新規チャネル作成」** をクリックし、 **「Messaging API」** を選択します。\n"
-                                    "- チャネル名（AIの名前など）や説明、業種などを入力し、規約に同意して「作成」をクリックします。\n"
-                                    "  **💡 すでに公式アカウントマネージャーでアカウント作成済みの場合：**\n"
-                                    "  - [LINE公式アカウントマネージャー](https://manager.line.biz/) へログインし、右上「設定」> 左メニュー「Messaging API」>「Messaging APIを利用する」から連携してください。\n\n"
-    
-                                    "### 3. トークンとシークレットの取得\n"
-                                    "- デベロッパーコンソールで、作成したチャネルをクリックして開き、 **「チャネル基本設定（Basic settings）」** タブから **Channel secret** をコピーして下の欄に貼り付けます。\n"
-                                    "- 次に **「Messaging API設定」** タブへ移動し、一番下の **Channel access token** を「発行」ボタンで作成してコピーし、下の欄に貼り付けます。\n\n"
-    
-                                    "### 4. 許可ユーザーIDの設定\n"
-                                    "- 「チャネル基本設定」タブの下部にある **Your user ID** をコピーして下の「許可ユーザーID」欄に貼り付けます。これがないと反応しません。\n\n"
-    
-                                    "### 5. Webhook設定 【重要】\n"
-                                    "- LINE Botは外部からアクセスできるURL（HTTPS）が必要です。一番簡単な方法は **Cloudflare Tunnel** を使うことです。\n"
-                                    "  #### 💡 Cloudflare Tunnelの簡単な手順：\n"
-                                    "  1. [cloudflaredのダウンロードページ](https://github.com/cloudflare/cloudflared/releases) からファイルをダウンロードします。\n"
-                                    "     - **Windows:** `cloudflared-windows-amd64.exe` を使用\n"
-                                    "     - **Linux (WSL2等):** `wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb` での直接ダウンロードを推奨\n"
-                                    "     - **Mac:** `cloudflared-amd64.pkg` を使用\n\n"
-                                    "  2. インストールまたは実行します。\n"
-                                    "     - **Windows:** PowerShell 等を開き、置いた場所で `.\\cloudflared.exe tunnel --url http://localhost:7862` を実行します。\n"
-                                    "     - **Linux (WSL2等):** ダウンロード後、`sudo dpkg -i cloudflared-linux-amd64.deb` でインストールし、`cloudflared tunnel --url http://localhost:7862` を実行します。\n\n"
-                                    "  3. 実行後、画面に `https://[英数字].trycloudflare.com` というURLが表示されたら成功です。そのURLをコピーします（実行中はターミナルを閉じないでください）。\n\n"
-                                    "- 「Messaging API設定」タブの「Webhook設定」にある **Webhook URL** に、そのURLを入力します。\n"
-                                    "- **重要:** `https://[英数字].trycloudflare.com/api/line/webhook` のように、末尾に必ず `/api/line/webhook` を付けてください。\n"
-                                    "- 入力後 **「更新」** （またはUpdate）をクリックし、 **「検証」** （またはVerify）で「成功」と出ればOKです。また、必ず **「Webhookの利用」をオン** にしてください。\n\n"
-                                    "  **⚠️ 注意事項：**\n"
-                                    "  - この方法（`--url`）で発行されたURLは一時的なものです。Tunnelを閉じたり、PCを再起動したりするたびにURLが変わるため、その都度LINE側の設定も更新する必要があります。\n\n"
-                                    "  #### 💡 URLを永続化（固定）したい場合：\n"
-                                    "  - 独自のドメインをCloudflareに登録している場合、Cloudflare Zero Trustダッシュボードから「Named Tunnel」を作成し、任意のサブドメイン（`line.yourdomain.com` など）を `http://localhost:7862` に紐付けることで、URLを完全に固定できます。\n\n"
-    
-                                    "### 6. 応答メッセージ設定の無効化\n"
-                                    "- [LINE公式アカウントマネージャー](https://manager.line.biz/) の「設定」>「応答設定」から、**「あいさつメッセージ」と「応答メッセージ」をオフ** にしてください（AIの返信と二重になるのを防ぐため）。"
-                                )
-    
-                            with gr.Accordion("🎮 LINEでの使い方", open=False):
-                                gr.Markdown(
-                                    "### コマンドと操作\n"
-                                    "- **応答の再生成**: `/retry` と送信すると、直前のAIの応答を削除して新しく生成し直します。\n"
-                                    "- **ルームの切り替え**: `/room ルーム名`（例: `/room オリヴェ`）と送信することで、対話対象とするルームを切り替えられます。\n"
-                                    "- **画像解析**: 画像を送信すると、AIが内容を認識して返信します。"
-                                )
-    
-                            line_bot_enabled_checkbox = gr.Checkbox(
-                                label="LINE Bot連携を有効化する",
-                                value=config_manager.LINE_BOT_ENABLED,
-                                interactive=True,
-                                info="有効にすると、Webhook受信用サーバーが立ち上がります。（事前にポートの外部公開が必要です）"
-                            )
-                            line_channel_access_token_input = gr.Textbox(
-                                label="チャネルアクセストークン",
-                                type="password",
-                                placeholder="eyJhbGciOiJIUzI1NiJ9...",
-                                value=config_manager.LINE_CHANNEL_ACCESS_TOKEN,
-                                interactive=True
-                            )
-                            line_channel_secret_input = gr.Textbox(
-                                label="チャネルシークレット",
-                                type="password",
-                                placeholder="1234567890abcdef...",
-                                value=config_manager.LINE_CHANNEL_SECRET,
-                                interactive=True
-                            )
-                            line_authorized_ids_input = gr.Textbox(
-                                label="許可ユーザーID (カンマ区切り)",
-                                placeholder="U1234567890abcdef...",
-                                value=", ".join([str(aid) for aid in config_manager.LINE_AUTHORIZED_USER_IDS]),
-                                interactive=True,
-                                info="LINE Developersのチャネル基本設定にある「Your user ID」を入力してください。"
-                            )
-                            line_bot_linked_room_dropdown = gr.Dropdown(
-                                label="連動するルーム",
-                                choices=["自動（現在のUIと連動）"] + [r[1] for r in room_manager.get_room_list_for_ui()],
-                                value=config_manager.LINE_BOT_LINKED_ROOM if config_manager.LINE_BOT_LINKED_ROOM else "自動（現在のUIと連動）",
-                                interactive=True,
-                                info="LINEでの対話に使用するペルソナ（ルーム）を選択します。「自動」にすると、メイン画面で選択中のルームが使用されます。"
-                            )
-    
-                            with gr.Row():
-                                save_line_bot_settings_button = gr.Button("💾 設定を保存してサーバーを再起動", variant="primary")
-                                stop_line_bot_button = gr.Button("🛑 サーバーを停止", variant="stop")
-    
-                            line_bot_status_display = gr.Markdown(f"サーバー状態: {'🟢 実行中' if config_manager.LINE_BOT_ENABLED and config_manager.LINE_CHANNEL_ACCESS_TOKEN else '⚪ 停止中'}")
-
-                    with gr.TabItem("🎮 Roblox", id="external_roblox_tab", visible=False):
-                        gr.Markdown("## 🎮 Roblox × Nexus Ark\n💡 AIをROBLOX内の仮想アバターと連動させるための設定です。[Creator Dashboard](https://create.roblox.com/credentials) から取得してください。")
-
-                        # --- セットアップガイド ---
-                        with gr.Accordion("📖 セットアップガイド", open=False):
-                            roblox_guide_display = gr.Markdown(value="ガイドを読み込み中...")
-                        roblox_api_key_input = gr.Textbox(
-                            label="ROBLOX API キー (Open Cloud)",
-                            type="password",
-                            placeholder="APIキーを入力",
-                            value="",
-                            interactive=True
-                        )
-                        roblox_universe_id_input = gr.Textbox(
-                            label="Universe ID (ゲーム固有のID)",
-                            placeholder="例: 1234567890",
-                            value="",
-                            interactive=True
-                        )
-                        roblox_topic_input = gr.Textbox(
-                            label="Messaging Topic (受信側のトピック名)",
-                            placeholder="NexusArkCommands",
-                            value="NexusArkCommands",
-                            interactive=True
-                        )
-                        roblox_test_result_output = gr.Textbox(
-                            label="テスト結果",
-                            interactive=False,
-                            visible=False,
-                            lines=3
-                        )
-
-                        gr.Markdown("### 📡 双方向連携 (Webhook 受信)")
-                        gr.Markdown("ROBLOX側からイベント（接近・チャット等）を受信するための設定です。")
-                        roblox_webhook_enabled_checkbox = gr.Checkbox(
-                            label="Webhook連携の有効化 (推奨)",
-                            value=True,
-                            interactive=True,
-                        )
-                        roblox_activation_mode_radio = gr.Radio(
-                            choices=[("自動 (Auto)", "auto"), ("常時 (Enabled)", "enabled"), ("無効 (Disabled)", "disabled")],
-                            value="auto",
-                            label="Robloxツールの有効化モード",
-                            info="自動：Webhook通信検知時のみツールを有効化。常時：常に有効。無効：常に無効。",
-                            interactive=True
-                        )
-                        roblox_filtering_enabled_checkbox = gr.Checkbox(
-                            label="チャット送信時に文字置き換えルールを適用する",
-                            value=True,
-                            interactive=True,
-                            info="「チャット支援ツール」で設定した文字置き換えルールを、ROBLOX内でのAIの発言にも適用します。"
-                        )
-                        with gr.Row():
-                            roblox_webhook_domain_input = gr.Textbox(
-                                label="Webhookドメイン (Cloudflare Tunnel URL)",
-                                placeholder="例: https://victor-hero-growth-foo.trycloudflare.com",
-                                value="",
-                                interactive=True,
-                                info="Cloudflare Tunnelなどで取得したURLを入力してください。",
-                                scale=3
-                            )
-                            save_cloudflare_url_button = gr.Button("💾 URL保存", variant="primary", scale=1)
-                        with gr.Row():
-                            roblox_webhook_secret_input = gr.Textbox(
-                                label="Webhook Secret Token (認証キー)",
-                                placeholder="保存時に自動生成されます",
-                                interactive=False,
-                                scale=3
-                            )
-                            roblox_webhook_regenerate_button = gr.Button("🔄 トークン再生成", variant="secondary", scale=1)
-
-                        roblox_webhook_url_display = gr.Markdown(
-                            "**Webhook URL (例):** `https://[CloudflareTunnelのURL]/api/roblox/event/{room_name}`\n"
-                            "※ ルアスクリプトの `WEBHOOK_URL` に設定してください。"
-                        )
-
-                        roblox_webhook_logs_display = gr.Textbox(
-                            label="直近の受信イベント (直近5件)",
-                            interactive=False,
-                            lines=5,
-                            value="（まだイベントを受信していません）"
-                        )
-                        roblox_webhook_refresh_logs_button = gr.Button("🔄 ログ更新")
-
-                        gr.Markdown("---")
-                        with gr.Row():
-                            save_roblox_settings_button = gr.Button("💾 このルームのROBLOX設定を保存", variant="primary", scale=2)
-                            test_roblox_connection_button = gr.Button("🔌 接続テスト", variant="secondary", scale=1)
-
-                    with gr.TabItem("🛠️ 拡張ツール", id="external_custom_tools_tab") as custom_tools_tab:
-                        gr.Markdown("## 🛠️ Nexus Ark 拡張ツール (Plugins & MCP)")
-                        gr.Markdown("ユーザー自作のツールや、MCP (Model Context Protocol) サーバ経由のツールを AI が利用できるようにします。")
-
-                        # 初期値取得
-                        _custom_settings = config_manager.CONFIG_GLOBAL.get("custom_tools_settings", {})
-
-                        custom_tools_enabled = gr.Checkbox(
-                            label="拡張ツール機能を有効にする",
-                            value=_custom_settings.get("enabled", True),
-                            info="OFFにすると、以下のカスタムツールやMCPツールは AI のツールリストから除外されます。"
-                        )
-
-                        with gr.Tabs():
-                            with gr.TabItem("📂 ローカルプラグイン"):
-                                with gr.Accordion("💡 使いかたを表示", open=False):
-                                    gr.Markdown(
-                                        "### ローカルプラグインの作成\n"
-                                        "`custom_tools/` フォルダに Python スクリプトを追加するだけで、AIに新しい能力を授けることができます。\n\n"
-                                        "1. `custom_tools/` 内に `.py` ファイルを作成します。\n"
-                                        "2. `@tool` デコレータを使用して関数を定義します。**関数の説明（docstring）が重要です**。\n"
-                                        "3. ファイル保存後、下の「🔄 再スキャン」ボタンを押すと認識されます。\n\n"
-                                        "**コード例:**\n"
-                                        "```python\n"
-                                        "from langchain_core.tools import tool\n\n"
-                                        "@tool\n"
-                                        "def get_time(location: str):\n"
-                                        "    \"\"\"指定された場所の現在時刻を返します。\"\"\"\n"
-                                        "    from datetime import datetime\n"
-                                        "    return f\"{location}は {datetime.now().strftime('%H:%M')} です。\"\n"
-                                        "```"
-                                    )
-                                gr.Markdown("`custom_tools/` フォルダ内の Python スクリプトからロードされたツールです。")
-                                is_scanning_plugins = gr.State(False)
-                                # 現在の状態を反映した初期値を取得
-                                _initial_local_tools = ui_handlers.handle_refresh_custom_tools()
-                                local_tools_df = gr.Dataframe(
-                                    headers=["有効", "ファイル名", "ツール名", "説明", "短い説明", "使う場面", "結果後プロンプト"],
-                                    datatype=["bool", "str", "str", "str", "str", "str", "str"],
-                                    value=_initial_local_tools,
-                                    interactive=True,
-                                    label="検出されたプラグイン (個別ON/OFF・AI向け説明・結果後プロンプト)",
-                                    wrap=True
-                                )
-                                local_tools_refresh_btn = gr.Button("🔄 再スキャン", variant="secondary")
-
-                                gr.Markdown("---")
-                                gr.Markdown("### 📝 プラグインエディタ")
-                                with gr.Row():
-                                    local_plugin_file_dropdown = gr.Dropdown(label="編集するファイルを選択", choices=[], interactive=True, scale=3)
-                                    local_plugin_enabled = gr.Checkbox(label="有効", value=True, interactive=True, scale=1)
-                                    local_plugin_reload_files_btn = gr.Button("🔄 リスト更新", variant="secondary", scale=0)
-
-                                local_plugin_code_editor = gr.Code(label="ソースコード", language="python", lines=20, interactive=True)
-                                with gr.Row():
-                                    local_plugin_save_btn = gr.Button("💾 保存して反映", variant="primary")
-                                    local_plugin_new_btn = gr.Button("🆕 新規作成", variant="secondary")
-                                    local_plugin_delete_btn = gr.Button("🗑️ 削除", variant="stop")
+                                    local_plugin_refresh_button = gr.Button("プラグイン一覧を更新", variant="secondary")
+                                    local_plugin_new_filename_input = gr.Textbox(label="新規ファイル名", placeholder="my_tool.py", interactive=True)
+                                    local_plugin_create_button = gr.Button("新規作成", variant="secondary")
+                                    local_plugin_delete_button = gr.Button("削除", variant="stop")
+                                local_plugin_enabled_checkbox = gr.Checkbox(label="選択プラグインを有効化", value=True, interactive=True)
+                                local_plugin_code_editor = gr.Code(label="プラグインコード", language="python", interactive=True, lines=18)
+                                local_plugin_save_button = gr.Button("プラグインを保存", variant="primary")
                                 local_plugin_status = gr.Markdown("")
 
-                            with gr.TabItem("🌐 MCPサーバ"):
-                                with gr.Accordion("💡 使いかたを表示", open=False):
-                                    gr.Markdown(
-                                        "### MCP (Model Context Protocol) の設定\n"
-                                        "MCPは、AIツールを外部プロセスとして統合するための標準規格です。\n\n"
-                                        "- **stdio**: ローカルサーバ向け。コマンドと引数を指定して起動します。\n"
-                                        "- **streamable_http**: HTTPベースの最新推奨方式。URL（例: `http://localhost:8000/mcp`）を指定します。\n"
-                                        "- **sse**: SSE (Server-Sent Events) ベース。従来のHTTP方式です。\n"
-                                        "- **simple_http**: 軽量デバイス（M5Atom 等）向け。ルートパスへの単純な HTTP POST (JSON-RPC) です。\n\n"
-                                        "**設定例 (同梱の天気予報MCP):**\n"
-                                        "- **種別**: `stdio` / **コマンド**: `python` / **引数**: `tools/weather_mcp_server.py`\n\n"
-                                        "設定を登録後、「🔌 接続テスト」でツール一覧が表示されれば成功です。AIに「天気を教えて」などと頼むと実行されます。"
-                                    )
-                                gr.Markdown("Model Context Protocol (MCP) を使用して外部サーバからツールを統合します。")
-
-                                # MCPサーバ一覧
-                                _mcp_servers = _custom_settings.get("mcp_servers", [])
-                                _mcp_df_data = [[s.get("enabled", True), s.get("name"), s.get("type"), s.get("command") or s.get("url"), " ".join(s.get("args", [])), "未接続"] for s in _mcp_servers]
-
+                            with gr.TabItem("MCP", id="custom_tools_mcp"):
+                                mcp_selected_server_state = gr.State(None)
+                                with gr.Row():
+                                    refresh_mcp_servers_button = gr.Button("MCPサーバ一覧を更新", variant="secondary")
+                                    edit_mcp_server_button = gr.Button("選択サーバを編集欄へ反映", variant="secondary")
+                                    test_mcp_connection_button = gr.Button("接続テスト", variant="primary")
+                                    remove_mcp_server_button = gr.Button("選択サーバを削除", variant="stop")
                                 mcp_servers_df = gr.Dataframe(
+                                    label="MCPサーバ一覧",
                                     headers=["有効", "名前", "種別", "コマンド/URL", "引数", "状態"],
                                     datatype=["bool", "str", "str", "str", "str", "str"],
                                     interactive=True,
-                                    label="MCPサーバ一覧",
-                                    value=_mcp_df_data,
-                                    wrap=True
+                                    wrap=True,
                                 )
-
                                 with gr.Row():
-                                    mcp_edit_btn = gr.Button("📝 編集", variant="secondary")
-                                    mcp_remove_btn = gr.Button("🗑️ 選択したサーバを削除", variant="stop")
-                                    mcp_connect_test_btn = gr.Button("🔌 接続テスト")
-
-                                mcp_selected_info = gr.State(None)
-
-                                gr.Markdown("---")
-                                gr.Markdown("### ➕ サーバ追加 / 編集")
+                                    mcp_server_name_input = gr.Textbox(label="名前", interactive=True)
+                                    mcp_server_type_dropdown = gr.Dropdown(
+                                        label="種別",
+                                        choices=["stdio", "sse", "streamable_http", "simple_http"],
+                                        value="stdio",
+                                        interactive=True,
+                                    )
+                                    mcp_server_enabled_checkbox = gr.Checkbox(label="有効", value=True, interactive=True)
                                 with gr.Row():
-                                    mcp_new_name = gr.Textbox(label="サーバ名", placeholder="SwitchBot")
-                                    mcp_new_type = gr.Radio(label="種別", choices=["stdio", "streamable_http", "sse", "simple_http"], value="stdio")
-                                    mcp_new_enabled = gr.Checkbox(label="有効", value=True)
-                                with gr.Row():
-                                    mcp_new_cmd_url = gr.Textbox(label="コマンド / URL", placeholder="python")
-                                    mcp_new_args = gr.Textbox(label="引数 (スペース区切り)", placeholder="path/to/mcp_server.py")
-                                with gr.Row():
-                                    mcp_add_btn = gr.Button("✅ 登録 / 上書き保存", variant="primary")
-                                    mcp_clear_btn = gr.Button("🧹 入力クリア", variant="secondary")
-                                mcp_status_msg = gr.Markdown("")
-
-                                gr.Markdown("---")
-
-                                gr.Markdown("### 🛠️ ツール構成")
-                                gr.Markdown("「接続テスト」成功後、個別ツールの有効/無効、AI向け説明、結果後プロンプトを設定できます。")
-                                mcp_tools_config_df = gr.Dataframe(
-                                    headers=["有効", "ツール名", "説明", "短い説明", "使う場面", "結果後プロンプト"],
+                                    mcp_server_command_input = gr.Textbox(label="コマンド", placeholder="python", interactive=True, scale=2)
+                                    mcp_server_args_input = gr.Textbox(label="引数", interactive=True, scale=2)
+                                    add_mcp_server_button = gr.Button("追加/更新", variant="primary", scale=1)
+                                mcp_status = gr.Markdown("")
+                                mcp_tools_df = gr.Dataframe(
+                                    label="検出ツール",
+                                    headers=["有効", "ツール名", "説明", "概要", "使う場面", "結果プロンプト"],
                                     datatype=["bool", "str", "str", "str", "str", "str"],
                                     interactive=True,
-                                    label="ツール個別設定",
-                                    wrap=True
+                                    wrap=True,
                                 )
 
-                            with gr.TabItem("📦 ライブラリ管理"):
-                                gr.Markdown("### 🛡️ 依存ライブラリの承認管理")
-                                gr.Markdown("AIがツール自作時に必要とした外部パッケージの承認を行います。未承認のものはインストールされません。")
+                    with gr.TabItem("API Gateway / Lite", id="external_api_gateway", key="external_tab_api_gateway"):
+                        gr.Markdown("## API Gateway / Nexus Ark Lite")
+                        _api_gateway_settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+                        external_api_status = gr.Markdown("API状態: 待機中")
 
-                                # 選択状態保持用
-                                selected_pending_dep = gr.State(None)
-                                selected_allowed_dep = gr.State(None)
+                        with gr.Accordion("個人用の使い方", open=True):
+                            gr.Markdown(value=ui_handlers.build_api_gateway_personal_use_guide())
 
-                                _pending_deps = _custom_settings.get("pending_dependencies", [])
-                                _allowed_deps = _custom_settings.get("allowed_dependencies", [])
+                        with gr.Accordion("API設定", open=False):
+                            with gr.Row():
+                                external_api_enabled_checkbox = gr.Checkbox(
+                                    label="API Gatewayを有効化",
+                                    value=bool(_api_gateway_settings.get("enabled", False)),
+                                    interactive=True,
+                                    scale=1,
+                                )
+                                external_api_host_input = gr.Textbox(
+                                    label="Host",
+                                    value=_api_gateway_settings.get("host", "0.0.0.0"),
+                                    interactive=True,
+                                    scale=2,
+                                )
+                                external_api_port_input = gr.Number(
+                                    label="Port",
+                                    value=int(_api_gateway_settings.get("port", 8000) or 8000),
+                                    precision=0,
+                                    interactive=True,
+                                    scale=1,
+                                )
+                            with gr.Row():
+                                external_api_require_auth_checkbox = gr.Checkbox(
+                                    label="Token認証",
+                                    value=bool(_api_gateway_settings.get("require_auth", True)),
+                                    interactive=True,
+                                    scale=1,
+                                )
+                                external_api_auto_tailscale_checkbox = gr.Checkbox(
+                                    label="起動時にTailscale HTTPSを自動設定",
+                                    value=bool(_api_gateway_settings.get("auto_start_tailscale_serve", False)),
+                                    interactive=True,
+                                    scale=2,
+                                )
+                                external_api_auth_token_input = gr.Textbox(
+                                    label="接続用Token",
+                                    value=_api_gateway_settings.get("auth_token", ""),
+                                    type="password",
+                                    interactive=True,
+                                    scale=3,
+                                )
+                                external_api_token_generate_button = gr.Button("Token生成", variant="secondary", scale=1)
+                                external_api_token_show_button = gr.Button("保存済みTokenを表示", variant="secondary", scale=1)
+                            external_api_token_copy_output = gr.Textbox(
+                                label="PWA入力用Token（一時表示）",
+                                value="",
+                                interactive=False,
+                                lines=1,
+                                placeholder="「保存済みTokenを表示」を押すと、PWAへコピーするTokenを表示します。",
+                            )
+                            with gr.Row():
+                                external_api_save_button = gr.Button("API設定を保存", variant="primary")
+                                external_api_refresh_button = gr.Button("接続情報を更新", variant="secondary")
+                                external_tailscale_button = gr.Button("Tailscale HTTPS設定を実行", variant="secondary")
 
-                                with gr.Row():
-                                    with gr.Column():
-                                        gr.Markdown("#### ⏳ 承認待ち")
-                                        pending_deps_df = gr.Dataframe(
-                                            headers=["パッケージ名"],
-                                            datatype=["str"],
-                                            interactive=False,
-                                            value=[[p] for p in _pending_deps],
-                                            label="承認待ちリスト (選択して承認/却下)"
-                                        )
-                                        with gr.Row():
-                                            approve_dep_btn = gr.Button("✅ 選択したパッケージを承認", variant="primary")
-                                            reject_dep_btn = gr.Button("❌ 却下", variant="stop")
+                        with gr.Accordion("安全診断", open=False):
+                            external_api_security_diagnostics = gr.Markdown(
+                                value=ui_handlers.build_api_gateway_security_diagnostics()
+                            )
 
-                                    with gr.Column():
-                                        gr.Markdown("#### ✅ 承認済み")
-                                        allowed_deps_df = gr.Dataframe(
-                                            headers=["パッケージ名"],
-                                            datatype=["str"],
-                                            interactive=False,
-                                            value=[[a] for a in _allowed_deps],
-                                            label="承認済みリスト (選択して削除)"
-                                        )
-                                        remove_allowed_dep_btn = gr.Button("🗑️ 承認を取り消す", variant="secondary")
+                        with gr.Accordion("Nexus Ark Lite 接続情報", open=True):
+                            external_lite_connection_help = gr.Markdown("接続情報は「接続情報を更新」で取得します。")
 
-                                dep_management_status = gr.Markdown("")
-                                deps_refresh_btn = gr.Button("🔄 リスト更新", variant="secondary")
+                        with gr.Accordion("外部連携リファレンス", open=False):
+                            external_api_docs = gr.Markdown(value=ui_handlers.build_api_gateway_external_docs(effective_initial_room))
 
+                        with gr.Accordion("外部イベントテスター", open=False):
+                            with gr.Row():
+                                external_event_type_dropdown = gr.Dropdown(
+                                    label="イベント種別",
+                                    choices=[
+                                        "switchbot_triggered",
+                                        "stackchan_observed",
+                                        "stable_diffusion_result",
+                                        "sns_post_received",
+                                        "custom",
+                                    ],
+                                    value="switchbot_triggered",
+                                    interactive=True,
+                                    scale=2,
+                                )
+                                external_event_source_input = gr.Textbox(
+                                    label="送信元",
+                                    value="external_ui",
+                                    interactive=True,
+                                    scale=2,
+                                )
+                                external_event_notify_checkbox = gr.Checkbox(
+                                    label="通知トリガー",
+                                    value=True,
+                                    interactive=True,
+                                    scale=1,
+                                )
+                                external_event_importance_dropdown = gr.Dropdown(
+                                    label="重要度",
+                                    choices=["low", "normal", "high", "critical"],
+                                    value="high",
+                                    interactive=True,
+                                    scale=1,
+                                )
+                            external_event_data_json = gr.Code(
+                                label="イベント内容JSON",
+                                value=ui_handlers.build_external_event_template("switchbot_triggered"),
+                                language="json",
+                                interactive=True,
+                                lines=10,
+                            )
+                            external_event_test_button = gr.Button("現在のルームへイベントを記録", variant="primary")
+                            external_event_result = gr.Markdown("")
+
+                    with gr.TabItem("Roblox", id="external_roblox", key="external_tab_roblox", visible=False):
+                        gr.Markdown("## Roblox")
+                        with gr.Accordion("クイックスタートガイド", open=False):
+                            roblox_guide_display = gr.Markdown(value=ui_handlers.load_roblox_guide())
+                        with gr.Row():
+                            roblox_api_key_input = gr.Textbox(label="Open Cloud API Key", type="password", interactive=True, scale=2)
+                            roblox_universe_id_input = gr.Textbox(label="Universe ID", interactive=True, scale=1)
+                        with gr.Row():
+                            roblox_topic_input = gr.Textbox(label="MessagingService Topic", value="NexusArkCommands", interactive=True)
+                            roblox_filtering_enabled_checkbox = gr.Checkbox(label="チャットフィルタリング", value=True, interactive=True)
+                        with gr.Row():
+                            roblox_webhook_enabled_checkbox = gr.Checkbox(label="Webhookを有効化", value=True, interactive=True)
+                            roblox_activation_mode_radio = gr.Radio(
+                                choices=[("自動", "auto"), ("有効", "enabled"), ("無効", "disabled")],
+                                value="auto",
+                                label="起動モード",
+                                interactive=True,
+                            )
+                        roblox_webhook_domain_input = gr.Textbox(label="Webhook公開URL / Cloudflare Tunnel URL", interactive=True)
+                        with gr.Row():
+                            save_cloudflare_url_button = gr.Button("URLだけ保存", variant="secondary")
+                            save_roblox_settings_button = gr.Button("Roblox設定を保存", variant="primary")
+                            test_roblox_connection_button = gr.Button("接続テスト", variant="secondary")
+                        roblox_webhook_secret_input = gr.Textbox(label="Webhook Secret", type="password", interactive=False)
+                        with gr.Row():
+                            roblox_webhook_regenerate_button = gr.Button("Webhook Secretを再生成", variant="secondary")
+                            roblox_webhook_refresh_logs_button = gr.Button("Webhookログを更新", variant="secondary")
+                        roblox_test_result_output = gr.Textbox(label="接続テスト結果", lines=4, interactive=False)
+                        roblox_webhook_logs_display = gr.Textbox(label="Webhookログ", lines=8, interactive=False)
 
             # ===== 💼 お出かけタブ =====
             # ===== お出かけタブ =====
-            with gr.TabItem("お出かけ", elem_id="outing_tab"):
+            with gr.TabItem("お出かけ", id="outing", elem_id="outing_tab", key="top_tab_outing"):
                 with gr.Tabs():
                     # --- Tab 1: エクスポート ---
                     with gr.TabItem("📤 エクスポート", elem_id="outing_export_tab"):
@@ -5486,7 +5328,7 @@ try:
 
                         outing_import_status = gr.Markdown("ステータス: 待機中")
 
-            with gr.TabItem("デバッグコンソール"):
+            with gr.TabItem("デバッグコンソール", id="debug_console", key="top_tab_debug_console"):
                 gr.Markdown("## デバッグコンソール\nアプリケーションの内部的な動作ログ（ターミナルに出力される内容）をここに表示します。")
                 debug_console_output = gr.Textbox(
                     label="コンソール出力",
@@ -5506,8 +5348,9 @@ try:
             room_dropdown,
             alarm_room_dropdown, timer_room_dropdown, manage_room_selector,
             location_dropdown,
-            current_scenery_display, room_tts_provider_dropdown, room_tts_model_dropdown, room_voice_dropdown,
+            current_scenery_display, room_tts_provider_dropdown, room_tts_profile_dropdown, room_tts_model_dropdown, room_voice_dropdown,
             room_voice_style_prompt_textbox,
+            room_voice_speed_slider, room_voice_pitch_slider, room_voice_intonation_slider, room_voice_volume_slider,
             enable_typewriter_effect_checkbox,
             streaming_speed_slider,
             room_temperature_slider, room_top_p_slider,
@@ -5645,38 +5488,37 @@ try:
             saved_locations_dropdown,
             temp_scenery_image_display,
             scenery_mode_tabs,
-            # --- Twitter 設定 ---
+            # --- 外部連携リセット対象追加 (Twitter: 18項目) ---
             twitter_enabled_checkbox,
-            twitter_auth_mode,
-            twitter_api_key,
-            twitter_api_secret,
-            twitter_access_token,
-            twitter_access_token_secret,
-            twitter_posting_summary,
-            twitter_posting_guidelines,
+            twitter_auth_mode_radio,
+            twitter_posting_summary_input,
+            twitter_posting_guidelines_input,
             twitter_auto_post_checkbox,
-            twitter_approval_required_for_replies_checkbox,
-            twitter_notify_approval_checkbox,
-            twitter_premium_checkbox,
+            twitter_approval_for_replies_checkbox,
+            twitter_notify_on_approval_checkbox,
+            twitter_api_key_input,
+            twitter_api_secret_input,
+            twitter_access_token_input,
+            twitter_access_token_secret_input,
+            twitter_browser_auth_group,
+            twitter_api_auth_group,
+            twitter_is_premium_checkbox,
             twitter_privacy_filter_checkbox,
             twitter_fetch_thread_checkbox,
-            twitter_thread_fetch_count_slider,
-            # --- Discord 設定 ---
+            twitter_thread_fetch_count_number,
+            twitter_status,
+            # --- 外部連携リセット対象追加 Discord (11項目) ---
             discord_bot_enabled_checkbox,
             discord_bot_token_input,
-            discord_authorized_ids_input,
-            discord_allowed_channel_ids_input,
-            discord_default_channel_id_input,
-            discord_mention_only_checkbox,
-            discord_channel_response_modes_input,
-            discord_allow_autonomous_send_checkbox,
-            discord_persona_webhook_input,
-            discord_approval_ids_input,
-            discord_voice_input_enabled_checkbox,
-            discord_voice_confirm_transcript_checkbox,
-            discord_voice_timeout_slider,
-            discord_voice_stt_model_input,
-            discord_bot_status_display
+            discord_bot_auth_ids_input,
+            discord_bot_allowed_channels_input,
+            discord_bot_default_channel_input,
+            discord_bot_mention_only_checkbox,
+            discord_bot_channel_modes_input,
+            discord_bot_allow_autonomous_send_checkbox,
+            discord_bot_persona_webhook_input,
+            discord_bot_approval_ids_input,
+            discord_bot_status
         ]
 
         initial_load_outputs = [
@@ -5702,14 +5544,7 @@ try:
             image_gen_api_key_dropdown,
             gemini_image_model_dropdown,
             openai_image_model_dropdown,
-            # --- [追加] Pollinations / Hugging Face 画像生成設定 ---
-            pollinations_api_key_input,
-            pollinations_image_model_dropdown,
-            huggingface_api_token_input,
-            huggingface_image_model_dropdown,
-            paid_keys_checkbox_group,
-            allow_external_connection_checkbox,
-            # --- [追加] ローカル画像生成設定 (7コンポーネント) ---
+            # --- [追加] ローカル画像生成設定 ---
             local_sd_url_input,
             local_sd_sampler_dropdown,
             local_sd_steps_slider,
@@ -5717,8 +5552,15 @@ try:
             local_sd_positive_prefix_input,
             local_sd_positive_append_input,
             local_sd_negative_prompt_input,
-            # ------------------------------------------------
+            # --- [追加] Pollinations / Hugging Face 画像生成設定 ---
+            pollinations_api_key_input,
+            pollinations_image_model_dropdown,
+            huggingface_api_token_input,
+            huggingface_image_model_dropdown,
+            paid_keys_checkbox_group,
+            allow_external_connection_checkbox,
             custom_scenery_location_dropdown,
+            custom_scenery_season_dropdown,
             custom_scenery_time_dropdown,
             # --- [追加] OpenAI設定UIへの反映 ---
             openai_profile_dropdown,
@@ -5763,6 +5605,8 @@ try:
             attachments_df,
             active_attachments_display,
             custom_scenery_location_dropdown,
+            custom_scenery_season_dropdown,
+            custom_scenery_time_dropdown,
             # 司令塔間で戻り値の数を統一するための追加コンポーネント
             token_count_display,
             room_delete_confirmed_state, # handle_delete_room が返すリセット値用
@@ -5772,38 +5616,6 @@ try:
             active_working_memory_status,
             working_memory_slot_dropdown,
             working_memory_editor
-            ## --- Twitter同期項目を追加 ---
-            #twitter_enabled_checkbox,
-            #twitter_auth_mode,
-            #twitter_api_key,
-            #twitter_api_secret,
-            #twitter_access_token,
-            #twitter_access_token_secret,
-            #twitter_posting_summary,
-            #twitter_posting_guidelines,
-            #twitter_auto_post_checkbox,
-            #twitter_approval_required_for_replies_checkbox,
-            #twitter_notify_approval_checkbox,
-            #twitter_premium_checkbox,
-            #twitter_privacy_filter_checkbox,
-            #twitter_fetch_thread_checkbox,
-            #twitter_thread_fetch_count_slider,
-            ## --- Discord同期項目を追加 ---
-            #discord_bot_enabled_checkbox,
-            #discord_bot_token_input,
-            #discord_authorized_ids_input,
-            #discord_allowed_channel_ids_input,
-            #discord_default_channel_id_input,
-            #discord_mention_only_checkbox,
-            #discord_channel_response_modes_input,
-            #discord_allow_autonomous_send_checkbox,
-            #discord_persona_webhook_input,
-            #discord_approval_ids_input,
-            #discord_voice_input_enabled_checkbox,
-            #discord_voice_confirm_transcript_checkbox,
-            #discord_voice_timeout_slider,
-            #discord_voice_stt_model_input,
-            #discord_bot_status_display
         ]
         full_refresh_output_count = gr.State(len(unified_full_room_refresh_outputs))
 
@@ -5832,6 +5644,10 @@ try:
             room_tts_model_dropdown,
             room_voice_dropdown,
             room_voice_style_prompt_textbox,
+            room_voice_speed_slider,
+            room_voice_pitch_slider,
+            room_voice_intonation_slider,
+            room_voice_volume_slider,
             room_temperature_slider,
             room_top_p_slider,
             room_safety_harassment_dropdown,
@@ -5886,7 +5702,7 @@ try:
             room_project_root_input,
             room_project_exclude_dirs_input,
             room_project_exclude_files_input,
-            # --- ローカル画像生成設定項目を追加（7項目） ---
+            # --- [追加] ローカル画像生成設定（７項目） ---
             local_sd_url_input,
             local_sd_sampler_dropdown,
             local_sd_steps_slider,
@@ -5897,39 +5713,7 @@ try:
             release_notes_markdown,
             active_working_memory_status,
             working_memory_slot_dropdown,
-            working_memory_editor,
-            # --- Twitter同期項目を追加 ---
-            twitter_enabled_checkbox,
-            twitter_auth_mode,
-            twitter_api_key,
-            twitter_api_secret,
-            twitter_access_token,
-            twitter_access_token_secret,
-            twitter_posting_summary,
-            twitter_posting_guidelines,
-            twitter_auto_post_checkbox,
-            twitter_approval_required_for_replies_checkbox,
-            twitter_notify_approval_checkbox,
-            twitter_premium_checkbox,
-            twitter_privacy_filter_checkbox,
-            twitter_fetch_thread_checkbox,
-            twitter_thread_fetch_count_slider,
-            # --- Discord同期項目を追加 ---
-            discord_bot_enabled_checkbox,
-            discord_bot_token_input,
-            discord_authorized_ids_input,
-            discord_allowed_channel_ids_input,
-            discord_default_channel_id_input,
-            discord_mention_only_checkbox,
-            discord_channel_response_modes_input,
-            discord_allow_autonomous_send_checkbox,
-            discord_persona_webhook_input,
-            discord_approval_ids_input,
-            discord_voice_input_enabled_checkbox,
-            discord_voice_confirm_transcript_checkbox,
-            discord_voice_timeout_slider,
-            discord_voice_stt_model_input,
-            discord_bot_status_display
+            working_memory_editor
         ]
 
 
@@ -6404,9 +6188,14 @@ try:
 
         for component, field in [
             (room_tts_provider_dropdown, "tts_provider"),
+            (room_tts_profile_dropdown, "tts_profile_name"),
             (room_tts_model_dropdown, "tts_model"),
             (room_voice_dropdown, "tts_voice"),
             (room_voice_style_prompt_textbox, "voice_style_prompt"),
+            (room_voice_speed_slider, "tts_voice_speed"),
+            (room_voice_pitch_slider, "tts_voice_pitch"),
+            (room_voice_intonation_slider, "tts_voice_intonation"),
+            (room_voice_volume_slider, "tts_voice_volume"),
             (room_temperature_slider, "temperature"),
             (room_top_p_slider, "top_p"),
             (room_safety_harassment_dropdown, "safety_block_threshold_harassment"),
@@ -6477,7 +6266,13 @@ try:
 
         preview_event = room_preview_voice_button.click(
             fn=ui_handlers.handle_voice_preview,
-            inputs=[current_room_name, room_tts_provider_dropdown, room_tts_model_dropdown, room_voice_dropdown, room_voice_style_prompt_textbox, room_preview_text_textbox, api_key_dropdown],
+            inputs=[
+                current_room_name, room_tts_provider_dropdown, room_tts_model_dropdown,
+                room_voice_dropdown, room_voice_style_prompt_textbox, room_preview_text_textbox,
+                api_key_dropdown,
+                room_voice_speed_slider, room_voice_pitch_slider, room_voice_intonation_slider, room_voice_volume_slider,
+                room_tts_profile_dropdown
+            ],
             outputs=[audio_player, play_audio_button, room_preview_voice_button]
         )
         preview_event.failure(
@@ -6488,10 +6283,53 @@ try:
 
         room_tts_provider_dropdown.change(
             fn=ui_handlers.handle_tts_provider_change,
-            inputs=[room_tts_provider_dropdown],
-            outputs=[room_tts_model_dropdown, room_voice_dropdown],
+            inputs=[room_tts_provider_dropdown, current_room_name],
+            outputs=[
+                room_tts_model_dropdown,
+                room_voice_dropdown,
+                room_voice_style_prompt_textbox,
+                room_voice_speed_slider,
+                room_voice_pitch_slider,
+                room_voice_intonation_slider,
+                room_voice_volume_slider,
+                room_tts_profile_dropdown
+            ],
             show_progress="hidden",
             queue=False
+        )
+
+        room_tts_profile_dropdown.change(
+            fn=ui_handlers.handle_tts_profile_change,
+            inputs=[room_tts_profile_dropdown, current_room_name],
+            outputs=[
+                room_tts_model_dropdown,
+                room_voice_dropdown,
+                room_voice_style_prompt_textbox,
+            ],
+            show_progress="hidden",
+            queue=False
+        )
+
+        room_tts_model_dropdown.change(
+            fn=ui_handlers.handle_tts_model_change_for_voice_choices,
+            inputs=[current_room_name, room_tts_provider_dropdown, room_tts_profile_dropdown, room_tts_model_dropdown],
+            outputs=[room_voice_dropdown],
+            show_progress="hidden",
+            queue=False
+        )
+
+        room_fetch_tts_models_button.click(
+            fn=ui_handlers.handle_fetch_openai_compatible_tts_models,
+            inputs=[current_room_name, room_tts_provider_dropdown, room_tts_profile_dropdown],
+            outputs=[room_tts_model_dropdown, room_voice_dropdown],
+            show_progress="full",
+            queue=True
+        )
+
+        room_refresh_speakers_button.click(
+            fn=ui_handlers.handle_refresh_speakers,
+            inputs=[current_room_name, room_tts_provider_dropdown, room_tts_model_dropdown],
+            outputs=[room_voice_dropdown]
         )
 
         # --- [Phase 3] 個別プロバイダ切り替えイベント ---
@@ -6955,9 +6793,9 @@ try:
             outputs=[research_year_filter, research_month_filter, research_entry_dropdown, research_notes_editor, research_notes_raw_editor]
         )
         research_year_filter.change(
-            fn=ui_handlers.handle_research_filter_change,
+            fn=ui_handlers.handle_research_year_filter_change,
             inputs=[current_room_name, research_year_filter, research_month_filter, research_notes_file_dropdown],
-            outputs=[research_entry_dropdown]
+            outputs=[research_month_filter, research_entry_dropdown]
         )
         research_month_filter.change(
             fn=ui_handlers.handle_research_filter_change,
@@ -7479,17 +7317,7 @@ try:
             outputs=[episodic_date_dropdown]
         )
 
-        twitter_auth_mode.change(
-            fn=ui_handlers.handle_twitter_auth_mode_change,
-            inputs=[twitter_auth_mode],
-            outputs=[twitter_browser_group, twitter_api_group]
-        )
-
-        twitter_api_test_button.click(
-            fn=ui_handlers.handle_test_twitter_api,
-            inputs=[twitter_api_key, twitter_api_secret, twitter_access_token, twitter_access_token_secret],
-            outputs=[twitter_api_test_result]
-        )
+        # Twitter外部接続UIは退避中のため、認証方式切替/接続テストイベントは登録しない。
 
         episodic_date_dropdown.change(
             fn=ui_handlers.handle_episodic_selection_from_dropdown,
@@ -7651,8 +7479,8 @@ try:
             inputs=[current_room_name],
             outputs=[style_injector]
         )
-        audio_player.stop(fn=lambda: gr.update(visible=False), inputs=None, outputs=[audio_player])
-        audio_player.pause(fn=lambda: gr.update(visible=False), inputs=None, outputs=[audio_player])
+        # audio_player.stop(fn=lambda: gr.update(visible=False), inputs=None, outputs=[audio_player])
+        # audio_player.pause(fn=lambda: gr.update(visible=True), inputs=None, outputs=[audio_player])
 
         # ワールドビルダーは world_settings.txt と Code editor の更新が重いため、
         # タブ選択時の自動ロードは行わない。必要時はRAWエディタの再読み込みボタンで更新する。
@@ -8595,11 +8423,71 @@ try:
 
         play_audio_event = play_audio_button.click(
             fn=ui_handlers.handle_play_audio_button_click,
-            inputs=[selected_message_state, current_room_name, api_key_dropdown],
-            outputs=[audio_player, play_audio_button, rerun_button]
+            inputs=[selected_message_state, current_room_name, api_key_dropdown, tts_playback_mode_dropdown],
+            outputs=[
+                audio_player,
+                play_audio_button,
+                rerun_button,
+                tts_segment_dropdown,
+                play_tts_segment_button,
+                tts_playlist_state,
+                tts_playlist_index_state,
+            ]
         )
-        play_audio_event.failure(fn=ui_handlers._reset_play_audio_on_failure, inputs=None, outputs=[audio_player, play_audio_button, rerun_button])
-
+        play_audio_event.failure(
+            fn=ui_handlers._reset_play_audio_on_failure,
+            inputs=None,
+            outputs=[
+                audio_player,
+                play_audio_button,
+                rerun_button,
+                tts_segment_dropdown,
+                play_tts_segment_button,
+                tts_playlist_state,
+                tts_playlist_index_state,
+            ],
+        )
+        play_tts_segment_button.click(
+            fn=ui_handlers.handle_play_tts_segment,
+            inputs=[tts_segment_dropdown, tts_playlist_state],
+            outputs=[audio_player, tts_playlist_index_state],
+            show_progress="hidden",
+        )
+        auto_play_next_trigger_btn.click(
+            fn=ui_handlers.handle_play_next_tts_segment,
+            inputs=[tts_playlist_state, tts_playlist_index_state],
+            outputs=[audio_player, tts_playlist_index_state],
+            queue=False,
+            show_progress="hidden",
+        )
+        audio_player.change(
+            fn=None,
+            inputs=None,
+            outputs=None,
+            js="""
+            () => {
+                const gradioApp = document.querySelector('gradio-app');
+                if (!gradioApp) return;
+                const root = gradioApp.shadowRoot || document;
+                const audioEl = root.querySelector('#main_audio_player audio');
+                if (!audioEl) return;
+                if (audioEl.dataset.hasEndedListener) return;
+                audioEl.dataset.hasEndedListener = "true";
+                audioEl.addEventListener('ended', () => {
+                    console.log("--- [JS:PlayAudio] Audio ended, triggering next segment...");
+                    const btn = root.querySelector('#auto_play_next_trigger_btn');
+                    if (btn) {
+                        btn.click();
+                    }
+                });
+            }
+            """
+        )
+        audio_player.clear(
+            fn=lambda: gr.update(visible=False),
+            inputs=None,
+            outputs=[audio_player]
+        )
         copy_scenery_prompt_button.click(
             fn=None, inputs=[scenery_prompt_output_textbox], outputs=None,
             js="(text) => { navigator.clipboard.writeText(text); const toast = document.createElement('gradio-toast'); toast.setAttribute('description', 'プロンプトをコピーしました！'); document.querySelector('.gradio-toast-container-x-center').appendChild(toast); }"
@@ -8730,255 +8618,355 @@ try:
             outputs=[local_model_path_input]
         )
 
+        # --- 外部接続 / API Gateway ---
+        external_api_token_generate_button.click(
+            fn=ui_handlers.handle_generate_api_gateway_token,
+            outputs=[external_api_auth_token_input, external_api_token_copy_output, external_api_status]
+        )
+        external_api_token_show_button.click(
+            fn=ui_handlers.handle_show_saved_api_gateway_token,
+            outputs=[external_api_token_copy_output]
+        )
+        external_api_save_button.click(
+            fn=ui_handlers.handle_save_external_api_gateway_settings,
+            inputs=[
+                external_api_enabled_checkbox,
+                external_api_host_input,
+                external_api_port_input,
+                external_api_require_auth_checkbox,
+                external_api_auth_token_input,
+                external_api_auto_tailscale_checkbox,
+                current_room_name,
+            ],
+            outputs=[
+                external_api_status,
+                external_api_token_copy_output,
+                external_api_security_diagnostics,
+                external_lite_connection_help,
+                external_api_docs,
+            ]
+        )
+        external_api_refresh_button.click(
+            fn=ui_handlers.handle_refresh_external_api_gateway_panel,
+            inputs=[current_room_name],
+            outputs=[external_api_security_diagnostics, external_lite_connection_help, external_api_docs]
+        )
+        external_tailscale_button.click(
+            fn=ui_handlers.handle_configure_tailscale_lite_https,
+            outputs=[external_api_security_diagnostics, external_lite_connection_help, external_api_status]
+        )
+        external_event_type_dropdown.change(
+            fn=ui_handlers.handle_external_event_type_change,
+            inputs=[external_event_type_dropdown],
+            outputs=[external_event_data_json]
+        )
+        external_event_test_button.click(
+            fn=ui_handlers.handle_test_external_event,
+            inputs=[
+                current_room_name,
+                external_event_type_dropdown,
+                external_event_source_input,
+                external_event_notify_checkbox,
+                external_event_importance_dropdown,
+                external_event_data_json,
+            ],
+            outputs=[external_event_result]
+        )
+
+        # --- 外部接続 / Twitter ---
+        twitter_auth_mode_radio.change(
+            fn=ui_handlers.handle_twitter_auth_mode_change,
+            inputs=[twitter_auth_mode_radio],
+            outputs=[twitter_browser_auth_group, twitter_api_auth_group]
+        )
+        twitter_load_settings_button.click(
+            fn=ui_handlers.handle_load_twitter_settings,
+            inputs=[current_room_name],
+            outputs=[
+                twitter_enabled_checkbox,
+                twitter_auth_mode_radio,
+                twitter_posting_summary_input,
+                twitter_posting_guidelines_input,
+                twitter_auto_post_checkbox,
+                twitter_approval_for_replies_checkbox,
+                twitter_notify_on_approval_checkbox,
+                twitter_api_key_input,
+                twitter_api_secret_input,
+                twitter_access_token_input,
+                twitter_access_token_secret_input,
+                twitter_browser_auth_group,
+                twitter_api_auth_group,
+                twitter_is_premium_checkbox,
+                twitter_privacy_filter_checkbox,
+                twitter_fetch_thread_checkbox,
+                twitter_thread_fetch_count_number,
+            ]
+        )
+        twitter_check_session_button.click(
+            fn=ui_handlers.handle_check_twitter_session,
+            inputs=[current_room_name],
+            outputs=[twitter_session_status]
+        )
+        twitter_login_button.click(
+            fn=ui_handlers.handle_twitter_login,
+            inputs=[current_room_name],
+            outputs=[twitter_session_status]
+        )
+        twitter_cookie_import_button.click(
+            fn=ui_handlers.handle_twitter_cookie_import,
+            inputs=[twitter_cookie_input, current_room_name],
+            outputs=[twitter_session_status]
+        )
+        twitter_test_api_button.click(
+            fn=ui_handlers.handle_test_twitter_api,
+            inputs=[
+                twitter_api_key_input,
+                twitter_api_secret_input,
+                twitter_access_token_input,
+                twitter_access_token_secret_input,
+            ],
+            outputs=[twitter_test_result]
+        )
+        twitter_save_button.click(
+            fn=lambda *args: (ui_handlers.handle_save_twitter_settings(*args), "Twitter状態: 設定を保存しました。")[1],
+            inputs=[
+                current_room_name,
+                twitter_enabled_checkbox,
+                twitter_auth_mode_radio,
+                twitter_api_key_input,
+                twitter_api_secret_input,
+                twitter_access_token_input,
+                twitter_access_token_secret_input,
+                twitter_posting_summary_input,
+                twitter_posting_guidelines_input,
+                twitter_auto_post_checkbox,
+                twitter_approval_for_replies_checkbox,
+                twitter_notify_on_approval_checkbox,
+                twitter_is_premium_checkbox,
+                twitter_privacy_filter_checkbox,
+                twitter_fetch_thread_checkbox,
+                twitter_thread_fetch_count_number,
+            ],
+            outputs=[twitter_status]
+        )
+        twitter_refresh_pending_button.click(
+            fn=ui_handlers.handle_refresh_twitter_pending,
+            inputs=[current_room_name],
+            outputs=[twitter_pending_df]
+        )
+        twitter_pending_df.select(
+            fn=ui_handlers.handle_load_selected_twitter_draft,
+            inputs=[twitter_pending_df],
+            outputs=[
+                twitter_selected_draft_id_state,
+                twitter_draft_editor,
+                twitter_draft_warnings,
+                twitter_reply_preview,
+                twitter_reply_url_state,
+                twitter_reply_id_state,
+                twitter_media_file,
+                twitter_media_gallery,
+            ]
+        )
+        twitter_load_selected_draft_button.click(
+            fn=ui_handlers.handle_load_twitter_draft_by_button,
+            inputs=[twitter_selected_draft_id_state],
+            outputs=[
+                twitter_selected_draft_id_state,
+                twitter_draft_editor,
+                twitter_draft_warnings,
+                twitter_reply_preview,
+                twitter_reply_url_state,
+                twitter_reply_id_state,
+                twitter_media_file,
+                twitter_media_gallery,
+            ]
+        )
+        twitter_media_file.change(
+            fn=ui_handlers.handle_twitter_media_file_change,
+            inputs=[twitter_media_file],
+            outputs=[twitter_media_gallery],
+            show_progress="hidden",
+        )
+        twitter_approve_button.click(
+            fn=ui_handlers.handle_approve_twitter_tweet,
+            inputs=[
+                twitter_selected_draft_id_state,
+                twitter_draft_editor,
+                twitter_reply_url_state,
+                twitter_media_file,
+            ],
+            outputs=[
+                twitter_pending_df,
+                twitter_history_df,
+                twitter_selected_draft_id_state,
+                twitter_draft_editor,
+                twitter_approval_detail,
+                twitter_media_file,
+                twitter_media_gallery,
+            ]
+        )
+        twitter_reject_button.click(
+            fn=ui_handlers.handle_reject_twitter_tweet,
+            inputs=[twitter_selected_draft_id_state],
+            outputs=[
+                twitter_pending_df,
+                twitter_history_df,
+                twitter_selected_draft_id_state,
+                twitter_draft_editor,
+                twitter_approval_detail,
+                twitter_media_file,
+                twitter_media_gallery,
+            ]
+        )
+        twitter_refresh_history_button.click(
+            fn=ui_handlers.handle_refresh_twitter_history,
+            outputs=[twitter_history_df]
+        )
+        twitter_history_df.select(
+            fn=ui_handlers.handle_twitter_history_select,
+            inputs=[twitter_history_df],
+            outputs=[twitter_history_selected_id_state, twitter_history_detail]
+        )
+        twitter_history_retry_button.click(
+            fn=ui_handlers.handle_twitter_history_retry_lite,
+            inputs=[twitter_history_selected_id_state],
+            outputs=[twitter_pending_df, twitter_history_df, twitter_history_detail]
+        )
+        twitter_history_delete_button.click(
+            fn=ui_handlers.handle_delete_twitter_history,
+            inputs=[twitter_history_selected_id_state],
+            outputs=[twitter_history_df]
+        )
+
+        # --- 外部接続 / Roblox ---
+        save_cloudflare_url_button.click(
+            fn=ui_handlers.handle_save_cloudflare_url,
+            inputs=[current_room_name, roblox_webhook_domain_input],
+            outputs=None
+        )
         save_roblox_settings_button.click(
             fn=ui_handlers.handle_save_roblox_settings,
-            inputs=[current_room_name, roblox_api_key_input, roblox_universe_id_input, roblox_topic_input, roblox_webhook_enabled_checkbox, roblox_activation_mode_radio, roblox_webhook_domain_input, roblox_filtering_enabled_checkbox],
+            inputs=[
+                current_room_name,
+                roblox_api_key_input,
+                roblox_universe_id_input,
+                roblox_topic_input,
+                roblox_webhook_enabled_checkbox,
+                roblox_activation_mode_radio,
+                roblox_webhook_domain_input,
+                roblox_filtering_enabled_checkbox,
+            ],
             outputs=[roblox_webhook_secret_input]
         )
-
-
         test_roblox_connection_button.click(
             fn=ui_handlers.handle_test_roblox_connection,
-            inputs=[current_room_name, roblox_api_key_input, roblox_universe_id_input, roblox_topic_input],
+            inputs=[
+                current_room_name,
+                roblox_api_key_input,
+                roblox_universe_id_input,
+                roblox_topic_input,
+            ],
             outputs=[roblox_test_result_output]
         )
-
-        # Webhook Secret の再生成（強制）
         roblox_webhook_regenerate_button.click(
             fn=ui_handlers.handle_regenerate_roblox_webhook_secret,
             inputs=[current_room_name],
             outputs=[roblox_webhook_secret_input]
         )
-
-        # Webhook ログの更新
         roblox_webhook_refresh_logs_button.click(
             fn=ui_handlers.handle_refresh_roblox_webhook_logs,
-            inputs=[],
             outputs=[roblox_webhook_logs_display]
         )
 
-        # Cloudflare URL 専用保存
-        save_cloudflare_url_button.click(
-            fn=ui_handlers.handle_save_cloudflare_url,
-            inputs=[current_room_name, roblox_webhook_domain_input],
-            outputs=[]
+        # --- 外部接続 / 拡張ツール ---
+        custom_tools_enabled_checkbox.change(
+            fn=ui_handlers.handle_custom_tools_enabled_change,
+            inputs=[custom_tools_enabled_checkbox],
+            outputs=None
         )
-
-        # 外部接続タブ全体の重い自動更新は行わない。
-        # Twitterは設定とローカルJSON一覧だけタブ選択時に軽く復元し、セッション確認は手動ボタンに委ねる。
-        external_twitter_tab.select(
-            fn=ui_handlers.handle_refresh_twitter_all,
-            inputs=[current_room_name],
-            outputs=[
-                twitter_session_status_display,
-                twitter_enabled_checkbox,
-                twitter_auth_mode,
-                twitter_posting_summary,
-                twitter_posting_guidelines,
-                twitter_auto_post_checkbox,
-                twitter_approval_required_for_replies_checkbox,
-                twitter_notify_approval_checkbox,
-                twitter_api_key,
-                twitter_api_secret,
-                twitter_access_token,
-                twitter_access_token_secret,
-                twitter_browser_group,
-                twitter_api_group,
-                twitter_premium_checkbox,
-                twitter_privacy_filter_checkbox,
-                twitter_fetch_thread_checkbox,
-                twitter_thread_fetch_count_slider,
-                twitter_pending_df,
-                twitter_history_df,
-            ]
-        )
-
-        external_discord_tab.select(
-            fn=ui_handlers.handle_load_discord_bot_settings,
-            inputs=[current_room_name],
-            outputs=[
-                discord_bot_enabled_checkbox,
-                discord_bot_token_input,
-                discord_authorized_ids_input,
-                discord_allowed_channel_ids_input,
-                discord_default_channel_id_input,
-                discord_mention_only_checkbox,
-                discord_channel_response_modes_input,
-                discord_allow_autonomous_send_checkbox,
-                discord_persona_webhook_input,
-                discord_approval_ids_input,
-                discord_voice_input_enabled_checkbox,
-                discord_voice_confirm_transcript_checkbox,
-                discord_voice_timeout_slider,
-                discord_voice_stt_model_input,
-                discord_bot_status_display,
-            ]
-        )
-        external_discord_tab.select(
-            fn=ui_handlers.handle_load_global_discord_migration_state,
-            inputs=[current_room_name],
-            outputs=[
-                discord_global_migration_status,
-                discord_global_migration_room,
-            ]
-        )
-
-        # --- [拡張ツール Events] ---
-        # 選択イベントで情報を保持
-        mcp_servers_df.select(
-            fn=ui_handlers.handle_mcp_server_select,
-            inputs=[mcp_servers_df],
-            outputs=[mcp_selected_info]
-        )
-
-        mcp_edit_btn.click(
-            fn=ui_handlers.handle_edit_mcp_server,
-            inputs=[mcp_selected_info],
-            outputs=[mcp_new_name, mcp_new_type, mcp_new_cmd_url, mcp_new_args, mcp_new_enabled]
-        )
-
-        mcp_remove_btn.click(
-            fn=ui_handlers.handle_remove_mcp_server,
-            inputs=[mcp_selected_info],
-            outputs=[mcp_servers_df]
-        )
-
-        mcp_connect_test_btn.click(
-            fn=ui_handlers.handle_test_mcp_connection,
-            inputs=[mcp_selected_info],
-            outputs=[mcp_status_msg, mcp_tools_config_df]
-        )
-
-        mcp_add_btn.click(
-            fn=ui_handlers.handle_add_mcp_server,
-            inputs=[mcp_new_name, mcp_new_type, mcp_new_cmd_url, mcp_new_args, mcp_new_enabled],
-            outputs=[mcp_servers_df, mcp_status_msg]
-        )
-
-        mcp_clear_btn.click(
-            fn=lambda: ("", "stdio", "", "", True),
-            outputs=[mcp_new_name, mcp_new_type, mcp_new_cmd_url, mcp_new_args, mcp_new_enabled]
-        )
-
-        mcp_new_type.change(
-            fn=ui_handlers.handle_mcp_type_change,
-            inputs=[mcp_new_type],
-            outputs=[mcp_new_cmd_url, mcp_new_args]
-        )
-
-        # ライブラリ承認管理
-        def handle_dep_select(evt: gr.SelectData, df: pd.DataFrame):
-            if evt.index is None: return None
-            return df.iloc[evt.index[0]][0]
-
-        pending_deps_df.select(
-            fn=handle_dep_select,
-            inputs=[pending_deps_df],
-            outputs=[selected_pending_dep]
-        )
-        allowed_deps_df.select(
-            fn=handle_dep_select,
-            inputs=[allowed_deps_df],
-            outputs=[selected_allowed_dep]
-        )
-
-        deps_refresh_btn.click(
-            fn=ui_handlers.handle_refresh_dependencies,
-            outputs=[pending_deps_df, allowed_deps_df, dep_management_status]
-        )
-        approve_dep_btn.click(
-            fn=ui_handlers.handle_approve_dependency,
-            inputs=[selected_pending_dep],
-            outputs=[pending_deps_df, allowed_deps_df, dep_management_status]
-        )
-        reject_dep_btn.click(
-            fn=ui_handlers.handle_reject_dependency,
-            inputs=[selected_pending_dep],
-            outputs=[pending_deps_df, allowed_deps_df, dep_management_status]
-        )
-        remove_allowed_dep_btn.click(
-            fn=ui_handlers.handle_remove_allowed_dependency,
-            inputs=[selected_allowed_dep],
-            outputs=[pending_deps_df, allowed_deps_df, dep_management_status]
-        )
-
-        local_tools_refresh_btn.click(
-            fn=lambda: True,
-            outputs=[is_scanning_plugins]
-        ).then(
-            fn=ui_handlers.handle_refresh_custom_tools,
-            outputs=[local_tools_df]
-        ).then(
-            fn=lambda: False,
-            outputs=[is_scanning_plugins]
-        )
-
-        # プラグイン一覧の行選択 -> エディタに読み込み
-        local_tools_df.select(
-            fn=ui_handlers.handle_local_tool_select,
-            inputs=[local_tools_df],
-            outputs=[local_plugin_file_dropdown]
-        )
-
-        local_tools_df.change(
-            fn=ui_handlers.handle_local_tools_df_change,
-            inputs=[local_tools_df]
-        )
-
-        # プラグインエディアイベント
-        local_plugin_reload_files_btn.click(
+        local_plugin_refresh_button.click(
             fn=ui_handlers.handle_refresh_local_plugin_files,
             outputs=[local_plugin_file_dropdown]
         )
-
         local_plugin_file_dropdown.change(
             fn=ui_handlers.handle_load_plugin_code,
             inputs=[local_plugin_file_dropdown],
-            outputs=[local_plugin_code_editor, local_plugin_enabled]
+            outputs=[local_plugin_code_editor, local_plugin_enabled_checkbox]
         )
-
-        local_plugin_save_btn.click(
-            fn=ui_handlers.handle_save_plugin_code,
-            inputs=[local_plugin_file_dropdown, local_plugin_code_editor, local_plugin_enabled],
-            outputs=[local_plugin_status, local_tools_df] # 保存後に一覧も更新
-        )
-
-        local_plugin_new_btn.click(
+        local_plugin_create_button.click(
             fn=ui_handlers.handle_create_new_plugin,
-            inputs=[local_plugin_file_dropdown], # ファイル名入力を兼用
+            inputs=[local_plugin_new_filename_input],
             outputs=[local_plugin_file_dropdown, local_plugin_status]
         )
-
-        local_plugin_delete_btn.click(
+        local_plugin_save_button.click(
+            fn=ui_handlers.handle_save_plugin_code_lite,
+            inputs=[local_plugin_file_dropdown, local_plugin_code_editor, local_plugin_enabled_checkbox],
+            outputs=[local_plugin_status, local_plugin_file_dropdown]
+        )
+        local_plugin_delete_button.click(
             fn=ui_handlers.handle_delete_plugin,
             inputs=[local_plugin_file_dropdown],
             outputs=[local_plugin_file_dropdown, local_plugin_status]
         )
-
-        custom_tools_enabled.change(
-            fn=ui_handlers.handle_custom_tools_enabled_change,
-            inputs=[custom_tools_enabled]
+        refresh_mcp_servers_button.click(
+            fn=ui_handlers.handle_refresh_mcp_servers_lite,
+            outputs=[mcp_servers_df]
         )
-
+        mcp_server_type_dropdown.change(
+            fn=ui_handlers.handle_mcp_type_change,
+            inputs=[mcp_server_type_dropdown],
+            outputs=[mcp_server_command_input, mcp_server_args_input]
+        )
+        add_mcp_server_button.click(
+            fn=ui_handlers.handle_add_mcp_server,
+            inputs=[
+                mcp_server_name_input,
+                mcp_server_type_dropdown,
+                mcp_server_command_input,
+                mcp_server_args_input,
+                mcp_server_enabled_checkbox,
+            ],
+            outputs=[mcp_servers_df, mcp_status]
+        )
         mcp_servers_df.change(
             fn=ui_handlers.handle_mcp_servers_df_change,
-            inputs=[mcp_servers_df]
+            inputs=[mcp_servers_df],
+            outputs=None
         )
-
-        mcp_tools_config_df.change(
+        mcp_servers_df.select(
+            fn=ui_handlers.handle_mcp_server_select,
+            inputs=[mcp_servers_df],
+            outputs=[mcp_selected_server_state]
+        )
+        edit_mcp_server_button.click(
+            fn=ui_handlers.handle_edit_mcp_server,
+            inputs=[mcp_selected_server_state],
+            outputs=[
+                mcp_server_name_input,
+                mcp_server_type_dropdown,
+                mcp_server_command_input,
+                mcp_server_args_input,
+                mcp_server_enabled_checkbox,
+            ]
+        )
+        remove_mcp_server_button.click(
+            fn=ui_handlers.handle_remove_mcp_server,
+            inputs=[mcp_selected_server_state],
+            outputs=[mcp_servers_df]
+        )
+        test_mcp_connection_button.click(
+            fn=ui_handlers.handle_test_mcp_connection,
+            inputs=[mcp_selected_server_state],
+            outputs=[mcp_status, mcp_tools_df]
+        )
+        mcp_tools_df.change(
             fn=ui_handlers.handle_mcp_tools_config_change,
-            inputs=[mcp_tools_config_df, mcp_selected_info]
+            inputs=[mcp_tools_df, mcp_selected_server_state],
+            outputs=None
         )
 
-        custom_tools_tab.select(
-            fn=ui_handlers.handle_refresh_custom_tools,
-            outputs=[local_tools_df]
-        ).then(
-            fn=ui_handlers.handle_refresh_local_plugin_files,
-            outputs=[local_plugin_file_dropdown]
-        )
-
-# --- API Key / Webhook Events ---
+# --- API Key / Webhook Events ---# --- API Key / Webhook Events ---
         settings_rotation_checkbox.change(
             fn=ui_handlers.handle_rotation_setting_change,
             inputs=[settings_rotation_checkbox],
@@ -8995,6 +8983,26 @@ try:
             fn=ui_handlers.handle_allow_external_connection_change,
             inputs=[allow_external_connection_checkbox],
             outputs=[common_settings_status]
+        )
+
+
+        # --- 天気・環境連携イベント ---
+        weather_search_btn.click(
+            fn=ui_handlers.handle_weather_search,
+            inputs=[weather_city_input],
+            outputs=[weather_candidate_dropdown]
+        )
+
+        weather_candidate_dropdown.change(
+            fn=ui_handlers.handle_weather_candidate_change,
+            inputs=[weather_candidate_dropdown],
+            outputs=[weather_lat_display, weather_lon_display]
+        )
+
+        weather_save_btn.click(
+            fn=ui_handlers.handle_save_weather_settings,
+            inputs=[weather_city_input, weather_candidate_dropdown, enable_weather_context_cb, enable_weather_scenery_cb],
+            outputs=[weather_status_preview, common_settings_status]
         )
 
         debug_mode_checkbox.change(
@@ -9037,139 +9045,7 @@ try:
             outputs=None
         )
 
-        # --- Disclaimer Acceptance Events ---
-        twitter_accept_button.click(
-            fn=ui_handlers.handle_accept_disclaimer,
-            inputs=[gr.State("twitter")],
-            outputs=[twitter_disclaimer_accordion, twitter_accept_button, twitter_main_content]
-        )
-        discord_accept_button.click(
-            fn=ui_handlers.handle_accept_disclaimer,
-            inputs=[gr.State("discord")],
-            outputs=[discord_disclaimer_accordion, discord_accept_button, discord_main_content]
-        )
-        line_accept_button.click(
-            fn=ui_handlers.handle_accept_disclaimer,
-            inputs=[gr.State("line")],
-            outputs=[line_disclaimer_accordion, line_accept_button, line_main_content]
-        )
-
-        # --- Twitter (X) Events ---
-        twitter_pending_refresh_button.click(
-            fn=ui_handlers.handle_refresh_twitter_pending,
-            inputs=[],
-            outputs=[twitter_pending_df]
-        )
-
-        twitter_pending_df.select(
-            fn=ui_handlers.handle_load_selected_twitter_draft,
-            inputs=[twitter_pending_df],
-            outputs=[twitter_selected_draft_id, twitter_draft_editor, twitter_draft_warnings_display, twitter_reply_preview, twitter_reply_url_input, twitter_reply_id_state, twitter_image_uploader, twitter_image_preview]
-        )
-
-        twitter_load_selected_draft_button.click(
-            fn=ui_handlers.handle_load_twitter_draft_by_id,
-            inputs=[twitter_selected_draft_id],
-            outputs=[twitter_selected_draft_id, twitter_draft_editor, twitter_draft_warnings_display, twitter_reply_preview, twitter_reply_url_input, twitter_reply_id_state, twitter_image_uploader, twitter_image_preview]
-        )
-
-        twitter_approve_button.click(
-            fn=ui_handlers.handle_approve_twitter_tweet,
-            inputs=[twitter_selected_draft_id, twitter_draft_editor, twitter_reply_url_input, twitter_image_uploader],
-            outputs=[twitter_pending_df, twitter_history_df, twitter_selected_draft_id, twitter_draft_editor, twitter_history_detail, twitter_image_uploader, twitter_image_preview]
-        )
-
-        twitter_reject_button.click(
-            fn=ui_handlers.handle_reject_twitter_tweet,
-            inputs=[twitter_selected_draft_id],
-            outputs=[twitter_pending_df, twitter_history_df, twitter_selected_draft_id, twitter_draft_editor, twitter_history_detail, twitter_image_uploader, twitter_image_preview]
-        )
-
-        twitter_manual_draft_button.click(
-            fn=ui_handlers.handle_manual_twitter_draft,
-            inputs=[twitter_draft_editor, current_room_name, twitter_reply_url_input, twitter_reply_id_state, twitter_image_uploader],
-            outputs=[twitter_pending_df, twitter_history_df, twitter_draft_editor, twitter_reply_url_input, twitter_reply_id_state, twitter_image_uploader, twitter_image_preview]
-        )
-
-        # 画像アップローダーの変更をプレビューに同期
-        twitter_image_uploader.change(
-            fn=lambda x: x,
-            inputs=[twitter_image_uploader],
-            outputs=[twitter_image_preview]
-        )
-
-        twitter_history_refresh_button.click(
-            fn=ui_handlers.handle_refresh_twitter_history,
-            inputs=[],
-            outputs=[twitter_history_df]
-        )
-
-        twitter_history_df.select(
-            fn=ui_handlers.handle_twitter_history_select,
-            inputs=[twitter_history_df],
-            outputs=[twitter_selected_history_id, twitter_history_detail]
-        )
-
-        twitter_history_delete_button.click(
-            fn=ui_handlers.handle_delete_twitter_history,
-            inputs=[twitter_selected_history_id],
-            outputs=[twitter_history_df]
-        )
-
-        twitter_history_retry_button.click(
-            fn=ui_handlers.handle_twitter_history_retry,
-            inputs=[twitter_selected_history_id],
-            outputs=[twitter_pending_df, twitter_history_df, twitter_draft_editor, twitter_main_tabs]
-        )
-
-        twitter_feed_refresh_button.click(
-            fn=ui_handlers.handle_refresh_twitter_feed,
-            inputs=[current_room_name, twitter_feed_type],
-            outputs=[twitter_feed_df]
-        )
-
-        twitter_feed_df.select(
-            fn=ui_handlers.handle_twitter_reply_click,
-            inputs=[twitter_feed_df, twitter_draft_editor],
-            outputs=[twitter_reply_preview, twitter_draft_editor, twitter_reply_url_input, twitter_reply_id_state, twitter_main_tabs]
-        )
-
-        twitter_save_settings_button.click(
-            fn=ui_handlers.handle_save_twitter_settings,
-            inputs=[
-                current_room_name, twitter_enabled_checkbox, twitter_auth_mode,
-                twitter_api_key, twitter_api_secret, twitter_access_token, twitter_access_token_secret,
-                twitter_posting_summary, twitter_posting_guidelines,
-                twitter_auto_post_checkbox,
-                twitter_approval_required_for_replies_checkbox,
-                twitter_notify_approval_checkbox,
-                twitter_premium_checkbox, twitter_privacy_filter_checkbox,
-                twitter_fetch_thread_checkbox, twitter_thread_fetch_count_slider
-            ],
-            outputs=[]
-        )
-
-        twitter_login_button.click(
-            fn=ui_handlers.handle_twitter_login,
-            inputs=[current_room_name],
-            outputs=[twitter_session_status_display]
-        )
-
-        twitter_refresh_session_button.click(
-            fn=ui_handlers.handle_check_twitter_session,
-            inputs=[current_room_name],
-            outputs=[twitter_session_status_display]
-        )
-
-        twitter_cookie_import_button.click(
-            fn=ui_handlers.handle_twitter_cookie_import,
-            inputs=[twitter_cookie_import_input, current_room_name],
-            outputs=[twitter_cookie_import_status]
-        ).then(
-            fn=ui_handlers.handle_check_twitter_session,
-            inputs=[current_room_name],
-            outputs=[twitter_session_status_display]
-        )
+        # 外部接続UIは退避中のため、Disclaimer/Twitterイベントは登録しない。
 
         # --- [Phase 3] 内部処理モデル設定ボタンのイベント ---
 
@@ -9254,22 +9130,29 @@ try:
         image_gen_provider_radio.change(
             fn=ui_handlers.handle_image_gen_provider_change,
             inputs=[image_gen_provider_radio],
+            #outputs=[gemini_model_section, openai_image_section, pollinations_image_section, huggingface_image_section, image_gen_api_key_dropdown]
             outputs=[
                 gemini_model_section, 
                 openai_image_section, 
                 pollinations_image_section, 
                 huggingface_image_section, 
-                image_gen_api_key_dropdown, 
-                local_image_section,  # ←ローカルでの画像生成を追加
+                image_gen_api_key_dropdown,
+                local_image_section, # ローカル設定パネル
                 fetch_image_models_button
             ]
         )
 
         save_image_gen_button.click(
             fn=ui_handlers.handle_save_image_generation_settings,
+            #inputs=[
+            #    image_gen_provider_radio, image_gen_api_key_dropdown, gemini_image_model_dropdown,
+            #    openai_image_profile_dropdown, openai_image_model_dropdown,
+            #    pollinations_api_key_input, pollinations_image_model_dropdown,
+            #    huggingface_api_token_input, huggingface_image_model_dropdown
+            #],
             inputs=[
-                image_gen_provider_radio, image_gen_api_key_dropdown, gemini_image_model_dropdown, 
-                openai_image_profile_dropdown, openai_image_model_dropdown, 
+                image_gen_provider_radio, image_gen_api_key_dropdown, gemini_image_model_dropdown,
+                openai_image_profile_dropdown, openai_image_model_dropdown,
                 pollinations_api_key_input, pollinations_image_model_dropdown, 
                 huggingface_api_token_input, huggingface_image_model_dropdown,
                 # --- ローカル設定を追加 ---
@@ -9553,106 +9436,80 @@ try:
             outputs=[room_google_settings_group, room_openai_settings_group]
         )
 
-        # Discord Bot Events
-        save_discord_bot_settings_button.click(
+        # --- 外部接続 / Discord・LINE ---
+        discord_bot_load_button.click(
+            fn=ui_handlers.handle_load_discord_bot_settings,
+            inputs=[current_room_name],
+            outputs=[
+                discord_bot_enabled_checkbox,
+                discord_bot_token_input,
+                discord_bot_auth_ids_input,
+                discord_bot_allowed_channels_input,
+                discord_bot_default_channel_input,
+                discord_bot_mention_only_checkbox,
+                discord_bot_channel_modes_input,
+                discord_bot_allow_autonomous_send_checkbox,
+                discord_bot_persona_webhook_input,
+                discord_bot_approval_ids_input,
+                discord_bot_voice_input_enabled_checkbox,
+                discord_bot_voice_confirm_checkbox,
+                discord_bot_voice_timeout_input,
+                discord_bot_voice_stt_model_input,
+                discord_bot_status,
+            ]
+        )
+        discord_bot_save_button.click(
             fn=ui_handlers.handle_save_discord_bot_settings,
             inputs=[
                 current_room_name,
                 discord_bot_enabled_checkbox,
                 discord_bot_token_input,
-                discord_authorized_ids_input,
-                discord_allowed_channel_ids_input,
-                discord_default_channel_id_input,
-                discord_mention_only_checkbox,
-                discord_channel_response_modes_input,
-                discord_allow_autonomous_send_checkbox,
-                discord_persona_webhook_input,
-                discord_approval_ids_input,
-                discord_voice_input_enabled_checkbox,
-                discord_voice_confirm_transcript_checkbox,
-                discord_voice_timeout_slider,
-                discord_voice_stt_model_input,
+                discord_bot_auth_ids_input,
+                discord_bot_allowed_channels_input,
+                discord_bot_default_channel_input,
+                discord_bot_mention_only_checkbox,
+                discord_bot_channel_modes_input,
+                discord_bot_allow_autonomous_send_checkbox,
+                discord_bot_persona_webhook_input,
+                discord_bot_approval_ids_input,
+                discord_bot_voice_input_enabled_checkbox,
+                discord_bot_voice_confirm_checkbox,
+                discord_bot_voice_timeout_input,
+                discord_bot_voice_stt_model_input,
             ],
-            outputs=[discord_bot_status_display]
+            outputs=[discord_bot_status]
         )
-        stop_discord_bot_button.click(
+        discord_bot_stop_button.click(
             fn=ui_handlers.handle_stop_discord_bot,
             inputs=[current_room_name],
-            outputs=[discord_bot_status_display]
+            outputs=[discord_bot_status]
         )
-        migrate_global_discord_button.click(
-            fn=ui_handlers.handle_migrate_global_discord_bot_to_room,
-            inputs=[discord_global_migration_room, current_room_name],
-            outputs=[
-                discord_global_migration_result,
-                discord_global_migration_status,
-                discord_bot_enabled_checkbox,
-                discord_bot_token_input,
-                discord_authorized_ids_input,
-                discord_allowed_channel_ids_input,
-                discord_default_channel_id_input,
-                discord_mention_only_checkbox,
-                discord_channel_response_modes_input,
-                discord_allow_autonomous_send_checkbox,
-                discord_persona_webhook_input,
-                discord_approval_ids_input,
-                discord_voice_input_enabled_checkbox,
-                discord_voice_confirm_transcript_checkbox,
-                discord_voice_timeout_slider,
-                discord_voice_stt_model_input,
-                discord_bot_status_display,
-            ]
-        )
-        copy_global_discord_common_button.click(
-            fn=ui_handlers.handle_copy_global_discord_common_settings_to_room,
-            inputs=[discord_global_migration_room, current_room_name],
-            outputs=[
-                discord_global_migration_result,
-                discord_global_migration_status,
-                discord_bot_enabled_checkbox,
-                discord_bot_token_input,
-                discord_authorized_ids_input,
-                discord_allowed_channel_ids_input,
-                discord_default_channel_id_input,
-                discord_mention_only_checkbox,
-                discord_channel_response_modes_input,
-                discord_allow_autonomous_send_checkbox,
-                discord_persona_webhook_input,
-                discord_approval_ids_input,
-                discord_voice_input_enabled_checkbox,
-                discord_voice_confirm_transcript_checkbox,
-                discord_voice_timeout_slider,
-                discord_voice_stt_model_input,
-                discord_bot_status_display,
-            ]
-        )
-
-        # LINE Bot Events
-        save_line_bot_settings_button.click(
+        line_bot_save_button.click(
             fn=ui_handlers.handle_save_line_bot_settings,
             inputs=[
                 line_bot_enabled_checkbox,
                 line_channel_access_token_input,
                 line_channel_secret_input,
-                line_authorized_ids_input,
-                line_bot_linked_room_dropdown
+                line_authorized_user_ids_input,
+                line_linked_room_dropdown,
             ],
-            outputs=[line_bot_status_display]
+            outputs=[line_bot_status]
         )
-        stop_line_bot_button.click(
+        line_bot_stop_button.click(
             fn=ui_handlers.handle_stop_line_bot,
-            outputs=[line_bot_status_display]
+            outputs=[line_bot_status]
         )
 
         # --- [新規] ユーザー用画像生成機能イベント ---
         user_gen_image_provider.change(
             fn=ui_handlers.update_user_gen_model_choices,
             inputs=[user_gen_image_provider, user_gen_image_openai_profile],
+            #outputs=[user_gen_image_model, user_gen_image_openai_profile, user_gen_free_only_checkbox]
             outputs=[
-                user_gen_image_model,
-                user_gen_image_openai_profile,
+                user_gen_image_model, 
+                user_gen_image_openai_profile, 
                 user_gen_free_only_checkbox,
-                user_gen_local_params_row # 可視性制御用に追加
+                user_gen_local_params_row # 可視性制御
             ]
         )
 
@@ -9664,6 +9521,11 @@ try:
 
         user_gen_image_button.click(
             fn=ui_handlers.handle_user_generate_image,
+            #inputs=[
+            #    user_gen_image_prompt, user_gen_image_provider,
+            #    user_gen_image_model, user_gen_image_openai_profile,
+            #    current_room_name, current_api_key_name_state
+            #],
             inputs=[
                 user_gen_image_prompt, user_gen_image_provider,
                 user_gen_image_model, user_gen_image_openai_profile,
@@ -9722,6 +9584,8 @@ try:
         server_name_value = "0.0.0.0" if allow_external else "127.0.0.1"
         webhook_port = int(config_manager.CONFIG_GLOBAL.get("roblox_webhook_port", 7861))
         line_bot_port = 7862
+        api_gateway_settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+        api_gateway_port = int(os.getenv("NEXUS_ARK_API_PORT") or api_gateway_settings.get("port", 8000))
         try:
             preferred_gradio_port = int(os.getenv("NEXUS_ARK_PORT") or config_manager.CONFIG_GLOBAL.get("gradio_port", 7860))
         except (TypeError, ValueError):
@@ -9730,7 +9594,7 @@ try:
         allow_port_fallback = _env_flag("NEXUS_ARK_ALLOW_PORT_FALLBACK", False)
         gradio_port = _resolve_gradio_port(
             default_port=preferred_gradio_port,
-            excluded_ports={webhook_port, line_bot_port},
+            excluded_ports={webhook_port, line_bot_port, api_gateway_port},
             allow_fallback=allow_port_fallback,
         )
         display_port = gradio_port if gradio_port is not None else "Gradioが自動選択"
@@ -9756,6 +9620,10 @@ try:
             print("   `ipconfig` (Windows) または `ifconfig` (Mac/Linux) と入力して確認できます)")
         else:
             print(f"\n  ※外部接続は無効です。共通設定で有効化できます。")
+        if api_gateway_settings.get("enabled") or os.getenv("NEXUS_ARK_API_ENABLED") == "1":
+            api_host = os.getenv("NEXUS_ARK_API_HOST") or api_gateway_settings.get("host", "0.0.0.0")
+            print(f"\n  【REST API】")
+            print(f"  http://{api_host}:{api_gateway_port}/api/v1")
         print("="*60 + "\n")
 
         # --- [Hotfix] v0.2.3.0 誤配布データのクリーンアップ ---
@@ -9793,6 +9661,29 @@ try:
         except Exception as e:
             print(f"  [Roblox Webhook Error] 起動に失敗しました: {e}")
 
+        # --- REST API Gateway ---
+        if api_gateway_settings.get("enabled") or os.getenv("NEXUS_ARK_API_ENABLED") == "1":
+            try:
+                from api.server import start_server as start_api_gateway_server
+                api_host = os.getenv("NEXUS_ARK_API_HOST") or api_gateway_settings.get("host", "0.0.0.0")
+                start_api_gateway_server(port=api_gateway_port, host=api_host, daemon=True)
+                print(f"  [API Gateway] ポート {api_gateway_port} で待機中。")
+
+                # 起動時にTailscale HTTPSを自動設定する
+                if api_gateway_settings.get("auto_start_tailscale_serve") or os.getenv("NEXUS_ARK_START_TAILSCALE_SERVE") == "1":
+                    import shutil
+                    if shutil.which("tailscale"):
+                        print("  [API Gateway] Tailscale HTTPS Serve の自動設定を非同期で開始します...")
+                        import threading
+                        threading.Thread(
+                            target=ui_handlers.handle_configure_tailscale_lite_https,
+                            daemon=True
+                        ).start()
+                    else:
+                        print("  [API Gateway] Tailscale CLI が見つからないため、自動設定をスキップしました。")
+            except Exception as e:
+                print(f"  [API Gateway Error] 起動に失敗しました: {e}")
+
         # --- [Discord Bot] ---
         if discord_manager:
             try:
@@ -9826,8 +9717,8 @@ try:
             "inbrowser": False,
             "quiet": True,
             "theme": active_theme_object,
-            "css": custom_css,
-            "js": custom_js,
+            "css": effective_custom_css,
+            "js": effective_custom_js,
             # Gradio 6 checks localhost with an internal HEAD request after
             # binding. In local/proxy/WSL environments this check can fail even
             # when the server is usable, causing a fatal startup error.

@@ -43,6 +43,58 @@ if ! command -v uv &> /dev/null; then
     fi
 fi
 
+start_tailscale_lite_https() {
+    if [ "${NEXUS_ARK_START_TAILSCALE_SERVE:-0}" != "1" ]; then
+        return
+    fi
+
+    if ! command -v tailscale &> /dev/null; then
+        echo -e "${YELLOW}[WARN] tailscale command not found. Skipping Lite HTTPS serve.${NC}"
+        return
+    fi
+
+    local api_port="${NEXUS_ARK_API_PORT:-8000}"
+    export NEXUS_ARK_API_ENABLED="${NEXUS_ARK_API_ENABLED:-1}"
+    local target_url="http://127.0.0.1:${api_port}"
+    local status_log="/tmp/nexus_ark_tailscale_serve_status.log"
+    local serve_log="/tmp/nexus_ark_tailscale_serve.log"
+    local dns_name
+    dns_name="$(timeout 5s tailscale status --json 2>/dev/null | .venv/bin/python -c 'import json,sys; data=json.load(sys.stdin); print((data.get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null || true)"
+
+    if timeout 8s tailscale serve status >"$status_log" 2>&1 && grep -q "$target_url" "$status_log"; then
+        echo -e "${GREEN}[OK] Tailscale HTTPS serve is already configured.${NC}"
+        if [ -n "$dns_name" ]; then
+            echo -e "${YELLOW}Lite HTTPS: https://${dns_name}/lite${NC}"
+        else
+            echo -e "${YELLOW}Lite HTTPS: https://<your-device>.<tailnet>.ts.net/lite${NC}"
+        fi
+        return
+    fi
+
+    echo -e "${YELLOW}[INFO] Configuring Tailscale HTTPS for Nexus Ark Lite...${NC}"
+    if timeout 20s tailscale serve --bg --https=443 "$target_url" >"$serve_log" 2>&1; then
+        echo -e "${GREEN}[OK] Tailscale HTTPS serve configured.${NC}"
+        if [ -n "$dns_name" ]; then
+            echo -e "${YELLOW}Lite HTTPS: https://${dns_name}/lite${NC}"
+        else
+            echo -e "${YELLOW}Lite HTTPS: https://<your-device>.<tailnet>.ts.net/lite${NC}"
+        fi
+    else
+        local serve_exit=$?
+        if [ $serve_exit -eq 124 ]; then
+            echo -e "${YELLOW}[WARN] Tailscale HTTPS serve setup timed out. Continuing Nexus Ark startup.${NC}"
+        else
+            echo -e "${YELLOW}[WARN] Tailscale HTTPS serve setup did not complete.${NC}"
+        fi
+        echo -e "${YELLOW}       Check: tailscale serve status${NC}"
+        if [ -s "$serve_log" ]; then
+            sed 's/^/       /' "$serve_log"
+        elif [ -s "$status_log" ]; then
+            sed 's/^/       /' "$status_log"
+        fi
+    fi
+}
+
 while true; do
     # Sync dependencies (runs every loop iteration to pick up updates)
     echo -e "${YELLOW}[INFO] Checking dependencies...${NC}"
@@ -56,7 +108,12 @@ while true; do
     echo -e "${GREEN}[INFO] Starting Nexus Ark...${NC}"
     echo -e "${YELLOW}Access URL: http://0.0.0.0:7860 (Local)${NC}"
     echo -e "${YELLOW}Remote Access: http://<Tailscale-IP>:7860${NC}"
+    if [ "${NEXUS_ARK_API_ENABLED:-0}" = "1" ] || [ "${NEXUS_ARK_START_TAILSCALE_SERVE:-0}" = "1" ]; then
+        echo -e "${YELLOW}Lite PWA: http://127.0.0.1:${NEXUS_ARK_API_PORT:-8000}/lite${NC}"
+    fi
     echo -e "${GREEN}---------------------------------------------------${NC}"
+
+    start_tailscale_lite_https
 
     uv run nexus_ark.py
     EXIT_CODE=$?

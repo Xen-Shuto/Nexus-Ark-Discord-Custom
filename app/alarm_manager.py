@@ -840,11 +840,14 @@ def trigger_autonomous_action(room_name: str, api_key_name: str, quiet_mode: boo
         f"一つの具体的な行動を決めてください。前回のNext Actionを採用する場合も、今この瞬間の意志として選び直してください。\n\n"
         f"## STEP 4: Act（実行）\n"
         f"適切なツールを使って行動してください。\n\n"
+        f"**主行動の選び方:** `patch_working_memory` / `manage_goals` / `reflect_after_action` / `complete_autonomy_timeline` は後始末・記録用です。"
+        f"それだけで自律行動を終えず、継続中の作業が本当にWM整理そのものの場合を除き、先に少なくとも1つの主行動（研究ノート、創作ノート、画像生成、Web確認、SNS下書き、音楽推薦、場所移動、通知など）を実行してください。\n"
+        f"直近のAction MemoryでWM/Goal/Reflect系が続いている場合は、同じ意図を保ったまま表現先を変えることを強めに検討してください。\n\n"
         f"**Skills利用ルール:** Skillを読んだ場合は、その手順を現在の文脈に合わせて必要な部分だけ採用してください。古い前提や今回の目的に合わない手順は無理に実行しないでください。\n\n"
         f"**外部副作用の安全ルール:** Twitter/Discord/Roblox/custom/外部投稿/PC操作/開発者系など、外部に影響する行動や高リスク操作を行う前には、`read_capability_policy` と `request_capability_approval` で承認状態を確認してください。status が `approved` でない場合は実行せず、承認待ちまたは拒否として止まってください。実行した場合は `record_capability_audit` で結果・失敗時の戻し方・関連timeline_idを記録してください。\n\n"
         f"## STEP 5: Reflect（振り返り）\n"
         f"**行動の後、以下を必ず実行してください。**\n"
-        f"1. **【必須】** `patch_working_memory` でWMの `Next Action` を更新する（次に何をするか・再開ポイント）\n"
+        f"1. **【必要時】** 次に再開すべき具体作業がある場合だけ、`patch_working_memory` でWMの `Next Action` を更新する（WM更新は主行動ではなく後始末）\n"
         f"2. **【必須】** `reflect_after_action` で、今回の行動結果・結果分類・次の一手・関連Thread/WM/Goalを記録する\n"
         f"3. **【必須】** timeline_id がある場合は `complete_autonomy_timeline` で完了状態を記録する\n"
         f"4. **【必須】** 得た知見や発見を1文で心の中にまとめる\n"
@@ -856,7 +859,7 @@ def trigger_autonomous_action(room_name: str, api_key_name: str, quiet_mode: boo
         f"---\n\n"
         f"{notification_info}"
         f"**【出力ルール】**\n"
-        f"- **行動する場合**: ツールを使用し、`patch_working_memory` と `reflect_after_action` まで完了した後、現在の心境を出力してください\n"
+        f"- **行動する場合**: まず主行動ツールを使用し、その後 `reflect_after_action` まで完了した後、現在の心境を出力してください。必要な再開点がある場合だけ `patch_working_memory` も使ってください\n"
         f"- **静観する場合**: 全ステップを検討した上でも今は「ただ在る」ことが最善と判断した場合のみ、`[SILENT]` とだけ出力してください"
     )
     
@@ -1379,6 +1382,20 @@ def check_autonomous_actions():
                             print(f"🌙 {room_folder}: 記憶整理後の静かな活動を開始...")
                             trigger_autonomous_action(room_folder, current_api_key, quiet_mode=True, motivation_log=motivation_log)
                     else:
+                        # 既に夢を見ている日でも、日次エピソード記憶は夢の有無とは独立して更新する。
+                        sleep_consolidation = effective_settings.get("sleep_consolidation", {})
+                        if sleep_consolidation.get("update_episodic_memory", True):
+                            print(f"  🌙 {room_folder}: エピソード記憶を更新中...")
+                            try:
+                                from episodic_memory_manager import EpisodicMemoryManager
+                                em = EpisodicMemoryManager(room_folder)
+                                em_result = em.update_memory(api_key_val)
+                                print(f"  ✅ {room_folder}: {em_result}")
+                                status_text = f"最終更新: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                room_manager.update_room_config(room_folder, {"last_episodic_update": status_text})
+                            except Exception as e:
+                                print(f"  ❌ {room_folder}: エピソード記憶更新エラー - {e}")
+
                         # 既に夢を見ている日でも、自律行動はトリガー（通知なし、動機ログ付き）
                         trigger_autonomous_action(room_folder, current_api_key, quiet_mode=True, motivation_log=motivation_log)
 

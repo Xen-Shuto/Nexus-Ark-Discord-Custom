@@ -494,6 +494,10 @@ def _build_group_agent_args(
     }
 
 
+def _discord_send_kwargs(**kwargs) -> Dict[str, Any]:
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
 class _InteractionMessageAdapter:
     def __init__(self, interaction: discord.Interaction, content: str = "", mentions: Optional[List[Any]] = None):
         self.interaction = interaction
@@ -505,7 +509,8 @@ class _InteractionMessageAdapter:
         self.id = interaction.id
         self.attachments = []
 
-    async def reply(self, content: str, **kwargs):
+    async def reply(self, content: str = "", **kwargs):
+        kwargs = _discord_send_kwargs(**kwargs)
         if self.interaction.response.is_done():
             await self.interaction.followup.send(content, **kwargs)
         else:
@@ -523,6 +528,7 @@ class _ChannelReplyAdapter:
         self.attachments = []
 
     async def reply(self, content: str = "", **kwargs):
+        kwargs = _discord_send_kwargs(**kwargs)
         await self.channel.send(content, **kwargs)
 
 
@@ -782,13 +788,12 @@ class TwitterDraftView(discord.ui.View):
             result = await loop.run_in_executor(None, _post_task)
 
             if result.get("success"):
-                new_content = interaction.message.content + f"\n\n✅ Twitter投稿済み: {url}"
+                url = result.get("url", "不明なURL")
                 # 成功時、元のプレビューを残してステータスを追記
                 content = interaction.message.content
                 if "投稿済み" not in content:
                     content += f"\n\n✅ Twitter投稿済み: {url}"
-                new_content = content
-                await interaction.edit_original_response(content=new_content, view=None)
+                await interaction.edit_original_response(content=content, view=None)
             else:
                 twitter_manager.move_back_to_drafts(self.draft_id)
                 await interaction.followup.send(f"❌ Twitter投稿に失敗しました: {result.get('error', '不明なエラー')}")
@@ -917,6 +922,36 @@ class NexusDiscordClient(discord.Client):
         allowed = self._allowed_channel_ids()
         channel_id = getattr(interaction.channel, "id", "")
         return not allowed or str(channel_id) in allowed
+
+    async def on_interaction(self, interaction: discord.Interaction):
+        """未登録の（迷子の）ボタンインタラクションをキャッチしてクリーンアップする"""
+        if interaction.type == discord.InteractionType.component:
+            custom_id = interaction.data.get("custom_id", "")
+            if custom_id.startswith(("tw_approve:", "tw_reject:", "tw_show:")):
+                # すでにViewによって処理されている（レスポンス済み）なら何もしない
+                if interaction.response.is_done():
+                    return
+
+                # リストにない＝迷子のボタンなので、クリーンアップを試みる
+                try:
+                    from twitter_manager import twitter_manager
+                    twitter_manager.reload()
+                    draft_id = custom_id.split(":", 1)[1] if ":" in custom_id else ""
+                    
+                    # まだリストにあるならViewを動的に適用して処理（基本は起動時に登録されるはずだが念のため）
+                    pending = twitter_manager.get_pending_list()
+                    if any(str(d.get("id")) == draft_id for d in pending):
+                        view = TwitterDraftView(draft_id=draft_id)
+                        self.add_view(view) # 今からでも監視対象に入れる
+                        # そのままボタンの処理を呼び出すのは難しいため、一度エラーとしてボタンを消すか再実行を促す
+                    
+                    # リストにない場合は「処理済み」としてボタンを消す
+                    content = interaction.message.content
+                    if "（処理済み）" not in content:
+                        content += "\n\n（再起動前に処理済み、または期限切れです）"
+                    await interaction.response.edit_message(content=content, view=None)
+                except Exception:
+                    pass
 
     async def _run_application_command(
         self,
@@ -1523,7 +1558,8 @@ class NexusDiscordClient(discord.Client):
             "silence_seconds": max(1.8, float(settings.get("voice_input_silence_seconds", 1.8) or 1.8)),
             "min_seconds": float(settings.get("voice_input_min_seconds", 0.6) or 0.6),
             "max_seconds": float(settings.get("voice_input_max_seconds", 12.0) or 12.0),
-            "stt_model": str(settings.get("voice_input_stt_model") or constants.DISCORD_VOICE_STT_MODEL),
+            # Discord voice input is sealed in the UI; ignore legacy hidden STT settings.
+            "stt_model": constants.DISCORD_VOICE_STT_MODEL,
             "voice_client": voice_client,
             "text_channel": message.channel,
             "author": message.author,
@@ -2151,7 +2187,7 @@ class NexusDiscordClient(discord.Client):
             for idx, part in enumerate(parts):
                 files = [discord.File(path) for path in image_paths if os.path.exists(path)] if idx == 0 else None
                 if part:
-                    await channel.send(part, files=files if files else None)
+                    await channel.send(part, **_discord_send_kwargs(files=files if files else None))
                 elif files:
                     await channel.send(files=files)
 
@@ -2173,7 +2209,7 @@ class NexusDiscordClient(discord.Client):
         parts = _chunk_text(prefix + (response_text or ""))
         for idx, part in enumerate(parts):
             files = [discord.File(path) for path in image_paths if os.path.exists(path)] if idx == 0 else None
-            await fallback_channel.send(part, files=files if files else None)
+            await fallback_channel.send(part, **_discord_send_kwargs(files=files if files else None))
 
     async def _execute_ai_interaction(self, room_name: str, user_content: str, attachments_paths: List[str], reply_target: discord.Message):
         log_file, _, _, _, _, _, _ = room_manager.get_room_files_paths(room_name)
@@ -2337,7 +2373,7 @@ class NexusDiscordClient(discord.Client):
                     parts = _chunk_text(final_text)
                     for idx, part in enumerate(parts):
                         files = [discord.File(path) for path in generated_images if os.path.exists(path)] if idx == 0 else None
-                        await reply_target.reply(part, files=files if files else None)
+                        await reply_target.reply(part, **_discord_send_kwargs(files=files if files else None))
                 elif generated_images:
                     files = [discord.File(path) for path in generated_images if os.path.exists(path)]
                     await reply_target.reply(files=files)

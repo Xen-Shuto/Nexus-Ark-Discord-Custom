@@ -395,12 +395,13 @@ class EpisodicMemoryManager:
                     is_success = False
             except Exception as e:
                 print(f"  - {date_str}: 要約生成に失敗しました: {e}")
-                summary_result = f"（エラーにより要約できませんでした: {e}）"
+                summary_result = ""
                 is_success = False
 
             # --- 保存判定 ---
-            if summary_result:
-                # 成功したか、恒久的に失敗した場合は保存して「完了」とする
+            if summary_result and is_success:
+                # 成功した場合のみ保存して「完了」とする。
+                # 503/Overloaded等の一時エラーを記憶として残すと、後続の再生成が阻害される。
                 # [Phase 2] Arousal平均値を取得
                 arousal_score = 0.5  # デフォルト
                 try:
@@ -415,14 +416,9 @@ class EpisodicMemoryManager:
                     "arousal": arousal_score,  # Arousal追加
                     "created_at": datetime.datetime.now().isoformat()
                 })
-                
-                if is_success:
-                    success_count += 1
-                else:
-                    error_count += 1
+                success_count += 1
             else:
-                # 予期せぬケース
-                print(f"  - {date_str}: 要約結果が得られなかったため、保存をスキップしました。")
+                print(f"  - {date_str}: 要約結果が得られなかったため、保存をスキップしました。次回再試行します。")
                 error_count += 1
 
         return f"処理完了: 成功 {success_count}件 / エラー・スキップ {error_count}件"

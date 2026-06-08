@@ -29,6 +29,7 @@ dependencies = [
     # --- Subprocess & Notifications ---
     "psutil==7.1.0",
     "plyer==2.1.0",
+    "pywebpush>=2.0.3",
     "schedule==1.2.2",
     "requests==2.32.5",
     # --- File & System Utilities ---

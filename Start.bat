@@ -50,6 +50,8 @@ echo.
 REM Move to app directory for execution
 cd app
 
+call :CONFIGURE_TAILSCALE_SERVE
+
 REM Invoke python directly. Note: .venv is in the parent directory
 if exist "..\.venv\Scripts\python.exe" (
     "..\.venv\Scripts\python.exe" nexus_ark.py
@@ -128,3 +130,44 @@ echo [ERROR] Application crashed!
 echo.
 pause
 exit /b 1
+
+:CONFIGURE_TAILSCALE_SERVE
+if not "%NEXUS_ARK_START_TAILSCALE_SERVE%"=="1" exit /b 0
+where tailscale >nul 2>nul
+if %errorlevel% NEQ 0 (
+    echo [WARN] tailscale command not found. Skipping Lite HTTPS serve.
+    exit /b 0
+)
+if "%NEXUS_ARK_API_PORT%"=="" set "NEXUS_ARK_API_PORT=8000"
+if "%NEXUS_ARK_API_ENABLED%"=="" set "NEXUS_ARK_API_ENABLED=1"
+set "NEXUS_ARK_LITE_TARGET=http://127.0.0.1:%NEXUS_ARK_API_PORT%"
+set "NEXUS_ARK_TS_STATUS=%TEMP%\nexus_ark_tailscale_serve_status.txt"
+set "NEXUS_ARK_TS_LOG=%TEMP%\nexus_ark_tailscale_serve.txt"
+tailscale serve status > "%NEXUS_ARK_TS_STATUS%" 2>&1
+findstr /C:"%NEXUS_ARK_LITE_TARGET%" "%NEXUS_ARK_TS_STATUS%" >nul 2>nul
+if %errorlevel% EQU 0 (
+    echo [OK] Tailscale HTTPS serve is already configured.
+    call :PRINT_TAILSCALE_LITE_URL
+    exit /b 0
+)
+echo [INFO] Configuring Tailscale HTTPS for Nexus Ark Lite...
+tailscale serve --bg --https=443 "%NEXUS_ARK_LITE_TARGET%" > "%NEXUS_ARK_TS_LOG%" 2>&1
+if %errorlevel% EQU 0 (
+    echo [OK] Tailscale HTTPS serve configured.
+    call :PRINT_TAILSCALE_LITE_URL
+    exit /b 0
+)
+echo [WARN] Tailscale HTTPS serve setup did not complete.
+echo        Check: tailscale serve status
+type "%NEXUS_ARK_TS_LOG%" 2>nul
+exit /b 0
+
+:PRINT_TAILSCALE_LITE_URL
+set "NEXUS_ARK_TS_DNS="
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $j = tailscale status --json | ConvertFrom-Json; ($j.Self.DNSName -replace '\\.$','') } catch { '' }"`) do set "NEXUS_ARK_TS_DNS=%%D"
+if not "%NEXUS_ARK_TS_DNS%"=="" (
+    echo Lite HTTPS: https://%NEXUS_ARK_TS_DNS%/lite
+) else (
+    echo Lite HTTPS: https://^<your-device^>.^<tailnet^>.ts.net/lite
+)
+exit /b 0

@@ -486,8 +486,8 @@ def load_chat_log_lazy(
         # cutoff_date によるフィルタリングをファイル単位で実施
         if cutoff_date:
             filtered = []
-            # 元の修正案(d30424c)に合わせ、メッセージ末尾の日付を確実に捉える
-            date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
+            # 本文中の記憶・研究文脈に含まれる日付ではなく、発言タイムスタンプだけを見る。
+            date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}) \(...\) \d{2}:\d{2}:\d{2}')
             
             # ファイル内のメッセージを逆順にチェック
             for msg in reversed(current_file_msgs):
@@ -1129,6 +1129,15 @@ def remove_thoughts_from_text(text: str) -> str:
     text = re.sub(r"\[THOUGHTS?\][\s\S]*?\[/THOUGHTS?\]\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<thinking>[\s\S]*?</thinking>\s*", "", text, flags=re.IGNORECASE)
 
+    # 閉じタグがない開始タグが末尾まで続いている場合、その開始タグから末尾までを思考ログとみなして除去する（閉じ忘れ・生成途中終了への対策）
+    for start_tag_pat, end_tag_pat in [
+        (r"【Thoughts?】", r"【/Thoughts?】"),
+        (r"\[THOUGHTS?\]", r"\[/THOUGHTS?\]"),
+        (r"<thinking>", r"</thinking>")
+    ]:
+        if re.search(start_tag_pat, text, flags=re.IGNORECASE) and not re.search(end_tag_pat, text, flags=re.IGNORECASE):
+            text = re.sub(start_tag_pat + r"[\s\S]*$", "", text, flags=re.IGNORECASE)
+
     # 2. JSON/Python辞書形式の思考ブロック除去 (複数対応 & クォート考慮)
     def remove_json_thinking(t: str) -> str:
         res_text = t
@@ -1674,7 +1683,19 @@ def find_scenery_image(room_name: str, location_id: str, season_en: str = None, 
     
     # --- 季節フォールバック順序を生成（現在季節から逆順に遡る）---
     SEASONS_ORDER = ["spring", "summer", "autumn", "winter"]
+    
+    # 拡張季節から基本季節や類似季節へのマッピング（最優先で最も近い季節へフォールバックさせる）
+    EXTENDED_SEASONS_MAP = {
+        "early_spring": ["spring", "winter", "autumn", "summer"],  # 早春 → 春 → 冬 → 秋 → 夏
+        "early_summer": ["summer", "spring", "autumn", "winter"],  # 初夏 → 夏 → 春 → 秋 → 冬
+        "late_summer": ["summer", "autumn", "spring", "winter"],   # 残暑 → 夏 → 秋 → 春 → 冬
+        "late_autumn": ["autumn", "winter", "summer", "spring"],   # 晩秋 → 秋 → 冬 → 夏 → 春
+    }
+
     def get_season_fallback_order(current_season: str) -> list:
+        if current_season in EXTENDED_SEASONS_MAP:
+            return [current_season] + EXTENDED_SEASONS_MAP[current_season]
+            
         if current_season not in SEASONS_ORDER:
             return SEASONS_ORDER
         idx = SEASONS_ORDER.index(current_season)
@@ -2204,15 +2225,52 @@ def _get_current_time_context(room_name: str) -> Tuple[str, str]:
     # 循環参照を避けるため、ここでローカルインポート
     import room_manager
     import datetime
+    import config_manager
 
     room_config = room_manager.get_room_config(room_name)
-    settings = (room_config or {}).get("time_settings", {})
+    room_config = room_config or {}
+    settings = room_config.get("time_settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+    if not settings:
+        override_settings = room_config.get("override_settings", {}) or {}
+        nested_settings = override_settings.get("time_settings", {})
+        if isinstance(nested_settings, dict):
+            settings = nested_settings
     
     mode = settings.get("mode", "realtime")
 
     now = datetime.datetime.now()
     default_season_en = get_season(now.month)
     default_time_en = get_time_of_day(now.hour)
+
+    # リアルタイム連動の時、天気・環境連携の動的季節・時間帯判定を適用する
+    if mode == "realtime":
+        try:
+            config = config_manager.load_config_file()
+            weather_settings = config.get("weather_settings", {})
+            if weather_settings.get("enable_scenery_reflection", False):
+                lat = weather_settings.get("latitude")
+                lon = weather_settings.get("longitude")
+                if lat is not None and lon is not None:
+                    from weather_service import WeatherService
+                    service = WeatherService()
+                    weather_data = service.get_cached_weather()
+                    if not weather_data:
+                        weather_data = service.fetch_weather(lat, lon)
+                    
+                    if weather_data:
+                        # 気温に基づく体感季節
+                        _, enhanced_season_en = service.get_enhanced_season(weather_data.temperature, now.month)
+                        # 日出日没時刻に基づく伸縮時間帯
+                        _, enhanced_time_en = service.get_enhanced_time_of_day(now.time(), weather_data.sunrise, weather_data.sunset)
+                        
+                        if enhanced_season_en:
+                            default_season_en = enhanced_season_en
+                        if enhanced_time_en:
+                            default_time_en = enhanced_time_en
+        except Exception as e:
+            print(f"--- [Weather Time Context Error] 動的コンテキスト取得に失敗しました (フォールバック): {e}")
 
     if mode == "fixed":
         season_en = settings.get("fixed_season", default_season_en)

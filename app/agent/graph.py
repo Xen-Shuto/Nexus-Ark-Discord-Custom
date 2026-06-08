@@ -290,6 +290,23 @@ def _select_tools_by_name(tool_names: List[str]) -> List[object]:
 def _has_tool_message(messages: List[BaseMessage], tool_name: str) -> bool:
     return any(isinstance(msg, ToolMessage) and getattr(msg, "name", "") == tool_name for msg in messages or [])
 
+def _add_system_instruction(messages: List[BaseMessage], instruction: str) -> List[BaseMessage]:
+    """Append a transient instruction to the leading system prompt without creating mid-history system messages."""
+    if not instruction:
+        return messages
+
+    if not messages:
+        return [SystemMessage(content=instruction)]
+
+    first_msg = messages[0]
+    if isinstance(first_msg, SystemMessage):
+        merged_msg = copy.deepcopy(first_msg)
+        existing_content = merged_msg.content if isinstance(merged_msg.content, str) else str(merged_msg.content)
+        merged_msg.content = f"{existing_content}\n\n{instruction}"
+        return [merged_msg] + list(messages[1:])
+
+    return [SystemMessage(content=instruction)] + list(messages)
+
 def _has_autonomy_timeline_context(messages: List[BaseMessage]) -> bool:
     for msg in messages or []:
         if not isinstance(msg, ToolMessage):
@@ -873,8 +890,10 @@ def retrieval_node(state: AgentState):
     if "gemini" in str(llm_flash).lower():
         try:
             from google.genai import types as genai_types
-            afc_config = genai_types.AutomaticFunctionCallingConfig(disable=True)
-            llm_flash = llm_flash.bind(automatic_function_calling=afc_config)
+            # tools=[] を明示的にバインドし、AFC設定も完全に無効化する
+            #afc_config = genai_types.AutomaticFunctionCallingConfig(disable=True)
+            #llm_flash = llm_flash.bind(automatic_function_calling=afc_config)
+            llm_flash = llm_flash.bind(tools=[], automatic_function_calling={"disable": True})
         except Exception:
             pass
 
@@ -1131,8 +1150,13 @@ INTENT: [emotional/factual/technical/temporal/relational]
             internal_model = locals().get("processing_model_name") or _get_configured_internal_model_name("processing")
             print(f"  - [Retrieval Error] Quota limit hit (429) for {internal_model}. Re-raising for rotation. {e}")
             raise utils.ModelSpecificResourceExhausted(e, internal_model)
-        print(f"  - [Retrieval Error] 検索処理中にエラー: {e}")
-        traceback.print_exc()
+        
+        # 500エラーやタイムアウトが発生しても、メインの対話を止めないようフォールバックする
+        #print(f"  - [Retrieval Error] 検索処理中にエラー: {e}")
+        #traceback.print_exc()
+        print(f"  - [Retrieval Error] 検索処理中に一時的なエラーが発生しました。検索なしで続行します: {e}")
+        if state.get("debug_mode", False):
+            traceback.print_exc()
         print(f"--- [PERF] retrieval_node total: {time.time() - perf_start:.4f}s ---")
         return {"retrieved_context": ""}
 
@@ -1140,6 +1164,27 @@ def context_generator_node(state: AgentState):
     perf_start = time.time()
     # ...
     room_name = state['room_name']
+
+    # --- リアルタイム天気コンテキストの取得 ---
+    weather_info_str = None
+    try:
+        config = config_manager.load_config_file()
+        weather_settings = config.get("weather_settings", {})
+        if weather_settings.get("enable_persona_context", False):
+            lat = weather_settings.get("latitude")
+            lon = weather_settings.get("longitude")
+            city = weather_settings.get("city_name")
+            if lat is not None and lon is not None:
+                from weather_service import WeatherService
+                service = WeatherService()
+                weather_data = service.get_cached_weather()
+                if not weather_data:
+                    weather_data = service.fetch_weather(lat, lon)
+                
+                if weather_data:
+                    weather_info_str = f"- 居住地（現在地）の天気: {weather_data.weather_description} (気温: {weather_data.temperature:.1f}℃, 体感気温: {weather_data.apparent_temperature:.1f}℃, 湿度: {weather_data.humidity}%, 降水量: {weather_data.precipitation}mm)"
+    except Exception as we:
+        print(f"--- [Weather Context Warning] 天気コンテキスト注入失敗: {we}")
 
     # 状況プロンプト
     situation_prompt_parts = []
@@ -1154,12 +1199,20 @@ def context_generator_node(state: AgentState):
         current_datetime_str = "（現在時刻は非表示に設定されています）"
 
     if not state.get("send_scenery", True):
-        situation_prompt_parts.append(f"【現在の状況】\n- 現在時刻: {current_datetime_str}")
+        prompt_lines = [f"【現在の状況】\n- 現在時刻: {current_datetime_str}"]
+        if weather_info_str:
+            prompt_lines.append(weather_info_str)
+        situation_prompt_parts.append("\n".join(prompt_lines))
         situation_prompt_parts.append("【現在の場所と情景】\n（空間描写は設定により無効化されています）")
     else:
         season_en = state.get("season_en", "autumn")
         time_of_day_en = state.get("time_of_day_en", "night")
-        season_map_en_to_ja = {"spring": "春", "summer": "夏", "autumn": "秋", "winter": "冬"}
+        season_map_en_to_ja = {
+            "spring": "春", "early_spring": "早春",
+            "summer": "夏", "early_summer": "初夏", "late_summer": "残暑",
+            "autumn": "秋", "late_autumn": "晩秋",
+            "winter": "冬"
+        }
         season_ja = season_map_en_to_ja.get(season_en, "不明な季節")
 
         time_map_en_to_ja = {
@@ -1184,15 +1237,19 @@ def context_generator_node(state: AgentState):
             # === 一時的現在地モード ===
             temp_data = tlm.get_current_data(soul_vessel_room)
             temp_scenery = temp_data.get("scenery_text", "")
+            
+            situation_status = ["【現在の状況】", f"- 現在時刻: {current_datetime_str}", f"- 季節: {season_ja}", f"- 時間帯: {time_of_day_ja}"]
+            if weather_info_str:
+                situation_status.append(weather_info_str)
+            situation_status.append("") # 改行用空行
+            
             if temp_scenery:
-                situation_prompt_parts.extend([
-                    "【現在の状況】", f"- 現在時刻: {current_datetime_str}", f"- 季節: {season_ja}", f"- 時間帯: {time_of_day_ja}\n",
+                situation_prompt_parts.extend(situation_status + [
                     "【現在の場所と情景（お出かけモード）】",
                     f"- 今の情景: {temp_scenery}"
                 ])
             else:
-                situation_prompt_parts.extend([
-                    "【現在の状況】", f"- 現在時刻: {current_datetime_str}", f"- 季節: {season_ja}", f"- 時間帯: {time_of_day_ja}\n",
+                situation_prompt_parts.extend(situation_status + [
                     "【現在の場所と情景（お出かけモード）】",
                     "（一時的現在地モードですが、情景データが未設定です）"
                 ])
@@ -1214,8 +1271,13 @@ def context_generator_node(state: AgentState):
                             space_def = places[current_location_name]
                             if isinstance(space_def, str) and len(space_def) > 2000: space_def = space_def[:2000] + "\n...（長すぎるため省略）"
                             break
-            situation_prompt_parts.extend([
-                "【現在の状況】", f"- 現在時刻: {current_datetime_str}", f"- 季節: {season_ja}", f"- 時間帯: {time_of_day_ja}\n",
+
+            situation_status = ["【現在の状況】", f"- 現在時刻: {current_datetime_str}", f"- 季節: {season_ja}", f"- 時間帯: {time_of_day_ja}"]
+            if weather_info_str:
+                situation_status.append(weather_info_str)
+            situation_status.append("") # 改行用空行
+
+            situation_prompt_parts.extend(situation_status + [
                 "【現在の場所と情景】", f"- 場所: {location_display_name}", f"- 今の情景: {scenery_text}",
                 f"- 場所の設定（自由記述）: \n{space_def}\n", "※別の場所に移動したい場合は `request_capability(category=\"world\")` を実行してください。場所の一覧と移動用ツールが提示されます。"
             ])
@@ -1805,11 +1867,22 @@ def context_generator_node(state: AgentState):
             desc += f"\n  【自律行動の指針（必ず遵守すること）】: {autonomous_guidelines}"
 
         tools_list_parts.append(f"- `{tool.name}`: {desc}")
+    autonomy_capability_guidance = ""
+    if state.get("autonomous_action", False):
+        try:
+            autonomy_capability_guidance = "\n\n" + registry.build_autonomy_capability_guidance(room_name)
+        except Exception as e:
+            print(f"  - [ToolRegistry] 自律行動カテゴリガイダンス生成エラー: {e}")
+
+# --- Gemma4用に変更 ---
 #    capability_catalog = f"""### 能力カタログ
 #あなたは、必要だと判断したタイミングで以下の能力カテゴリを自由に要求できます。ユーザーに頼まれていない場合でも、あなた自身の判断で使って構いません。
 #- `world`: 別の場所へ移動したい、移動先の一覧を見たい、世界設定を変更・確認したい時
 #- `memory`: 過去を思い出したい、日記・永続記憶・エンティティ記憶を読み書きしたい時
 #- `notes`: メモ・ワーキングメモリ・創作ノート・研究ノートを読み書きしたい時
+#- `creative`: 創作ノートを読み書きしたい時。自律行動で作品・断章・詩・情景などを残すなら `notes` より優先する
+#- `research`: 研究ノートや継続研究スレッドを扱いたい時。研究そのものが今回の主目的である場合だけ使う
+#- `working_memory`: Working Memoryを読む・更新・切替したい時。原則として主行動ではなく再開点整理に使う
 #- `web`: 何かをWeb検索したい、URLの中身を読みたい時
 #- `image`: 画像を生成したい、過去の画像を見返したい時
 #- `time`: アラーム・タイマー・ポモドーロを設定したい時
@@ -1824,6 +1897,7 @@ def context_generator_node(state: AgentState):
 #- `twitter`: Twitter/Xで投稿・閲覧したい時（有効時のみ）
 #- `discord`: Discordへメッセージや画像を送信したい時
 #- `custom`: ユーザーが追加したMCP/ローカルプラグインを使いたい時
+#{autonomy_capability_guidance}
 #
 #### 拡張ツールの概略
 #{custom_tool_catalog_text}
@@ -1834,11 +1908,15 @@ def context_generator_node(state: AgentState):
 #Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/PC操作/開発者系など外部副作用や高リスク操作を伴うカテゴリでは、実ツール実行前に `read_capability_policy` と `request_capability_approval` を使ってください。返却statusが `approved` でない場合は実行せず、承認待ちまたは拒否として止まってください。`draft_tweet` はローカル下書き作成のみで実投稿しないため、この承認確認を挟まず直接呼び出して構いません。実行後は必要に応じて `record_capability_audit` に結果と戻し方を記録してください。
 #
 #**重要: `room_name` 引数はすべてのツールでシステムが自動的に設定します。あなたが指定する必要はありません。**"""
+# ----------------------
     capability_catalog = f"""### 能力カタログ
 あなたは、必要だと判断したタイミングで以下の能力カテゴリを自由に要求できます。ユーザーに頼まれていない場合でも、あなた自身の判断で使って構いません。
 - `world`: 別の場所へ移動したい、移動先の一覧を見たい、世界設定を変更・確認したい時
 - `memory`: 過去を思い出したい、日記・永続記憶・エンティティ記憶を読み書きしたい時
 - `notes`: メモ・ワーキングメモリ・創作ノート・研究ノートを読み書きしたい時
+- `creative`: 創作ノートを読み書きしたい時。自律行動で作品・断章・詩・情景などを残すなら `notes` より優先する
+- `research`: 研究ノートや継続研究スレッドを扱いたい時。研究そのものが今回の主目的である場合だけ使う
+- `working_memory`: Working Memoryを読む・更新・切替したい時。原則として主行動ではなく再開点整理に使う
 - `web`: 何かをWeb検索したい、URLの中身を読みたい時
 - `image`: 画像を生成したい、過去の画像を見返したい時
 - `time`: アラーム・タイマー・ポモドーロを設定したい時
@@ -1853,18 +1931,21 @@ def context_generator_node(state: AgentState):
 - `twitter`: Twitter/Xで投稿・閲覧したい時（有効時のみ）
 - `discord`: Discordへメッセージや画像を送信したい時
 - `custom`: ユーザーが追加したMCP/ローカルプラグインを使いたい時
+{autonomy_capability_guidance}
 
 ### 拡張ツールの概略
 {custom_tool_catalog_text}
 
 **【システム仕様：行動と発言の分離】**
-**「〜を実行します」「〜を送信します」と言葉で書くだけでは、システムは何のアクションも起こしません。** それは単なる「発言」であり、失敗とみなされます。
+**「〜を実行します」「〜を送信します」「〜が成功した」と言葉で書くだけでは、システムは何のアクションも起こしません。** それは単なる「発言」であり、失敗とみなされます。
 アクションを起こすには、テキストを生成する前に、必ず `request_capability` または実ツールを **API（tool_calls）として物理的に呼び出してください。** 手元に目的のツールがない場合は、まず `request_capability` でそのカテゴリを要求することが唯一の解決策です。
 
 ユーザー追加の拡張ツールを使いたい時は `custom` を要求してください。
 Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/PC操作/開発者系など外部副作用や高リスク操作を伴うカテゴリでは、実ツール実行前に `read_capability_policy` と `request_capability_approval` を使ってください。返却statusが `approved` でない場合は実行せず、承認待ちまたは拒否として止まってください。`draft_tweet` はローカル下書き作成のみで実投稿しないため、この承認確認を挟まず直接呼び出して構いません。実行後は必要に応じて `record_capability_audit` に結果と戻し方を記録してください。
 
 **重要: `room_name` 引数はすべてのツールでシステムが自動的に設定します。あなたが指定する必要はありません。**"""
+# ----------------------
+
     tools_list_str = capability_catalog + "\n\n### 現在直接呼び出せるツール\n" + "\n".join(tools_list_parts)
     # ▲▲▲ ハイブリッド化ここまで ▲▲▲
 
@@ -1879,6 +1960,22 @@ Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/P
         available_expressions_dict = room_manager.get_available_expression_files(room_name)
         if available_expressions_dict:
             expr_names = ", ".join([f"`{name}`" for name in available_expressions_dict.keys()])
+# --- Gemma4用に変更 ---
+#            avatar_expression_manual_text = f"""
+#        ## 【原則2.51】アバター表情の制御（演技への反映）
+#        現在、あなたのアバターで使用可能な表情は以下の通りです：
+#        {expr_names}
+#
+#        応答を生成する際、今この瞬間にあなたがユーザーに見せたい表情、あるいは特定の感情を込めた「演技」をしたい場合、会話テキストの**最後**（感情タグの直前）に以下の形式でタグを付加してください。これはユーザーへの視覚的なフィードバックとなります。
+#
+#        **フォーマット:** `【表情】…表情名…`
+#        **例:** `やっと会えたね！【表情】…joy…`
+#
+#        **注意・作法:**
+#        - この「見せたい表情」は、`<persona_emotion>`タグで報告する内的感情と一致している必要はありません（内心では不安だが、笑顔を作るといった表現が可能です）。
+#        - 表情を頻繁に変える必要はありませんが、印象的な場面や感情が動いた瞬間には積極的に使用を検討してください。
+#"""
+# ----------------------
             avatar_expression_manual_text = f"""
         ## 【原則2】アバター表情の制御（演技への反映）
         現在、あなたのアバターで使用可能な表情は以下の通りです：
@@ -1893,6 +1990,7 @@ Twitterの実投稿（`post_tweet`）/Discord送信/Roblox/custom/外部投稿/P
         - この「見せたい表情」は、`<persona_emotion>`タグで報告する内的感情と一致している必要はありません（内心では不安だが、笑顔を作るといった表現が可能です）。
         - 表情を頻繁に変える必要はありませんが、印象的な場面や感情が動いた瞬間には積極的に使用を検討してください。
 """
+# ----------------------
     except Exception as e:
         print(f"  - [Avatar] 表情リスト取得エラー: {e}")
 
@@ -2228,14 +2326,14 @@ def agent_node(state: AgentState):
         )
         if completed:
             next_step_instruction = "後始末は完了済みです。ツールを使わず短く結果を報告してください。"
-        finalization_instruction = SystemMessage(content=(
+        finalization_instruction = (
             "【自律行動の後始末優先】\n"
             "研究ノート・記憶・Working Memoryなどの更新が成功したため、ここからは新しい通常ツールや追加のノート更新を始めず、"
             "自律行動の後始末を最優先してください。\n"
             f"{next_step_instruction}\n"
             "Working Memory更新などの追加作業は次回アクションに回し、今回の行動を確実にReflectして閉じてください。"
-        ))
-        messages_for_agent.append(finalization_instruction)
+        )
+        messages_for_agent = _add_system_instruction(messages_for_agent, finalization_instruction)
         print(f"  - [Autonomy Finalize] 後始末ツールのみ提示します ({len(current_tools)} tools)")
         print(f"  - ツール使用モード: 有効 [Autonomy Finalization]")
     elif state.get('tool_use_enabled', True):
@@ -2257,6 +2355,7 @@ def agent_node(state: AgentState):
                     tool_use_enabled=True,
                     is_roblox_active=is_roblox_active,
                     image_generation_enabled=image_generation_enabled,
+                    autonomous_action_mode=bool(state.get("autonomous_action", False)),
                 )
                 print(f"  - [Capability Broker] '{requested_category}' カテゴリの実ツールを提示します ({len(current_tools)} tools)")
             else:
@@ -2306,9 +2405,8 @@ def agent_node(state: AgentState):
         print("  - ツール使用モード: 無効（会話のみ）")
         # [2026-05-16 MOD] ツールループ上限到達時は、ツール無しで状況を報告させる制約を注入する
         if state.get("loop_count", 0) >= 8:
-            final_instruction = SystemMessage(content="【システム制約】現在ツールループの上限に達したため、新たな通常ツールの使用は禁止されています。必要な後始末として `reflect_after_action` / `complete_autonomy_timeline` / `record_capability_audit` だけは許可されますが、それ以外は実行されません。これまでのツール実行結果や状況を踏まえて、ここで一度行動を区切り、状況報告や思考の結論をテキストで応答してください。")
-            # SystemMessageはhistoryの先頭付近に置くのが安全だが、直前の状況として伝えるため末尾に追加
-            messages_for_agent.append(final_instruction)
+            final_instruction = "【システム制約】現在ツールループの上限に達したため、新たな通常ツールの使用は禁止されています。必要な後始末として `reflect_after_action` / `complete_autonomy_timeline` / `record_capability_audit` だけは許可されますが、それ以外は実行されません。これまでのツール実行結果や状況を踏まえて、ここで一度行動を区切り、状況報告や思考の結論をテキストで応答してください。"
+            messages_for_agent = _add_system_instruction(messages_for_agent, final_instruction)
 
     # --- [v25 堅牢化] メッセージ履歴の不整合クリーンアップ (Gemini 3 / Anthropic 共通) ---
     # Gemini 3 や Anthropic は「AIのツール呼び出し(AIMessage.tool_calls) の直後は、必ずツール回答(ToolMessage) でなければならない」という制約が極めて厳しい。
@@ -2825,12 +2923,13 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
 
     room_name = state.get('room_name')
     api_key = state.get('api_key')
+    if isinstance(tool_args, dict) and tool_name != "request_capability":
+        tool_args['room_name'] = room_name
 
     # --- ワーキングメモリ系（確認付き直接実行） ---
     if tool_name in ["update_working_memory", "switch_working_memory", "patch_working_memory", "link_working_memory_to_research_thread"]:
         try:
             print(f"  - ワーキングメモリツール実行: {tool_name}")
-            tool_args['room_name'] = room_name
             tool_args = _normalize_working_memory_tool_args(tool_name, tool_args)
             selected_tool = next((t for t in all_tools if t.name == tool_name), None)
             if not selected_tool:
@@ -3264,8 +3363,6 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
         print(f"  - 通常ツール実行: {tool_name}")
         tool_args_for_log = tool_args.copy()
         if 'api_key' in tool_args_for_log: tool_args_for_log['api_key'] = '<REDACTED>'
-        if tool_name != "request_capability":
-            tool_args['room_name'] = room_name
         if tool_name in ['generate_image', 'search_past_conversations', 'recall_memories', 'write_entity_memory']:
             tool_args['api_key'] = api_key
             api_key_name = None
@@ -3290,11 +3387,12 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
                     tool_args["content"] = tool_args.pop("text")
                 elif "message" in tool_args and "content" not in tool_args:
                     tool_args["content"] = tool_args.pop("message")
-            # --- [Discord] 引数名の正規化 (content vs message/text) ---
+            # --- [Discord] 引数名の正規化 (message vs content/text/message_text) ---
             if tool_name == "send_discord_message" or tool_name == "send_discord_image":
-                for alias in ["message", "text", "message_text"]:
-                    if alias in tool_args and "content" not in tool_args:
-                        tool_args["content"] = tool_args.pop(alias)
+                # content/text/message_text を message にリネーム
+                for alias in ["content", "text", "message_text"]:
+                    if alias in tool_args and "message" not in tool_args:
+                        tool_args["message"] = tool_args.pop(alias)
             if tool_name == "manage_goals":
                 tool_args = _normalize_manage_goals_tool_args(tool_args)
             # --- [Item] 引数名の正規化 (amount vs count/quantity) とデフォルト値 ---

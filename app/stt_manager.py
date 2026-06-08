@@ -86,7 +86,12 @@ def transcribe_audio_file_openai_detailed(
         raise SttApiError(f"OpenAI STT APIエラー ({target_model}): {e}") from e
 
 
-def transcribe_audio_file_detailed(audio_path: str, api_key: str, model_name: Optional[str] = None) -> SttResult:
+def transcribe_audio_file_detailed(
+    audio_path: str,
+    api_key: str,
+    model_name: Optional[str] = None,
+    mime_type: str = "audio/wav",
+) -> SttResult:
     """Geminiで短い音声クリップを文字起こしする。"""
     if not audio_path or not os.path.exists(audio_path):
         return SttResult(text="")
@@ -103,7 +108,9 @@ def transcribe_audio_file_detailed(audio_path: str, api_key: str, model_name: Op
             audio_data = f.read()
         if not audio_data:
             return SttResult(text="")
-        audio_data = _prepare_wav_for_stt(audio_data)
+        normalized_mime_type = (mime_type or "audio/wav").strip() or "audio/wav"
+        if normalized_mime_type == "audio/wav":
+            audio_data = _prepare_wav_for_stt(audio_data)
 
         client = genai.Client(api_key=api_key)
         last_error: Optional[Exception] = None
@@ -126,10 +133,10 @@ def transcribe_audio_file_detailed(audio_path: str, api_key: str, model_name: Op
             max_attempts = 2 if candidate_model == target_model else 1
             for attempt in range(max_attempts):
                 try:
-                    cleaned = _request_transcript(client, candidate_model, audio_data, strict_prompt)
+                    cleaned = _request_transcript(client, candidate_model, audio_data, strict_prompt, normalized_mime_type)
                     if cleaned:
                         return SttResult(text=cleaned, model_name=candidate_model)
-                    relaxed = _request_transcript(client, candidate_model, audio_data, relaxed_prompt)
+                    relaxed = _request_transcript(client, candidate_model, audio_data, relaxed_prompt, normalized_mime_type)
                     if relaxed:
                         return SttResult(text=relaxed, uncertain=True, model_name=candidate_model)
                     break
@@ -157,12 +164,12 @@ def transcribe_audio_file_detailed(audio_path: str, api_key: str, model_name: Op
         raise SttApiError(f"STT処理中に予期しないエラーが発生しました: {e}") from e
 
 
-def _request_transcript(client, model_name: str, audio_data: bytes, prompt: str) -> str:
+def _request_transcript(client, model_name: str, audio_data: bytes, prompt: str, mime_type: str = "audio/wav") -> str:
     response = client.models.generate_content(
         model=model_name,
         contents=[
             prompt,
-            types.Part.from_bytes(data=audio_data, mime_type="audio/wav"),
+            types.Part.from_bytes(data=audio_data, mime_type=mime_type or "audio/wav"),
         ],
     )
     text = getattr(response, "text", "") or ""

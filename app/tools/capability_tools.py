@@ -9,9 +9,11 @@ def request_capability(category: str, intent: str, details: str = "") -> str:
     必要な能力カテゴリをシステムに要求します。
 
     category: 使用したい能力カテゴリ。
-      world, memory, notes, web, image, time, autonomy, music, watchlist, items,
-      chess, developer, roblox, twitter, discord, custom のいずれか。
+      world, memory, notes, creative, research, working_memory, web, image, time,
+      autonomy, music, watchlist, items, chess, developer, roblox, twitter,
+      discord, custom のいずれか。
       場所移動・現在地変更は world を使います（location/place/space 等の別名もworld扱い）。
+      創作ノートは creative、研究ノートは research、Working Memory整理は working_memory を優先します。
     intent: なぜその能力を使いたいか。
     details: 実行したい内容、判断材料、ユーザーに見せたい意図など。
 

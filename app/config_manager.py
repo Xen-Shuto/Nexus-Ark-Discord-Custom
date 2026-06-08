@@ -10,6 +10,7 @@ import shutil
 import datetime 
 
 import constants
+import requests
 
 # --- グローバル変数 ---
 CONFIG_GLOBAL = {}
@@ -73,6 +74,9 @@ TTS_PROVIDERS = {
     "openai": "OpenAI公式",
     "openai_compatible": "OpenAI互換プロファイル",
     "elevenlabs": "ElevenLabs",
+    "aivisspeech": "AivisSpeech (ローカル)",
+    "voicevox": "VOICEVOX (ローカル)",
+    "coeiroink": "COEIROINK (ローカル)",
 }
 
 TTS_MODELS = {
@@ -83,12 +87,37 @@ TTS_MODELS = {
     ],
     "openai": ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"],
     "openai_compatible": [
+        "kokoro",
+        "piper",
+        "chatterbox",
+        "fish-speech",
         "canopylabs/orpheus-v1-english",
         "canopylabs/orpheus-arabic-saudi",
-        "xai.grok-tts",
+        "xai/grok-tts",
     ],
     "elevenlabs": ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_v3"],
+    # VOICEVOX互換系は「TTSモデル」欄をエンジンURLとして使う。
+    # AivisSpeech Engineは概ねVOICEVOX互換APIで、既定ポートは10101。
+    "aivisspeech": ["http://127.0.0.1:10101"],
+    "voicevox": ["http://127.0.0.1:50021"],
+    "coeiroink": ["http://127.0.0.1:50032"],
 }
+
+OPENAI_COMPATIBLE_CUSTOM_TTS_MODELS = [
+    "kokoro",
+    "piper",
+    "chatterbox",
+    "fish-speech",
+]
+
+XAI_TTS_MODELS = ["xai/grok-tts"]
+
+GROQ_TTS_MODELS = [
+    "canopylabs/orpheus-v1-english",
+    "canopylabs/orpheus-arabic-saudi",
+    "playai-tts",
+    "playai-tts-arabic",
+]
 
 OPENAI_TTS_VOICES = {
     "alloy": "Alloy",
@@ -121,9 +150,95 @@ OPENAI_COMPATIBLE_TTS_VOICES = {
     "sal": "Sal (xAI/Grok)",
 }
 
+XAI_TTS_VOICES = {
+    "eve": "Eve (xAI/Grok)",
+    "ara": "Ara (xAI/Grok)",
+    "rex": "Rex (xAI/Grok)",
+    "sal": "Sal (xAI/Grok)",
+    "leo": "Leo (xAI/Grok)",
+}
+
+GROQ_ORPHEUS_ENGLISH_TTS_VOICES = {
+    "autumn": "Autumn (Groq Orpheus)",
+    "diana": "Diana (Groq Orpheus)",
+    "hannah": "Hannah (Groq Orpheus)",
+    "austin": "Austin (Groq Orpheus)",
+    "daniel": "Daniel (Groq Orpheus)",
+    "troy": "Troy (Groq Orpheus)",
+}
+
+GROQ_ORPHEUS_ARABIC_TTS_VOICES = {
+    "abdullah": "Abdullah (Groq Orpheus Arabic)",
+    "fahad": "Fahad (Groq Orpheus Arabic)",
+    "sultan": "Sultan (Groq Orpheus Arabic)",
+    "lulwa": "Lulwa (Groq Orpheus Arabic)",
+    "noura": "Noura (Groq Orpheus Arabic)",
+    "aisha": "Aisha (Groq Orpheus Arabic)",
+}
+
+GROQ_PLAYAI_TTS_VOICES = {
+    "Aaliyah-PlayAI": "Aaliyah (Groq PlayAI)",
+    "Adelaide-PlayAI": "Adelaide (Groq PlayAI)",
+    "Angelo-PlayAI": "Angelo (Groq PlayAI)",
+    "Arista-PlayAI": "Arista (Groq PlayAI)",
+    "Atlas-PlayAI": "Atlas (Groq PlayAI)",
+    "Basil-PlayAI": "Basil (Groq PlayAI)",
+    "Briggs-PlayAI": "Briggs (Groq PlayAI)",
+    "Calum-PlayAI": "Calum (Groq PlayAI)",
+    "Celeste-PlayAI": "Celeste (Groq PlayAI)",
+    "Cheyenne-PlayAI": "Cheyenne (Groq PlayAI)",
+    "Chip-PlayAI": "Chip (Groq PlayAI)",
+    "Cillian-PlayAI": "Cillian (Groq PlayAI)",
+    "Deedee-PlayAI": "Deedee (Groq PlayAI)",
+    "Eleanor-PlayAI": "Eleanor (Groq PlayAI)",
+    "Fritz-PlayAI": "Fritz (Groq PlayAI)",
+    "Gail-PlayAI": "Gail (Groq PlayAI)",
+    "Indigo-PlayAI": "Indigo (Groq PlayAI)",
+    "Jennifer-PlayAI": "Jennifer (Groq PlayAI)",
+    "Judy-PlayAI": "Judy (Groq PlayAI)",
+    "Mamaw-PlayAI": "Mamaw (Groq PlayAI)",
+    "Mason-PlayAI": "Mason (Groq PlayAI)",
+    "Mikail-PlayAI": "Mikail (Groq PlayAI)",
+    "Mitch-PlayAI": "Mitch (Groq PlayAI)",
+    "Nia-PlayAI": "Nia (Groq PlayAI)",
+    "Quinn-PlayAI": "Quinn (Groq PlayAI)",
+    "Ruby-PlayAI": "Ruby (Groq PlayAI)",
+    "Thunder-PlayAI": "Thunder (Groq PlayAI)",
+}
+
 ELEVENLABS_TTS_VOICES = {
     "JBFqnCBsd6RMkjVDRZzb": "George (ElevenLabs)",
     "21m00Tcm4TlvDq8ikWAM": "Rachel (ElevenLabs)",
+}
+
+VOICEVOX_COMPATIBLE_AUTO_VOICES = {
+    "auto": "自動（エンジンの最初の話者）",
+}
+
+VOICEVOX_TTS_VOICES = {
+    **VOICEVOX_COMPATIBLE_AUTO_VOICES,
+    "3": "ずんだもん ノーマル (VOICEVOX)",
+    "2": "四国めたん ノーマル (VOICEVOX)",
+    "8": "春日部つむぎ ノーマル (VOICEVOX)",
+    "10": "雨晴はう ノーマル (VOICEVOX)",
+    "9": "波音リツ ノーマル (VOICEVOX)",
+    "11": "玄野武宏 ノーマル (VOICEVOX)",
+    "12": "白上虎太郎 ノーマル (VOICEVOX)",
+    "13": "青山龍星 ノーマル (VOICEVOX)",
+    "14": "冥鳴ひまり ノーマル (VOICEVOX)",
+    "16": "九州そら ノーマル (VOICEVOX)",
+    "20": "もち子さん ノーマル (VOICEVOX)",
+    "21": "剣崎雌雄 ノーマル (VOICEVOX)",
+    "23": "WhiteCUL ノーマル (VOICEVOX)",
+    "27": "後鬼 ノーマル (VOICEVOX)",
+    "29": "No.7 ノーマル (VOICEVOX)",
+    "36": "小夜/SAYO ノーマル (VOICEVOX)",
+    "37": "ナースロボ＿タイプＴ ノーマル (VOICEVOX)",
+}
+
+COEIROINK_TTS_VOICES = {
+    **VOICEVOX_COMPATIBLE_AUTO_VOICES,
+    "0": "つくよみちゃん (COEIROINK)",
 }
 
 
@@ -142,6 +257,7 @@ def tts_provider_display_from_key(value: Any) -> str:
 
 
 def get_tts_model_choices(provider: Any) -> List[str]:
+    """TTSモデルの選択肢を返す。OpenAI互換プロファイルの場合も共通のTTSモデルリストを返す。"""
     return TTS_MODELS.get(tts_provider_key_from_display(provider), TTS_MODELS["gemini"])
 
 
@@ -153,11 +269,248 @@ def get_tts_voice_map(provider: Any) -> Dict[str, str]:
         return OPENAI_COMPATIBLE_TTS_VOICES
     if provider_key == "elevenlabs":
         return ELEVENLABS_TTS_VOICES
+    
+    # ローカルTTSプロバイダで、キャッシュがある場合はキャッシュをマージして返す
+    if provider_key in {"voicevox", "aivisspeech", "coeiroink"}:
+        cached = CONFIG_GLOBAL.get("tts_speakers_cache", {}).get(provider_key)
+        if cached and isinstance(cached, dict):
+            res = {**VOICEVOX_COMPATIBLE_AUTO_VOICES}
+            res.update({str(k): str(v) for k, v in cached.items()})
+            return res
+        
+        # キャッシュがない場合のフォールバック
+        if provider_key in {"voicevox", "aivisspeech"}:
+            return VOICEVOX_TTS_VOICES
+        if provider_key == "coeiroink":
+            return COEIROINK_TTS_VOICES
+            
     return SUPPORTED_VOICES
+
+
+def save_tts_speakers_cache(provider: str, speakers_map: Dict[str, str]) -> bool:
+    """
+    指定されたプロバイダの話者リストキャッシュをconfig.jsonに保存し、CONFIG_GLOBALも更新する。
+    """
+    provider_key = tts_provider_key_from_display(provider)
+    config = load_config_file()
+    if "tts_speakers_cache" not in config or not isinstance(config["tts_speakers_cache"], dict):
+        config["tts_speakers_cache"] = {}
+    
+    # 文字列変換を保証して保存
+    config["tts_speakers_cache"][provider_key] = {str(k): str(v) for k, v in speakers_map.items()}
+    
+    # CONFIG_GLOBAL を更新して即時反映させる
+    if "tts_speakers_cache" not in CONFIG_GLOBAL or not isinstance(CONFIG_GLOBAL["tts_speakers_cache"], dict):
+        CONFIG_GLOBAL["tts_speakers_cache"] = {}
+    CONFIG_GLOBAL["tts_speakers_cache"][provider_key] = config["tts_speakers_cache"][provider_key]
+    
+    return save_config_if_changed("tts_speakers_cache", CONFIG_GLOBAL["tts_speakers_cache"])
 
 
 def get_tts_voice_choices(provider: Any) -> List[str]:
     return list(get_tts_voice_map(provider).values())
+
+
+def _resolve_openai_profile_base_url(profile_name: Any = None, base_url: Any = None) -> str:
+    resolved_base_url = str(base_url or "").strip().lower()
+    if not resolved_base_url and profile_name:
+        setting = get_openai_setting_by_name(str(profile_name))
+        resolved_base_url = str((setting or {}).get("base_url") or "").strip().lower()
+    return resolved_base_url
+
+
+def get_openai_profile_tts_kind(profile_name: Any = None, base_url: Any = None) -> str:
+    resolved_base_url = _resolve_openai_profile_base_url(profile_name, base_url)
+    if "api.x.ai" in resolved_base_url:
+        return "xai"
+    if "api.groq.com" in resolved_base_url:
+        return "groq"
+    if "api.openai.com" in resolved_base_url:
+        return "openai"
+    if "openrouter.ai" in resolved_base_url:
+        return "no_tts"
+    if "text.pollinations.ai" in resolved_base_url:
+        return "no_tts"
+    if "router.huggingface.co" in resolved_base_url:
+        return "no_tts"
+    if "integrate.api.nvidia.com" in resolved_base_url:
+        return "no_tts"
+    if "localhost:11434" in resolved_base_url or "127.0.0.1:11434" in resolved_base_url:
+        return "no_tts"
+    return "custom"
+
+
+def is_xai_openai_profile(profile_name: Any = None, base_url: Any = None) -> bool:
+    return get_openai_profile_tts_kind(profile_name, base_url) == "xai"
+
+
+def get_openai_compatible_tts_model_choices_for_profile(profile_name: Any = None, base_url: Any = None) -> List[str]:
+    if profile_name:
+        setting = get_openai_setting_by_name(str(profile_name))
+        current_base_url = _resolve_openai_profile_base_url(profile_name, base_url)
+        cached_models = (setting or {}).get("tts_available_models")
+        cached_base_url = str((setting or {}).get("tts_cache_base_url") or "").strip().lower()
+        if isinstance(cached_models, list) and cached_models and cached_base_url == current_base_url:
+            return [str(model) for model in cached_models if model]
+    kind = get_openai_profile_tts_kind(profile_name, base_url)
+    if kind == "xai":
+        return list(XAI_TTS_MODELS)
+    if kind == "groq":
+        return list(GROQ_TTS_MODELS)
+    if kind == "openai":
+        return list(TTS_MODELS["openai"])
+    if kind == "no_tts":
+        return []
+    return list(OPENAI_COMPATIBLE_CUSTOM_TTS_MODELS)
+
+
+def _normalize_tts_model_for_matching(model_name: Any) -> str:
+    return str(model_name or "").strip().lower()
+
+
+def get_openai_compatible_tts_voice_map_for_profile(
+    profile_name: Any = None,
+    base_url: Any = None,
+    model_name: Any = None,
+) -> Dict[str, str]:
+    if profile_name:
+        setting = get_openai_setting_by_name(str(profile_name))
+        current_base_url = _resolve_openai_profile_base_url(profile_name, base_url)
+        cached_voice_map = (setting or {}).get("tts_voice_cache", {})
+        cached_base_url = str((setting or {}).get("tts_cache_base_url") or "").strip().lower()
+        model_key = str(model_name or "").strip()
+        if isinstance(cached_voice_map, dict) and cached_base_url == current_base_url:
+            cached_for_model = cached_voice_map.get(model_key) or cached_voice_map.get("*")
+            if isinstance(cached_for_model, dict) and cached_for_model:
+                return {str(k): str(v) for k, v in cached_for_model.items()}
+
+    kind = get_openai_profile_tts_kind(profile_name, base_url)
+    if kind == "xai":
+        return XAI_TTS_VOICES
+    if kind == "groq":
+        model_key = _normalize_tts_model_for_matching(model_name)
+        if "arabic" in model_key:
+            return GROQ_ORPHEUS_ARABIC_TTS_VOICES
+        if "orpheus" in model_key:
+            return GROQ_ORPHEUS_ENGLISH_TTS_VOICES
+        if "playai" in model_key:
+            return GROQ_PLAYAI_TTS_VOICES
+        return GROQ_ORPHEUS_ENGLISH_TTS_VOICES
+    if kind == "openai":
+        return OPENAI_TTS_VOICES
+    if kind == "no_tts":
+        return {}
+    return OPENAI_COMPATIBLE_TTS_VOICES
+
+
+def get_openai_compatible_tts_voice_choices_for_profile(
+    profile_name: Any = None,
+    base_url: Any = None,
+    model_name: Any = None,
+) -> List[str]:
+    return list(get_openai_compatible_tts_voice_map_for_profile(profile_name, base_url, model_name).values())
+
+
+def _filter_tts_models_from_model_list(models: List[str]) -> List[str]:
+    keywords = ("tts", "speech", "audio", "orpheus", "playai", "kokoro", "piper", "chatterbox", "fish")
+    result = []
+    for model in models or []:
+        model_str = str(model)
+        if any(keyword in model_str.lower() for keyword in keywords):
+            result.append(model_str)
+    return result
+
+
+def _parse_tts_voice_response(data: Any) -> Dict[str, str]:
+    if isinstance(data, dict):
+        raw_voices = data.get("voices") or data.get("data") or data.get("items") or []
+    elif isinstance(data, list):
+        raw_voices = data
+    else:
+        raw_voices = []
+
+    voices = {}
+    for item in raw_voices:
+        if isinstance(item, str):
+            voices[item] = item
+            continue
+        if not isinstance(item, dict):
+            continue
+        voice_id = item.get("voice_id") or item.get("id") or item.get("name")
+        if not voice_id:
+            continue
+        label = item.get("name") or item.get("display_name") or item.get("label") or voice_id
+        voices[str(voice_id)] = str(label)
+    return voices
+
+
+def _fetch_xai_tts_voices(base_url: str, api_key: str) -> Dict[str, str]:
+    if not api_key:
+        return {}
+    try:
+        url = base_url.rstrip("/") + "/tts/voices"
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            print(f"[config_manager] xAI TTS声リスト取得失敗: Status={response.status_code}, Body={response.text[:300]}")
+            return {}
+        return _parse_tts_voice_response(response.json())
+    except Exception as e:
+        print(f"[config_manager] xAI TTS声リスト取得エラー: {e}")
+        return {}
+
+
+def fetch_openai_compatible_tts_capabilities(profile_name: str, base_url: str, api_key: str = "") -> Dict[str, Any]:
+    """OpenAI互換プロファイルのTTSモデル/声候補を取得する。取得不可の場合は既知候補へフォールバックする。"""
+    kind = get_openai_profile_tts_kind(profile_name, base_url)
+    model_choices = get_openai_compatible_tts_model_choices_for_profile(None, base_url)
+    voice_cache: Dict[str, Dict[str, str]] = {}
+
+    if kind == "no_tts":
+        return {"kind": kind, "models": [], "voice_cache": {}, "fetched": False}
+
+    if kind in {"groq", "custom", "openai"}:
+        fetched_models = fetch_models_from_api(base_url, api_key)
+        filtered_models = _filter_tts_models_from_model_list(fetched_models)
+        if kind == "openai":
+            model_choices = filtered_models or list(TTS_MODELS["openai"])
+        elif kind == "groq":
+            model_choices = filtered_models or list(GROQ_TTS_MODELS)
+        else:
+            model_choices = filtered_models or list(OPENAI_COMPATIBLE_CUSTOM_TTS_MODELS)
+
+    if kind == "xai":
+        model_choices = list(XAI_TTS_MODELS)
+        voices = _fetch_xai_tts_voices(base_url, api_key) or dict(XAI_TTS_VOICES)
+        voice_cache["*"] = voices
+    else:
+        for model in model_choices:
+            voice_cache[model] = get_openai_compatible_tts_voice_map_for_profile(None, base_url, model)
+
+    return {
+        "kind": kind,
+        "models": model_choices,
+        "voice_cache": voice_cache,
+        "fetched": True,
+    }
+
+
+def save_openai_profile_tts_cache(profile_name: str, models: List[str], voice_cache: Dict[str, Dict[str, str]]) -> bool:
+    settings_list = get_openai_settings_list()
+    changed = False
+    for setting in settings_list:
+        if setting.get("name") == profile_name:
+            setting["tts_available_models"] = list(models or [])
+            setting["tts_voice_cache"] = voice_cache or {}
+            setting["tts_cache_base_url"] = str(setting.get("base_url") or "").strip().lower()
+            changed = True
+            break
+    if changed:
+        save_openai_settings_list(settings_list)
+    return changed
 
 
 def resolve_tts_voice_id(provider: Any, voice_value: Any) -> Optional[str]:
@@ -1058,6 +1411,16 @@ def load_config():
             "pollinations": ["flux", "zimage", "klein", "gptimage", "kontext", "wan-image", "qwen-image"],
             "huggingface": ["black-forest-labs/FLUX.1-schnell", "stabilityai/stable-diffusion-xl-base-1.0"]
         }, 
+        # --- ローカルSD WebUI ---
+        "image_generation_local_settings": {
+            "url": "http://127.0.0.1:7861/sdapi/v1/txt2img",
+            "sampler": "Euler a",
+            "steps": 20,
+            "cfg_scale": 7.0,
+            "positive_prefix": "",
+            "positive_append": "",
+            "negative_prompt": ""
+        }, 
         # --- ユーザー用画像生成プロンプト補助 ---
         "user_image_gen_instruction_templates": [
             {
@@ -1146,7 +1509,31 @@ def load_config():
         "line_channel_access_token": "",
         "line_channel_secret": "",
         "line_authorized_user_ids": [],
-        "line_bot_linked_room": None
+        "line_bot_linked_room": None,
+        "api_gateway_settings": {
+            "enabled": False,
+            "host": "0.0.0.0",
+            "port": 8000,
+            "require_auth": True,
+            "auth_token": "",
+            "auto_start_tailscale_serve": False,
+            "rate_limit_enabled": True,
+            "rate_limit_window_seconds": 60,
+            "rate_limit_general_per_minute": 240,
+            "rate_limit_events_per_minute": 60,
+            "rate_limit_heavy_per_minute": 30,
+            "audit_enabled": True,
+            "event_notification_default_cooldown_seconds": 300,
+            "event_notification_cooldowns": {},
+            "response_notification_preview_enabled": True
+        },
+        "weather_settings": {
+            "city_name": "",
+            "latitude": None,
+            "longitude": None,
+            "enable_persona_context": False,
+            "enable_scenery_reflection": False
+        }
     }
 
     # ステップ2：ユーザーの設定ファイルを読み込む
@@ -1254,6 +1641,7 @@ def load_config():
     # ステップ5：ユーザー設定を優先しつつ、不足キーを補完
     config = default_config.copy()
     config.update(user_config)
+    missing_default_keys = [key for key in default_config.keys() if key not in user_config]
     legacy_notification_service = config.get("notification_service", "discord")
     if "alarm_notification_service" not in user_config:
         config["alarm_notification_service"] = legacy_notification_service
@@ -1300,6 +1688,7 @@ def load_config():
 
     # ステップ7：キー構成の変化、またはモデルリスト/テーマ設定の変化があった場合のみファイルを更新
     if (config_keys_changed or
+        bool(missing_default_keys) or
         set(user_config.get("available_models", [])) != set(config["available_models"]) or
         user_config.get("theme_settings") != config["theme_settings"] or # テーマ設定の変更もチェック
         not os.path.exists(constants.CONFIG_FILE)):
@@ -1493,6 +1882,14 @@ def get_effective_settings(room_name: str, **kwargs) -> dict:
                     and not (room_provider is None and k in ROOM_AI_PROVIDER_SETTING_KEYS)
                 ):
                     effective_settings[k] = v
+            
+            # プロバイダ固有のTTS設定キャッシュをマージする
+            current_tts_provider = override_settings.get("tts_provider", effective_settings.get("tts_provider", "gemini"))
+            provider_cache = override_settings.get("tts_provider_settings", {}).get(current_tts_provider, {})
+            for pk, pv in provider_cache.items():
+                if pv is not None:
+                    effective_settings[pk] = pv
+
             # ルーム個別のモデル設定を一時保存（後のロジックで使用）
             room_model_name = override_settings.get("model_name")
             room_zhipu_model = override_settings.get("zhipu_model")
@@ -2320,6 +2717,8 @@ def get_effective_internal_model(role: str) -> Tuple[str, str, str]:
     
 
 # --- APIキーローテーション関連 ---
+
+
 def is_key_exhausted(key_name: str, model_name: str = None) -> bool:
     """
     指定されたキー（および必要に応じて特定のモデル）が現在枯渇状態かどうかを返す。
@@ -2858,6 +3257,51 @@ def save_line_bot_settings(enabled: bool = None, token: str = None, secret: str 
     
     _save_config_file(CONFIG_GLOBAL)
     load_config() # グローバル変数を再反映
+
+
+def save_api_gateway_settings(
+    enabled: bool = None,
+    host: str = None,
+    port: int = None,
+    require_auth: bool = None,
+    auth_token: str = None,
+    auto_start_tailscale_serve: bool = None,
+) -> bool:
+    """REST API Gatewayの設定を保存する。"""
+    settings = {
+        "enabled": False,
+        "host": "0.0.0.0",
+        "port": 8000,
+        "require_auth": True,
+        "auth_token": "",
+        "auto_start_tailscale_serve": False,
+        "rate_limit_enabled": True,
+        "rate_limit_window_seconds": 60,
+        "rate_limit_general_per_minute": 240,
+        "rate_limit_events_per_minute": 60,
+        "rate_limit_heavy_per_minute": 30,
+        "audit_enabled": True,
+        "event_notification_default_cooldown_seconds": 300,
+        "event_notification_cooldowns": {},
+        "response_notification_preview_enabled": True,
+    }
+    settings.update(CONFIG_GLOBAL.get("api_gateway_settings", {}) or {})
+
+    if enabled is not None:
+        settings["enabled"] = bool(enabled)
+    if host is not None:
+        settings["host"] = (host or "").strip() or "0.0.0.0"
+    if port is not None:
+        settings["port"] = int(port or 8000)
+    if require_auth is not None:
+        settings["require_auth"] = bool(require_auth)
+    if auth_token is not None:
+        settings["auth_token"] = (auth_token or "").strip()
+    if auto_start_tailscale_serve is not None:
+        settings["auto_start_tailscale_serve"] = bool(auto_start_tailscale_serve)
+
+    return bool(save_config_if_changed("api_gateway_settings", settings))
+
 
 def is_image_generation_model(model_name: str) -> bool:
     """指定されたモデル名が画像生成用（Imagen等）であるか判定する"""

@@ -1,60 +1,64 @@
-import sys
 import asyncio
-import traceback
-import logging
-import glob
-import subprocess
-import gc
-import ctypes
-import gradio as gr
-import tempfile
-import shutil
-from send2trash import send2trash
-import psutil
 import ast
+import base64
+import ctypes
+import datetime
+import gc
+import glob
+import hashlib
+import html
+import io
+import json
+import locale
+import logging
+import os
+from pathlib import Path
+import pytz
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import traceback
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+import uuid
+import zipfile
+
+import filetype
+import gradio as gr
+import ijson
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 import pandas as pd
 from pandas import DataFrame
-import json
-import hashlib
-import os
-import html
-import re
-import locale
-import subprocess
-from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Union, Any
-import datetime
-import tempfile
-from typing import List, Optional, Dict, Any, Tuple, Iterator
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
-import gradio as gr
-import datetime
-from PIL import Image
-import threading
-import filetype
+from PIL import Image, ImageOps
+import psutil
+from send2trash import send2trash
+
+import rag_manager
+from tools.image_tools import generate_image as generate_image_tool_func
+from tts_key_rotation import generate_audio_with_key_rotation
+from tts_text_policy import TTS_MODE_SPLIT, prepare_tts_text_plan
+import utils
+from weather_service import WeatherService
 
 # ストップボタン押下時にストリーミングジェネレータを自己停止させるためのフラグ
 # Gradioのcancelsだけではジェネレータが確実に止まらないため、
 # このEventを使ってジェネレータ自身がyieldを停止する
 _stop_generation_event = threading.Event()
-import zipfile
-import base64
-import io
-import uuid
-import base64
-import io
-from pathlib import Path
-import textwrap
-from tools.image_tools import generate_image as generate_image_tool_func
-import pytz
-import ijson
-import time
-import rag_manager
-import utils
 
 # --- [2026-04-09] セッション分離型初期化ガード用の状態管理 ---
 # session_hash -> {"completed": bool, "time": float, "room": str}
 _session_init_states = {}
+
+def _ensure_value_in_choices(choices: list, value) -> list:
+    """valueがchoicesに含まれない場合、先頭に追加したリストを返す。"""
+    if value and value not in choices:
+        return [value] + list(choices)
+    return list(choices)
 
 def _perf_log(label: str, start: float, enabled: bool = True) -> float:
     now = time.perf_counter()
@@ -282,8 +286,15 @@ _initialization_completed = False
 _initialization_completed_time = 0  # 初期化完了時刻
 POST_INIT_GRACE_PERIOD_SECONDS = 15  # 初期化完了後も15秒間は自動保存を抑制
 
+# ルーム切り替え時の通知抑制用
+_last_room_switch_time = 0
+ROOM_SWITCH_GRACE_PERIOD_SECONDS = 5.0 # ルーム切り替え後の「余震」による保存通知を抑制する時間
+
 # --- トークン数記録用 ---
 _LAST_ACTUAL_TOKENS = {} # room_name -> {"prompt": int, "completion": int, "total": int}
+
+# --- 音声再生キャッシュ用 ---
+_tts_audio_cache = {} # (text_hash, room_name, provider, voice_id) -> filepath
 
 def _settings_status_message(scope: str, label: str, result: Any, restart_required: bool = False) -> str:
     """設定保存状態を、トーストではなくUI上に出す短い文言へ整形する。"""
@@ -297,10 +308,12 @@ def _settings_status_message(scope: str, label: str, result: Any, restart_requir
 
 def _should_skip_auto_settings_save(is_switching_room: bool = False) -> bool:
     """起動直後・ルーム切替中のUI同期イベントによる誤保存を防ぐ。"""
+    now = time.time()
     return (
         not _initialization_completed
         or is_switching_room
-        or (time.time() - _initialization_completed_time) < POST_INIT_GRACE_PERIOD_SECONDS
+        or (now - _initialization_completed_time) < POST_INIT_GRACE_PERIOD_SECONDS
+        or (now - _last_room_switch_time) < ROOM_SWITCH_GRACE_PERIOD_SECONDS
     )
 
 def handle_save_global_setting_delta(
@@ -367,6 +380,7 @@ _ROOM_SETTING_LABELS = {
     "enable_api_key_rotation": "APIキーローテーション",
     "auto_summary_enabled": "Auto Summary",
     "auto_summary_threshold": "Auto Summary 閾値",
+    "tts_profile_name": "TTSプロファイル",
 }
 
 _SAFETY_VALUE_MAP = {
@@ -419,6 +433,8 @@ def _convert_room_setting_delta(field: str, value: Any) -> Tuple[str, Any, str]:
         value = int(value)
     elif field == "model_name":
         value = value or None
+    elif field == "tts_profile_name":
+        value = value or None
     elif isinstance(value, bool):
         value = bool(value)
     label = _ROOM_SETTING_LABELS.get(field, field)
@@ -433,7 +449,46 @@ def handle_save_room_setting_delta(room_name: str, field: str, value: Any, is_sw
         return "個別設定: ルームが選択されていません"
     try:
         key, converted, label = _convert_room_setting_delta(field, value)
-        if key == "display_thoughts" and converted is False:
+        
+        # tts_provider_settings への同期（バックアップ）のロジック
+        tts_fields = {
+            "tts_model", "tts_voice", "voice_style_prompt",
+            "tts_voice_speed", "tts_voice_pitch", "tts_voice_intonation", "tts_voice_volume",
+            "tts_profile_name"
+        }
+        
+        if key in tts_fields:
+            # 現在のアクティブなプロバイダを取得
+            effective = config_manager.get_effective_settings(room_name)
+            current_provider = effective.get("tts_provider", "gemini")
+            
+            # tts_provider_settings 内の辞書を更新
+            room_config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
+            if os.path.exists(room_config_path):
+                try:
+                    with open(room_config_path, "r", encoding="utf-8") as f:
+                        room_config = json.load(f)
+                    overrides = room_config.get("override_settings", {})
+                except Exception:
+                    overrides = {}
+            else:
+                overrides = {}
+                
+            provider_settings = overrides.get("tts_provider_settings", {})
+            if current_provider not in provider_settings:
+                provider_settings[current_provider] = {}
+                
+            # プロバイダ用のキャッシュに値を書き込む
+            provider_settings[current_provider][key] = converted
+            
+            # 一緒に保存するupdates辞書を組み立てる
+            updates = {
+                key: converted,
+                "tts_provider_settings": provider_settings
+            }
+            
+            result = room_manager.update_room_config(room_name, {"override_settings": updates})
+        elif key == "display_thoughts" and converted is False:
             result = room_manager.update_room_config(room_name, {"display_thoughts": False, "send_thoughts": False})
         elif key == "provider" and converted is None:
             # 共通設定へ戻す時も、個別AI設定の選択値は編集用ドラフトとして保持する。
@@ -441,6 +496,7 @@ def handle_save_room_setting_delta(room_name: str, field: str, value: Any, is_sw
             result = room_manager.update_room_override_key(room_name, "provider", None)
         else:
             result = room_manager.update_room_override_key(room_name, key, converted)
+            
         status = _settings_status_message(room_name, label, result)
         if result is False:
             gr.Error(status)
@@ -1389,6 +1445,7 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
 
     effective_settings = config_manager.get_effective_settings(room_name)
     t_step = _perf_log("_update_chat_tab_for_room_change: config_manager.get_effective_settings", t_step)
+    profile_choices = [s["name"] for s in config_manager.get_openai_settings_list()]
 
     # 履歴取得設定
     limit_key = effective_settings.get("api_history_limit", "all")
@@ -1451,9 +1508,15 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
             gr.update(),  # location_dropdown - 空choicesでvalueを設定するとエラーになるため更新をスキップ
             "（APIキーが設定されていません）", # current_scenery_display
             config_manager.tts_provider_display_from_key(effective_settings.get("tts_provider", "gemini")), # room_tts_provider_dropdown
+            gr.update(choices=profile_choices, value=None, visible=False),  # room_tts_profile_dropdown
             gr.update(choices=config_manager.get_tts_model_choices(effective_settings.get("tts_provider", "gemini")), value=effective_settings.get("tts_model", "gemini-3.1-flash-tts-preview")), # room_tts_model_dropdown
             gr.update(choices=config_manager.get_tts_voice_choices(effective_settings.get("tts_provider", "gemini")), value=config_manager.tts_voice_display_from_id(effective_settings.get("tts_provider", "gemini"), effective_settings.get("tts_voice", effective_settings.get("voice_id", "iapetus")))), # voice_dropdown
-            effective_settings.get("tts_style_prompt", effective_settings.get("voice_style_prompt", "")), True, 0.01,  # voice_style_prompt, enable_typewriter, streaming_speed
+            effective_settings.get("tts_style_prompt", effective_settings.get("voice_style_prompt", "")),
+            effective_settings.get("tts_voice_speed", 1.0),
+            effective_settings.get("tts_voice_pitch", 0.0),
+            effective_settings.get("tts_voice_intonation", 1.0),
+            effective_settings.get("tts_voice_volume", 1.0),
+            True, 0.01,  # voice_style_prompt, speed, pitch, intonation, volume, enable_typewriter, streaming_speed
             0.8, 0.95, "高リスクのみブロック", "高リスクのみブロック", "高リスクのみブロック", "高リスクのみブロック",
             display_thoughts_val, # Use loaded setting
             False, # send_thoughts
@@ -1585,39 +1648,6 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
             "", # scenery
             gr.update(choices=[], value=None), # saved_locations
             None, # image_path
-            # --- Twitter連携同期 ---
-            gr.update(value=False),
-            gr.update(value="browser"),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=False),
-            gr.update(value=False),
-            gr.update(value=False),
-            gr.update(value=False),
-            gr.update(value=True),
-            gr.update(value=False),
-            gr.update(value=3),
-            # --- Discord Bot同期 ---
-            gr.update(value=False),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=False),
-            gr.update(value=""),
-            gr.update(value=False),
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(value=False),
-            gr.update(value=True),
-            gr.update(value=10),
-            gr.update(value=""),
-            gr.update(value=""),
-            # -----------------------
             gr.update(selected="virtual_location_tab") # tabs
         )
 
@@ -1699,11 +1729,29 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
 
     tts_provider_key = config_manager.tts_provider_key_from_display(effective_settings.get("tts_provider", "gemini"))
     tts_provider_display = config_manager.tts_provider_display_from_key(tts_provider_key)
-    tts_model_val = effective_settings.get("tts_model") or (config_manager.get_tts_model_choices(tts_provider_key)[0] if config_manager.get_tts_model_choices(tts_provider_key) else "")
-    voice_display_name = config_manager.tts_voice_display_from_id(
-        tts_provider_key,
-        effective_settings.get("tts_voice", effective_settings.get("voice_id", "iapetus"))
-    )
+    tts_profile_for_voice = effective_settings.get("tts_profile_name")
+    if not tts_profile_for_voice and profile_choices:
+        tts_profile_for_voice = profile_choices[0]
+    if tts_provider_key == "openai_compatible":
+        room_model_choices = config_manager.get_openai_compatible_tts_model_choices_for_profile(tts_profile_for_voice)
+    else:
+        room_model_choices = config_manager.get_tts_model_choices(tts_provider_key)
+    tts_model_val = effective_settings.get("tts_model") or (room_model_choices[0] if room_model_choices else None)
+    if room_model_choices and tts_model_val not in room_model_choices:
+        tts_model_val = room_model_choices[0]
+    elif not room_model_choices and tts_provider_key == "openai_compatible":
+        tts_model_val = None
+    if tts_provider_key == "openai_compatible":
+        room_voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(tts_profile_for_voice, model_name=tts_model_val)
+        voice_id_for_display = effective_settings.get("tts_voice", effective_settings.get("voice_id", "iapetus"))
+        voice_display_name = room_voice_map.get(voice_id_for_display) or next(iter(room_voice_map.values()), "")
+        room_voice_choices = list(room_voice_map.values())
+    else:
+        voice_display_name = config_manager.tts_voice_display_from_id(
+            tts_provider_key,
+            effective_settings.get("tts_voice", effective_settings.get("voice_id", "iapetus"))
+        )
+        room_voice_choices = config_manager.get_tts_voice_choices(tts_provider_key)
     voice_style_prompt_val = effective_settings.get("tts_style_prompt", effective_settings.get("voice_style_prompt", ""))
     safety_display_map = {
         "BLOCK_NONE": "ブロックしない", "BLOCK_LOW_AND_ABOVE": "低リスク以上をブロック",
@@ -1844,20 +1892,47 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
     t_step = _perf_log("_update_chat_tab_for_room_change: get_temp_location_ui_state", t_step)
     _perf_log("_update_chat_tab_for_room_change: total", t0)
 
-    # --- Twitter設定取得 ---
-    tw = effective_settings.get("twitter_settings", {})
-    tw_api = tw.get("api_config", {})
-    
-    # --- Discord設定取得 ---
-    ds = config_manager.get_room_discord_bot_settings(room_name)
-    ds_enabled = ds.get("enabled", False)
-    ds_token = ds.get("token", "")
-    if ds_enabled and ds_token:
-        ds_status = "Botの状態: 🟢 有効（起動中または起動対象）"
-    elif ds_token:
-        ds_status = "Botの状態: ⚪ 無効（Botトークン保存済み・チェックOFF）"
-    else:
-        ds_status = "Botの状態: ⚪ 無効"
+    tts_profile_val = effective_settings.get("tts_profile_name")
+    if not tts_profile_val and profile_choices:
+        tts_profile_val = profile_choices[0]
+
+    # --- 外部連携(Twitter/Discord)のリセット値定義 (不具合修正用) ---
+    # ルーム切替時に前のルームのキーが画面に残るのを防ぐため、明示的にクリア値を返す
+    # Twitter (18項目)
+    ext_resets_twitter = (
+        gr.update(value=False),                 # enabled
+        gr.update(value="api"),                 # auth_mode
+        gr.update(value=""),                    # posting_summary
+        gr.update(value=""),                    # posting_guidelines
+        gr.update(value=False),                 # auto_post
+        gr.update(value=True),                  # approval_for_replies
+        gr.update(value=False),                 # notify_on_approval
+        gr.update(value="", type="password"),   # api_key
+        gr.update(value="", type="password"),   # api_secret
+        gr.update(value="", type="password"),   # access_token
+        gr.update(value="", type="password"),   # access_token_secret
+        gr.update(visible=False),               # browser_auth
+        gr.update(visible=True),                # api_auth
+        gr.update(value=False),                 # is_premium
+        gr.update(value=True),                  # privacy_filter
+        gr.update(value=False),                 # fetch_thread
+        gr.update(value=3),                     # thread_count
+        gr.update(value="Twitter状態: ⚪ 未読み込み（ルーム切替後は安全のため空です）"),
+    )
+    # Discord (11項目)
+    ext_resets_discord = (
+        gr.update(value=False),                 # enabled
+        gr.update(value="", type="password"),   # token
+        gr.update(value=""),                    # auth_ids
+        gr.update(value=""),                    # allowed_channels
+        gr.update(value=""),                    # default_channel
+        gr.update(value=False),                 # mention_only
+        gr.update(value=""),                    # channel_modes
+        gr.update(value=False),                 # allow_autonomous_send
+        gr.update(value="", type="password"),   # persona_webhook
+        gr.update(value=""),                    # approval_ids
+        gr.update(value="Botの状態: ⚪ 未読み込み（下のボタンからロードしてください）")
+    )
 
     return (
         room_name, chat_history, mapping_list,
@@ -1875,9 +1950,14 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
         gr.update(choices=locations_for_ui, value=location_dd_val), # choicesとvalueを同期して返す
         scenery_text,
         tts_provider_display,
-        gr.update(choices=config_manager.get_tts_model_choices(tts_provider_key), value=tts_model_val),
-        gr.update(choices=config_manager.get_tts_voice_choices(tts_provider_key), value=voice_display_name),
+        gr.update(choices=profile_choices, value=tts_profile_val, visible=(tts_provider_key == "openai_compatible")),
+        gr.update(choices=_ensure_value_in_choices(room_model_choices, tts_model_val), value=tts_model_val),
+        gr.update(choices=room_voice_choices, value=voice_display_name),
         voice_style_prompt_val,
+        effective_settings.get("tts_voice_speed", 1.0),
+        effective_settings.get("tts_voice_pitch", 0.0),
+        effective_settings.get("tts_voice_intonation", 1.0),
+        effective_settings.get("tts_voice_volume", 1.0),
         effective_settings["enable_typewriter_effect"],
         effective_settings["streaming_speed"],
         effective_settings.get("temperature", 0.8), effective_settings.get("top_p", 0.95),
@@ -2011,40 +2091,12 @@ def _update_chat_tab_for_room_change(room_name: str, api_key_name: str):
         gr.update(choices=expression_choices, value=None), # expression_target_dropdown
         creative_dropdown_update, # creative_notes_file_dropdown
         research_dropdown_update, # research_notes_file_dropdown
-        # --- [新規] 一時的現在地 UI 同期用 ---
-        *temp_location_state, # scenery, saved_locations, image_path (3要素)
-        # --- Twitter連携同期 ---
-        gr.update(value=tw.get("enabled", False)),
-        gr.update(value=tw.get("auth_mode", "browser")),
-        gr.update(value=tw_api.get("api_key", ""), type="password"),
-        gr.update(value=tw_api.get("api_secret", ""), type="password"),
-        gr.update(value=tw_api.get("access_token", ""), type="password"),
-        gr.update(value=tw_api.get("access_token_secret", ""), type="password"),
-        gr.update(value=tw.get("posting_summary", "")),
-        gr.update(value=tw.get("posting_guidelines", "")),
-        gr.update(value=tw.get("auto_post", False)),
-        gr.update(value=tw.get("approval_required_for_replies", False)),
-        gr.update(value=tw.get("notify_on_approval_request", False)),
-        gr.update(value=tw.get("is_premium", False)),
-        gr.update(value=tw.get("enable_privacy_filter", True)),
-        gr.update(value=tw.get("fetch_thread_enabled", False)),
-        gr.update(value=tw.get("thread_fetch_count", 3)),
-        # --- Discord Bot同期 ---
-        gr.update(value=ds_enabled),
-        gr.update(value=ds_token, type="password"),
-        gr.update(value=", ".join([str(v) for v in ds.get("authorized_user_ids", [])])),
-        gr.update(value=", ".join([str(v) for v in ds.get("allowed_channel_ids", [])])),
-        gr.update(value=ds.get("default_channel_id", "")),
-        gr.update(value=ds.get("mention_only", False)),
-        gr.update(value=_format_discord_channel_response_modes(ds.get("channel_response_modes", {}))),
-        gr.update(value=ds.get("allow_autonomous_send", False)),
-        gr.update(value=ds.get("persona_webhook_url", ""), type="password"),
-        gr.update(value=", ".join([str(v) for v in ds.get("approval_command_allowlist", [])])),
-        gr.update(value=ds.get("voice_input_enabled", False)),
-        gr.update(value=ds.get("voice_input_confirm_transcript", True)),
-        gr.update(value=int(ds.get("voice_input_timeout_minutes", 10) or 10)),
-        gr.update(value=str(ds.get("voice_input_stt_model") or constants.DISCORD_VOICE_STT_MODEL)),
-        gr.update(value=ds_status)
+        # --- [新規] 一時的現在地 UI 同期用 (3要素: scenery, saved_locations, image_path) ---
+        *temp_location_state,
+        # --- 外部連携リセット (Twitter: 18要素) ---
+        *ext_resets_twitter,
+        # --- 外部連携リセット (Discord: 11要素) ---
+        *ext_resets_discord
     )
 
 
@@ -2136,8 +2188,8 @@ def _get_safe_dropdown_update(room_name: str, note_type: str, default_filename: 
         return gr.update()
 
 
-#def handle_initial_load(room_name: str = None, expected_count: int = 211, request: gr.Request = None):
-def handle_initial_load(room_name: str = None, expected_count: int = 241, request: gr.Request = None):
+#def handle_initial_load(room_name: str = None, expected_count: int = 217, request: gr.Request = None):
+def handle_initial_load(room_name: str = None, expected_count: int = 246, request: gr.Request = None):
     """
     【v11: 時間デフォルト対応版】
     UIセッションが開始されるたびに、UIコンポーネントの初期状態を完全に再構築する、唯一の司令塔。
@@ -2185,7 +2237,7 @@ def handle_initial_load(room_name: str = None, expected_count: int = 241, reques
     t_step = _perf_log("handle_initial_load: _get_working_memory_updates", t_step)
 
     # --- 2. 司令塔として、他のハンドラのロジックを呼び出してUI更新値を生成 ---
-    # `_update_chat_tab_for_room_change` は39個の値を返す
+    # `_update_chat_tab_for_room_change` は40個の値を返す
     chat_tab_updates = _update_chat_tab_for_room_change(safe_initial_room, safe_initial_api_key)
     t_step = _perf_log("handle_initial_load: _update_chat_tab_for_room_change", t_step)
 
@@ -2222,10 +2274,8 @@ def handle_initial_load(room_name: str = None, expected_count: int = 241, reques
     custom_scenery_dd_update = gr.update(choices=locations_for_custom_scenery, value=current_location_for_custom_scenery)
     t_step = _perf_log("handle_initial_load: custom scenery location state", t_step)
 
-    time_map_en_to_ja = {"early_morning": "早朝", "morning": "朝", "late_morning": "昼前", "afternoon": "昼下がり", "evening": "夕方", "night": "夜", "midnight": "深夜"}
-    now = datetime.datetime.now()
-    current_time_en = utils.get_time_of_day(now.hour)
-    current_time_ja = time_map_en_to_ja.get(current_time_en, "夜")
+    current_season_ja, current_time_ja = _get_current_time_context_ui_values(safe_initial_room)
+    custom_scenery_season_dd_update = gr.update(value=current_season_ja)
     custom_scenery_time_dd_update = gr.update(value=current_time_ja)
 
     if has_valid_key:
@@ -2343,6 +2393,7 @@ def handle_initial_load(room_name: str = None, expected_count: int = 241, reques
         onboarding_group_update,  # オンボーディングモーダルの表示制御
         *common_settings_updates,
         custom_scenery_dd_update,
+        custom_scenery_season_dd_update,
         custom_scenery_time_dd_update,
         *openai_updates,
         f"最終更新: {memory_index_last_updated}",  # memory_reindex_status
@@ -2484,41 +2535,39 @@ def handle_initial_chat_load(room_name: str = None, request: gr.Request = None):
     t_step = _perf_log("handle_initial_chat_load: room_manager.set_active_room_for_backup", t_step)
     _perf_log("handle_initial_chat_load: total", t0_overall)
 
-    # 設定グループを分解して取得
-    gen_updates, tw_updates, ds_updates = _get_room_settings_fast_updates(safe_initial_room, safe_initial_api_key)
-
     wm_slots_update, wm_content_update, active_wm_label = _get_working_memory_updates(safe_initial_room)
 
-    result = _ensure_output_count((
-        safe_initial_room,
-        chat_history,
-        mapping_list,
-        chat_input_update,
-        profile_image,
-        gr.update(choices=latest_room_list, value=safe_initial_room),
-        location_update,
-        scenery_text,
-        gr.update(value=scenery_image_path) if scenery_image_path else gr.update(value=None),
-        gr.update(value=style_update),
-        token_count_text,
-        gr.update(choices=latest_api_key_choices, value=safe_initial_api_key),
-        safe_initial_api_key,
-        limit_key,
-        gr.update(choices=config_manager.AVAILABLE_MODELS_GLOBAL, value=current_global_model),
-        current_global_model,
-        gr.update(value=display_thoughts_val),
-        gr.update(value=add_timestamp_val),
-        onboarding_guide_update,
-        onboarding_group_update,
-        #*_get_room_settings_fast_updates(safe_initial_room, safe_initial_api_key),
-        *gen_updates,            # 21-85: 一般設定 (58 + 7 = 65項目)
-        get_release_notes(),     # 86: リリースノート
-        active_wm_label,         # 87: WMラベル
-        wm_slots_update,         # 88: WMスロット
-        wm_content_update,       # 89: WMエディタ
-        *tw_updates,             # 90-104: Twitter (15項目)
-        *ds_updates              # 105-119: Discord (15項目)
-    ), 119)
+    result = _ensure_output_count(
+        (
+            safe_initial_room,
+            chat_history,
+            mapping_list,
+            chat_input_update,
+            profile_image,
+            gr.update(choices=latest_room_list, value=safe_initial_room),
+            location_update,
+            scenery_text,
+            gr.update(value=scenery_image_path) if scenery_image_path else gr.update(value=None),
+            gr.update(value=style_update),
+            token_count_text,
+            gr.update(choices=latest_api_key_choices, value=safe_initial_api_key),
+            safe_initial_api_key,
+            limit_key,
+            gr.update(choices=config_manager.AVAILABLE_MODELS_GLOBAL, value=current_global_model),
+            current_global_model,
+            gr.update(value=display_thoughts_val),
+            gr.update(value=add_timestamp_val),
+            onboarding_guide_update,
+            onboarding_group_update,
+            *_get_room_settings_fast_updates(safe_initial_room, safe_initial_api_key),
+            get_release_notes(),
+            active_wm_label,
+            wm_slots_update,
+            wm_content_update
+        ),
+        #86
+        93  # ローカルSD WebUIの７項目追加
+    )
     log_memory_diagnostics(
         "initial_chat_load:end",
         safe_initial_room,
@@ -2526,8 +2575,7 @@ def handle_initial_chat_load(room_name: str = None, request: gr.Request = None):
     )
     return result
 
-#def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
-def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None) -> Tuple[list, list, list]:
+def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None):
     """Fast init用に、自動保存対象の個別設定コンポーネントだけを現在値へ同期する。"""
     effective_settings = config_manager.get_effective_settings(room_name)
     room_config = room_manager.get_room_config(room_name) or {}
@@ -2571,11 +2619,15 @@ def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None) ->
     auto_summary_enabled = bool(effective_settings.get("auto_summary_enabled", False))
     rotation_value = overrides.get("enable_api_key_rotation", None)
 
-    general_settings = [
+    return (
         gr.update(value=config_manager.tts_provider_display_from_key(tts_provider)),
         gr.update(choices=config_manager.get_tts_model_choices(tts_provider), value=tts_model),
         gr.update(choices=config_manager.get_tts_voice_choices(tts_provider), value=voice_name),
         gr.update(value=effective_settings.get("tts_style_prompt", effective_settings.get("voice_style_prompt", ""))),
+        gr.update(value=effective_settings.get("tts_voice_speed", 1.0)),
+        gr.update(value=effective_settings.get("tts_voice_pitch", 0.0)),
+        gr.update(value=effective_settings.get("tts_voice_intonation", 1.0)),
+        gr.update(value=effective_settings.get("tts_voice_volume", 1.0)),
         gr.update(value=effective_settings.get("temperature", 1.0)),
         gr.update(value=effective_settings.get("top_p", 0.95)),
         gr.update(value=safety_label_map.get(effective_settings.get("safety_block_threshold_harassment"), "高リスクのみブロック")),
@@ -2630,6 +2682,7 @@ def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None) ->
         gr.update(value=project.get("root_path", "")),
         gr.update(value=", ".join(project.get("exclude_dirs", []))),
         gr.update(value=", ".join(project.get("exclude_files", []))),
+        # --- ローカルSD WebUI設定 ---
         gr.update(value=local_img_settings.get("url", "")),
         gr.update(value=local_img_settings.get("sampler", "Euler a")),
         gr.update(value=local_img_settings.get("steps", 25)),
@@ -2637,64 +2690,7 @@ def _get_room_settings_fast_updates(room_name: str, api_key_name: str = None) ->
         gr.update(value=local_img_settings.get("positive_prefix", "")),
         gr.update(value=local_img_settings.get("positive_append", "")),
         gr.update(value=local_img_settings.get("negative_prompt", ""))
-    ]
-
-    # --- Twitter設定 ---
-    tw = effective_settings.get("twitter_settings", {})
-    tw_api = tw.get("api_config", {})
-
-    # --- Twitter同期 ---
-    twitter_settings = [
-        gr.update(value=tw.get("enabled", False)),
-        gr.update(value=tw.get("auth_mode", "browser")),
-        gr.update(value=tw_api.get("api_key", ""), type="password"),
-        gr.update(value=tw_api.get("api_secret", ""), type="password"),
-        gr.update(value=tw_api.get("access_token", ""), type="password"),
-        gr.update(value=tw_api.get("access_token_secret", ""), type="password"),
-        gr.update(value=tw.get("posting_summary", "")),
-        gr.update(value=tw.get("posting_guidelines", "")),
-        gr.update(value=tw.get("auto_post", False)),
-        gr.update(value=tw.get("approval_required_for_replies", True)),
-        gr.update(value=tw.get("notify_on_approval_request", False)),
-        gr.update(value=tw.get("is_premium", False)),
-        gr.update(value=tw.get("enable_privacy_filter", True)),
-        gr.update(value=tw.get("fetch_thread_enabled", False)),
-        gr.update(value=tw.get("thread_fetch_count", 3))
-    ]
-
-    # --- Discord設定 ---
-    ds = config_manager.get_room_discord_bot_settings(room_name)
-    ds_enabled = ds.get("enabled", False)
-
-    ds_token = ds.get("token", "")
-    if ds_enabled and ds_token:
-        ds_status = "Botの状態: 🟢 有効（起動中または起動対象）"
-    elif ds_token:
-        ds_status = "Botの状態: ⚪ 無効（Botトークン保存済み・チェックOFF）"
-    else:
-        ds_status = "Botの状態: ⚪ 無効"
-
-    # --- Discord同期 ---
-    discord_settings = [
-        gr.update(value=ds_enabled),
-        gr.update(value=ds_token, type="password"),
-        gr.update(value=", ".join([str(v) for v in ds.get("authorized_user_ids", [])])),
-        gr.update(value=", ".join([str(v) for v in ds.get("allowed_channel_ids", [])])),
-        gr.update(value=ds.get("default_channel_id", "")),
-        gr.update(value=ds.get("mention_only", False)),
-        gr.update(value=_format_discord_channel_response_modes(ds.get("channel_response_modes", {}))),
-        gr.update(value=ds.get("allow_autonomous_send", False)),
-        gr.update(value=ds.get("persona_webhook_url", ""), type="password"),
-        gr.update(value=", ".join([str(v) for v in ds.get("approval_command_allowlist", [])])),
-        gr.update(value=ds.get("voice_input_enabled", False)),
-        gr.update(value=ds.get("voice_input_confirm_transcript", True)),
-        gr.update(value=int(ds.get("voice_input_timeout_minutes", 10) or 10)),
-        gr.update(value=str(ds.get("voice_input_stt_model") or constants.DISCORD_VOICE_STT_MODEL)),
-        gr.update(value=ds_status),
-    ]
-
-    return general_settings, twitter_settings, discord_settings
-
+    )
 
 def handle_initial_scenery_image_load(room_name: str, api_key_name: str = None):
     """Fast init後に、既存の現在地画像だけを軽量に読み込む。"""
@@ -2712,14 +2708,10 @@ def handle_initial_scenery_image_load(room_name: str, api_key_name: str = None):
 
         season_en, time_of_day_en = utils._get_current_time_context(room_name)
         image_path = utils.find_scenery_image(room_name, current_location, season_en, time_of_day_en)
-        return gr.update(value=image_path) if image_path else gr.update(value=None)
+        return gr.update(value=_load_image_for_gradio(image_path)) if image_path else gr.update(value=None)
     except Exception as e:
         print(f"  - [Init] 情景画像の遅延読み込みに失敗: {e}")
         return gr.update(value=None)
-
-# ルーム切り替え時の通知抑制用
-_last_room_switch_time = 0
-ROOM_SWITCH_GRACE_PERIOD_SECONDS = 5.0 # ルーム切り替え後の「余震」による保存通知を抑制する時間
 
 def handle_save_room_settings(
     room_name: str, voice_name: str, voice_style_prompt: str,
@@ -3406,6 +3398,9 @@ def _stream_and_handle_response(
                gr.update(), # [v21] style_injector (16番目)
                translation_cache # [v22] 17番目
         )
+        # 初回送信後は massive な HTML データを再送しないよう update() に戻す
+        current_profile_update = gr.update()
+        style_css_update = gr.update()
 
         # AIごとの応答生成ループ
         all_rooms_in_scene = [soul_vessel_room] + (active_participants or [])
@@ -3900,13 +3895,15 @@ def _stream_and_handle_response(
                                     # 思考ログ部分は一括で追加し、ウェイトを置かない
                                     streamed_text += part
                                     _replace_last_chatbot_message(chatbot_history, "assistant", streamed_text + "▌")
-                                    yield (chatbot_history, mapping_list, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), translation_cache)
+                                    #yield (chatbot_history, mapping_list, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), translation_cache)
+                                    yield (chatbot_history, mapping_list, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_profile_update, gr.update(), translation_cache)
                                 else:
                                     # 通常テキストは1文字ずつタイピング表示
                                     for char in part:
                                         streamed_text += char
                                         _replace_last_chatbot_message(chatbot_history, "assistant", streamed_text + "▌")
-                                        yield (chatbot_history, mapping_list, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), translation_cache)
+                                        #yield (chatbot_history, mapping_list, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), translation_cache)
+                                        yield (chatbot_history, mapping_list, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_profile_update, gr.update(), translation_cache)
                                         time.sleep(streaming_speed)
                             # -----------------------------------
 
@@ -4676,7 +4673,7 @@ def _get_updated_scenery_and_image(room_name: str, api_key_name: str, force_text
             # 以前はここで handle_generate_or_regenerate_scenery_image を呼んでいた
             pass
 
-        return scenery_text, scenery_image_path
+        return scenery_text, _load_image_for_gradio(scenery_image_path)
 
     except Exception as e:
         err_str = str(e).upper()
@@ -4894,7 +4891,7 @@ def handle_save_room_config(folder_name: str, room_name: str, user_display_name:
         traceback.print_exc()
         return gr.update(), gr.update()
 
-def handle_delete_room(confirmed: str, folder_name_to_delete: str, api_key_name: str, current_room_name: str = None, expected_count: int = 178):
+def handle_delete_room(confirmed: str, folder_name_to_delete: str, api_key_name: str, current_room_name: str = None, expected_count: int = 185):
     """
     【v7: 引数順序修正版】
     ルームを削除し、統一契約に従って常に正しい数の戻り値を返す。
@@ -4921,7 +4918,7 @@ def handle_delete_room(confirmed: str, folder_name_to_delete: str, api_key_name:
         if new_room_list:
             new_main_room_folder = new_room_list[0][1]
             # handle_room_change_for_all_tabs を呼び出し、その結果をそのまま返す
-            # 【Fix】expected_count を明示的に渡すことで、もしデフォルト値が古くても不整合を防ぐ
+            # 【Fix】expected_count を明示的に渡すことで、もしデフォルト値が古くても不整合を防群
             return handle_room_change_for_all_tabs(
                 new_main_room_folder, api_key_name, expected_count
             )
@@ -4937,8 +4934,10 @@ def handle_delete_room(confirmed: str, folder_name_to_delete: str, api_key_name:
                 gr.update(), # location_dropdown
                 "（ルームがありません）", # scenery_display
                 config_manager.tts_provider_display_from_key("gemini"),
+                gr.update(visible=False), # room_tts_profile_dropdown
                 gr.update(choices=config_manager.get_tts_model_choices("gemini"), value="gemini-3.1-flash-tts-preview"),
                 gr.update(choices=config_manager.get_tts_voice_choices("gemini"), value=list(config_manager.SUPPORTED_VOICES.values())[0]), "", # voice, style
+                1.0, 0.0, 1.0, 1.0, # speed, pitch, intonation, volume
                 True, 0.01, # typewriter, speed
                 0.8, 0.95, *[gr.update()]*4, # temperature, top_p, safety
                 False, # display_thoughts
@@ -5942,10 +5941,8 @@ def format_history_for_gradio(
         seen_paths = set()
         for match in media_matches:
             path_str = match.group(1).strip()
-            # --- 既存バグ？ ---
             if not path_str:
                 continue
-            # ------------------
             if path_str in seen_paths:
                 continue
             seen_paths.add(path_str)
@@ -5968,18 +5965,18 @@ def format_history_for_gradio(
                 except Exception:
                     pass
 
-            # --- 既存バグ？ ---
-            #if path_obj.exists() and is_allowed:
             try:
                 is_file = path_obj.is_file()
             except Exception:
                 is_file = False
 
             if is_file and is_allowed:
-            # ------------------
                 proto_history.append({"type": "media", "role": role, "responder": responder_id, "path": path_str, "log_index": i})
             else:
-                print(f"--- [警告] 無効または安全でない画像パスをスキップしました: {path_str} ---")
+                #print(f"--- [警告] 無効または安全でない画像パスをスキップしました: {path_str} ---")
+                # 巨大なバイナリデータがパスとして誤認された場合に備え、表示を制限
+                safe_path_display = str(path_str)[:100] + "..." if len(str(path_str)) > 100 else path_str
+                print(f"--- [警告] 無効または安全でない画像パスをスキップしました: {safe_path_display} ---")
 
         if not text_part and not media_matches and role != "SYSTEM":
              proto_history.append({"type": "text", "role": role, "responder": responder_id, "content": "", "log_index": i})
@@ -7793,11 +7790,25 @@ def handle_reload_notepad(room_name: str) -> str:
     content = load_notepad_content(room_name); gr.Info(f"「{room_name}」のメモ帳を再読み込みしました。"); return content
 
 # --- 創作ノートのハンドラ ---
+def _get_room_note_path(room_name: str, default_filename: str, filename: str = None) -> str:
+    """ノートファイルのパスを取得する。アーカイブ名は notes/archives 配下へ解決する。"""
+    if not filename:
+        filename = default_filename
+
+    normalized_filename = str(filename).replace("\\", "/").strip("/")
+    notes_dir = os.path.join(constants.ROOMS_DIR, room_name, constants.NOTES_DIR_NAME)
+
+    if normalized_filename.startswith("archives/"):
+        return os.path.join(notes_dir, normalized_filename)
+
+    if normalized_filename.startswith("archive_"):
+        return os.path.join(notes_dir, "archives", os.path.basename(normalized_filename))
+
+    return os.path.join(notes_dir, os.path.basename(normalized_filename))
+
 def _get_creative_notes_path(room_name: str, filename: str = None) -> str:
     """創作ノートのパスを取得"""
-    if not filename:
-        filename = constants.CREATIVE_NOTES_FILENAME
-    return os.path.join(constants.ROOMS_DIR, room_name, constants.NOTES_DIR_NAME, filename)
+    return _get_room_note_path(room_name, constants.CREATIVE_NOTES_FILENAME, filename)
 
 def load_creative_notes_content(room_name: str, filename: str = None) -> str:
     """創作ノートの内容を読み込む"""
@@ -7912,10 +7923,7 @@ def handle_load_creative_entries(room_name: str, filename: str = None):
     choices = []
 
     for i, entry in enumerate(entries):
-        date_str = entry.get("date", "")
-        if len(date_str) >= 7:
-            years.add(date_str[:4])
-            months.add(date_str[5:7])
+        _collect_research_filter_dates(entry, years, months)
 
         # ラベル作成（タイムスタンプ + 内容のプレビュー）
         preview = entry["content"][:30].replace("\n", " ")
@@ -7963,10 +7971,7 @@ def handle_show_latest_creative(room_name: str, filename: str = None):
     choices = []
 
     for i, entry in enumerate(entries):
-        date_str = entry.get("date", "")
-        if len(date_str) >= 7:
-            years.add(date_str[:4])
-            months.add(date_str[5:7])
+        _collect_research_filter_dates(entry, years, months)
 
         # ラベル作成
         preview = entry["content"][:30].replace("\n", " ")
@@ -8088,9 +8093,7 @@ def handle_save_creative_entry(room_name: str, selected_idx: str, new_content: s
 # --- 研究・分析ノートのハンドラ ---
 def _get_research_notes_path(room_name: str, filename: str = None) -> str:
     """研究ノートのパスを取得"""
-    if not filename:
-        filename = constants.RESEARCH_NOTES_FILENAME
-    return os.path.join(constants.ROOMS_DIR, room_name, constants.NOTES_DIR_NAME, filename)
+    return _get_room_note_path(room_name, constants.RESEARCH_NOTES_FILENAME, filename)
 
 def load_research_notes_content(room_name: str, filename: str = None) -> str:
     """研究ノートの内容を読み込む"""
@@ -8370,17 +8373,115 @@ def handle_save_working_memory(room_name: str, content: str, slot_name: str = No
 
 # --- 研究ノート：エントリベースのハンドラ ---
 
+def _format_research_entry_value(entry: dict, fallback_index: int) -> str:
+    """研究ノートのDropdown値に、元ファイルとファイル内インデックスを埋め込む。"""
+    source_filename = entry.get("source_filename") or constants.RESEARCH_NOTES_FILENAME
+    source_index = entry.get("source_index", fallback_index)
+    return f"{source_filename}::{source_index}"
+
+
+def _parse_research_entry_value(selected_idx: str, filename: str = None) -> tuple[str, int]:
+    """新旧形式の研究ノートDropdown値を、元ファイルとインデックスへ戻す。"""
+    selected_text = str(selected_idx)
+    if "::" in selected_text:
+        source_filename, raw_idx = selected_text.rsplit("::", 1)
+        return source_filename, int(raw_idx)
+
+    return filename or constants.RESEARCH_NOTES_FILENAME, int(selected_text)
+
+
+def _get_research_entry_date_candidates(entry: dict) -> set[str]:
+    """研究ノートのフィルタ対象日付を、エントリヘッダー日付だけから集める。"""
+    import re
+
+    candidates = set()
+    date_str = entry.get("date", "")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        candidates.add(date_str)
+
+    return candidates
+
+
+def _normalize_research_filter_year(year) -> str:
+    if year is None:
+        return "すべて"
+    normalized = str(year).strip().translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    return normalized or "すべて"
+
+
+def _normalize_research_filter_month(month) -> str:
+    if month is None:
+        return "すべて"
+    normalized = str(month).strip().translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    if normalized == "すべて":
+        return normalized
+    if normalized.isdigit():
+        return normalized.zfill(2)
+    return normalized or "すべて"
+
+
+def _collect_research_filter_dates(entry: dict, years: set, months: set) -> None:
+    for date_candidate in _get_research_entry_date_candidates(entry):
+        years.add(date_candidate[:4])
+        months.add(date_candidate[5:7])
+
+
+def _research_entry_matches_filter(entry: dict, year: str, month: str) -> bool:
+    year = _normalize_research_filter_year(year)
+    month = _normalize_research_filter_month(month)
+    candidates = _get_research_entry_date_candidates(entry)
+    if not candidates:
+        return year == "すべて" and month == "すべて"
+
+    for date_candidate in candidates:
+        match_year = year == "すべて" or date_candidate[:4] == year
+        match_month = month == "すべて" or date_candidate[5:7] == month
+        if match_year and match_month:
+            return True
+
+    return False
+
+
+def _research_entry_sort_key(entry: dict) -> tuple[str, str]:
+    """日付なしを末尾に回し、日付ありは新しい順に並べるためのキー。"""
+    timestamp = entry.get("timestamp", "")
+    if timestamp == "日付なし":
+        return ("0000-00-00 00:00", entry.get("source_filename", ""))
+    return (timestamp, entry.get("source_filename", ""))
+
+
+def _load_research_entries_for_index(room_name: str, filename: str = None) -> list:
+    """研究ノートの一覧表示用エントリを返す。通常表示ではアーカイブも横断する。"""
+    if not room_name:
+        return []
+
+    if filename and filename != constants.RESEARCH_NOTES_FILENAME:
+        target_files = [filename]
+    else:
+        target_files = room_manager.get_note_files(room_name, "research") or [constants.RESEARCH_NOTES_FILENAME]
+
+    entries = []
+    for source_filename in target_files:
+        content = load_research_notes_content(room_name, source_filename)
+        for source_index, entry in enumerate(_parse_notes_entries(content)):
+            enriched_entry = dict(entry)
+            enriched_entry["source_filename"] = source_filename
+            enriched_entry["source_index"] = source_index
+            entries.append(enriched_entry)
+
+    return sorted(entries, key=_research_entry_sort_key, reverse=True)
+
+
 def handle_load_research_entries(room_name: str, filename: str = None):
     """研究ノートのエントリを読み込み、UIを更新"""
     if not room_name:
         return gr.update(choices=["すべて"]), gr.update(choices=["すべて"]), gr.update(choices=[]), ""
 
     content = load_research_notes_content(room_name, filename)
-    if not content.strip():
+    entries = _load_research_entries_for_index(room_name, filename)
+    if not entries:
         print("--- [UI] 対象の研究ノートは空です。 ---")
         return gr.update(choices=["すべて"], value="すべて"), gr.update(choices=["すべて"], value="すべて"), gr.update(), content
-
-    entries = _parse_notes_entries(content)
 
     # 年・月リストを抽出
     years = set()
@@ -8388,17 +8489,14 @@ def handle_load_research_entries(room_name: str, filename: str = None):
     choices = []
 
     for i, entry in enumerate(entries):
-        date_str = entry.get("date", "")
-        if len(date_str) >= 7:
-            years.add(date_str[:4])
-            months.add(date_str[5:7])
+        _collect_research_filter_dates(entry, years, months)
 
         # ラベル作成（タイムスタンプ + 内容のプレビュー）
         preview = entry["content"][:30].replace("\n", " ")
         if len(entry["content"]) > 30:
             preview += "..."
         label = f"{entry['timestamp']} - {preview}"
-        choices.append((label, str(i)))
+        choices.append((label, _format_research_entry_value(entry, i)))
 
     year_choices = ["すべて"] + sorted(list(years), reverse=True)
     month_choices = ["すべて"] + sorted(list(months))
@@ -8422,11 +8520,7 @@ def handle_show_latest_research(room_name: str, filename: str = None):
         return gr.update(choices=["すべて"]), gr.update(choices=["すべて"]), gr.update(choices=[]), "", ""
 
     content = load_research_notes_content(room_name, filename)
-    if not content.strip():
-        print("--- [UI] 対象の研究ノートは空です。 ---")
-        return gr.update(choices=["すべて"], value="すべて"), gr.update(choices=["すべて"], value="すべて"), gr.update(), "", content
-
-    entries = _parse_notes_entries(content)
+    entries = _load_research_entries_for_index(room_name, filename)
 
     if not entries:
         gr.Info("エントリが見つかりません。RAW編集を使用してください。")
@@ -8438,17 +8532,14 @@ def handle_show_latest_research(room_name: str, filename: str = None):
     choices = []
 
     for i, entry in enumerate(entries):
-        date_str = entry.get("date", "")
-        if len(date_str) >= 7:
-            years.add(date_str[:4])
-            months.add(date_str[5:7])
+        _collect_research_filter_dates(entry, years, months)
 
         # ラベル作成
         preview = entry["content"][:30].replace("\n", " ")
         if len(entry["content"]) > 30:
             preview += "..."
         label = f"{entry['timestamp']} - {preview}"
-        choices.append((label, str(i)))
+        choices.append((label, _format_research_entry_value(entry, i)))
 
     year_choices = ["すべて"] + sorted(list(years), reverse=True)
     month_choices = ["すべて"] + sorted(list(months))
@@ -8461,7 +8552,7 @@ def handle_show_latest_research(room_name: str, filename: str = None):
     return (
         gr.update(choices=year_choices, value="すべて"),
         gr.update(choices=month_choices, value="すべて"),
-        gr.update(choices=choices, value="0"),  # 最新エントリを選択
+        gr.update(choices=choices, value=_format_research_entry_value(latest_entry, 0)),
         latest_content,  # エディタに最新エントリの内容を表示
         content  # RAWエディタにも反映
     )
@@ -8472,24 +8563,39 @@ def handle_research_filter_change(room_name: str, year: str, month: str, filenam
     if not room_name:
         return gr.update(choices=[])
 
-    content = load_research_notes_content(room_name, filename)
-    entries = _parse_notes_entries(content)
+    entries = _load_research_entries_for_index(room_name, filename)
 
     choices = []
     for i, entry in enumerate(entries):
-        date_str = entry.get("date", "")
-
-        match_year = (year == "すべて" or (len(date_str) >= 4 and date_str[:4] == year))
-        match_month = (month == "すべて" or (len(date_str) >= 7 and date_str[5:7] == month))
-
-        if match_year and match_month:
+        if _research_entry_matches_filter(entry, year, month):
             preview = entry["content"][:30].replace("\n", " ")
             if len(entry["content"]) > 30:
                 preview += "..."
             label = f"{entry['timestamp']} - {preview}"
-            choices.append((label, str(i)))
+            choices.append((label, _format_research_entry_value(entry, i)))
 
     return gr.update(choices=choices, value=None)
+
+
+def handle_research_year_filter_change(room_name: str, year: str, month: str, filename: str = None):
+    """年フィルタ変更時に、その年で有効な月候補とエントリ一覧を更新する。"""
+    if not room_name:
+        return gr.update(choices=["すべて"], value="すべて"), gr.update(choices=[])
+
+    year = _normalize_research_filter_year(year)
+    month = _normalize_research_filter_month(month)
+    entries = _load_research_entries_for_index(room_name, filename)
+    months = set()
+    for entry in entries:
+        if _research_entry_matches_filter(entry, year, "すべて"):
+            for date_candidate in _get_research_entry_date_candidates(entry):
+                if year == "すべて" or date_candidate[:4] == year:
+                    months.add(date_candidate[5:7])
+
+    month_choices = ["すべて"] + sorted(months)
+    selected_month = month if month in month_choices else "すべて"
+    entry_update = handle_research_filter_change(room_name, year, selected_month, filename)
+    return gr.update(choices=month_choices, value=selected_month), entry_update
 
 
 def handle_research_selection(room_name: str, selected_idx: str, filename: str = None):
@@ -8498,9 +8604,8 @@ def handle_research_selection(room_name: str, selected_idx: str, filename: str =
         return ""
 
     try:
-        idx = int(selected_idx)
-        content = load_research_notes_content(room_name, filename)
-        entries = _parse_notes_entries(content)
+        source_filename, idx = _parse_research_entry_value(selected_idx, filename)
+        entries = _parse_notes_entries(load_research_notes_content(room_name, source_filename))
 
         if 0 <= idx < len(entries):
             entry = entries[idx]
@@ -8526,8 +8631,8 @@ def handle_save_research_entry(room_name: str, selected_idx: str, new_content: s
         return new_content
 
     try:
-        idx = int(selected_idx)
-        content = load_research_notes_content(room_name, filename)
+        source_filename, idx = _parse_research_entry_value(selected_idx, filename)
+        content = load_research_notes_content(room_name, source_filename)
         entries = _parse_notes_entries(content)
 
         if 0 <= idx < len(entries):
@@ -8540,7 +8645,7 @@ def handle_save_research_entry(room_name: str, selected_idx: str, new_content: s
 
             updated_content = content.replace(old_section, new_section, 1)
 
-            path = _get_research_notes_path(room_name, filename)
+            path = _get_research_notes_path(room_name, source_filename)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(updated_content)
 
@@ -9162,15 +9267,21 @@ def _resolve_tts_request_settings(
     model_value: str = None,
     voice_value: str = None,
     style_prompt: str = None,
+    voice_speed: float = None,
+    voice_pitch: float = None,
+    voice_intonation: float = None,
+    voice_volume: float = None,
+    profile_value: str = None,
 ) -> Dict[str, Any]:
     """UI/ルーム設定からTTS生成に必要なプロバイダ別設定を解決する。"""
     effective_settings = config_manager.get_effective_settings(room_name)
     provider = config_manager.tts_provider_key_from_display(provider_value or effective_settings.get("tts_provider", "gemini"))
     explicit_model = bool(model_value and str(model_value).strip())
     model = (model_value or effective_settings.get("tts_model") or "").strip()
-    provider_models = config_manager.get_tts_model_choices(provider)
-    if provider_models and not explicit_model and model not in provider_models:
-        model = provider_models[0]
+    # カスタムモデル値（ユーザーが直接入力した値）は尊重してそのまま使う
+    if not model:
+        provider_models = config_manager.get_tts_model_choices(provider)
+        model = provider_models[0] if provider_models else ""
     voice_source = voice_value or effective_settings.get("tts_voice") or effective_settings.get("voice_id", "iapetus")
     if not voice_value and provider != "gemini" and voice_source in config_manager.SUPPORTED_VOICES:
         voice_choices = config_manager.get_tts_voice_map(provider)
@@ -9181,6 +9292,7 @@ def _resolve_tts_request_settings(
     api_key = None
     base_url = None
     extra_body = None
+    resolved_profile_name = None
 
     if provider == "gemini":
         api_key = config_manager.GEMINI_API_KEYS.get(api_key_name)
@@ -9193,23 +9305,68 @@ def _resolve_tts_request_settings(
             or config_manager.get_active_openai_setting()
         )
         if openai_setting:
+            resolved_profile_name = openai_setting.get("name")
             api_key = openai_setting.get("api_key")
             base_url = openai_setting.get("base_url") or None
         model = model or "gpt-4o-mini-tts"
         response_format = response_format or "mp3"
     elif provider == "openai_compatible":
-        openai_setting = config_manager.get_active_openai_setting()
+        profile_name = profile_value or effective_settings.get("tts_profile_name")
+        openai_setting = None
+        if profile_name:
+            openai_setting = config_manager.get_openai_setting_by_name(profile_name)
+        if not openai_setting:
+            openai_setting = config_manager.get_active_openai_setting()
+
+        profile_kind = None
         if openai_setting:
+            resolved_profile_name = openai_setting.get("name")
             api_key = openai_setting.get("api_key")
             base_url = openai_setting.get("base_url") or None
-            if not model:
+            profile_model_choices = config_manager.get_openai_compatible_tts_model_choices_for_profile(resolved_profile_name, base_url)
+            profile_kind = config_manager.get_openai_profile_tts_kind(resolved_profile_name, base_url)
+            if profile_model_choices:
+                if not model or (profile_kind != "custom" and model not in profile_model_choices):
+                    model = openai_setting.get("tts_model") or profile_model_choices[0]
+                if profile_kind != "custom" and model not in profile_model_choices:
+                    model = profile_model_choices[0]
+            elif profile_kind == "no_tts":
+                model = ""
+            elif not model:
                 model = openai_setting.get("tts_model") or openai_setting.get("default_model") or "canopylabs/orpheus-v1-english"
             extra_body = openai_setting.get("tts_extra_body")
-        response_format = response_format or "wav"
+            profile_voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(resolved_profile_name, base_url, model)
+            if profile_voice_map:
+                if voice_source in profile_voice_map:
+                    voice_id = str(voice_source)
+                else:
+                    voice_id = next((k for k, v in profile_voice_map.items() if v == voice_source), voice_id)
+                if profile_kind != "custom" and voice_id not in profile_voice_map:
+                    voice_id = next(iter(profile_voice_map.keys()), voice_id)
+            elif profile_kind == "no_tts":
+                voice_id = ""
+        if profile_kind == "groq":
+            response_format = "wav"
+        else:
+            response_format = "mp3" if response_format == "wav" else (response_format or "mp3")
     elif provider == "elevenlabs":
         api_key = config_manager.CONFIG_GLOBAL.get("elevenlabs_api_key")
         model = model or "eleven_flash_v2_5"
         response_format = "mp3" if response_format == "wav" else (response_format or "mp3")
+    elif provider in {"aivisspeech", "voicevox", "coeiroink"}:
+        api_key = "LOCAL_VOICEVOX_COMPATIBLE"
+        model = model or (config_manager.get_tts_model_choices(provider)[0] if config_manager.get_tts_model_choices(provider) else "")
+        response_format = "wav"
+
+    res_speed = voice_speed if voice_speed is not None else effective_settings.get("tts_voice_speed")
+    res_pitch = voice_pitch if voice_pitch is not None else effective_settings.get("tts_voice_pitch")
+    res_intonation = voice_intonation if voice_intonation is not None else effective_settings.get("tts_voice_intonation")
+    res_volume = voice_volume if voice_volume is not None else effective_settings.get("tts_voice_volume")
+
+    if res_speed is None: res_speed = 1.0
+    if res_pitch is None: res_pitch = 0.0
+    if res_intonation is None: res_intonation = 1.0
+    if res_volume is None: res_volume = 1.0
 
     return {
         "provider": provider,
@@ -9217,78 +9374,441 @@ def _resolve_tts_request_settings(
         "voice_id": voice_id,
         "style_prompt": resolved_style or "",
         "api_key": api_key,
+        "api_key_name": api_key_name if provider == "gemini" else None,
+        "profile_name": resolved_profile_name,
         "base_url": base_url,
         "response_format": response_format,
         "extra_body": extra_body,
+        "speedScale": float(res_speed),
+        "pitchScale": float(res_pitch),
+        "intonationScale": float(res_intonation),
+        "volumeScale": float(res_volume),
     }
 
-def handle_tts_provider_change(provider_display: str):
-    """TTSプロバイダ変更時に、モデルと声の候補を切り替える。"""
+def _prepare_audio_for_gradio_playback(audio_filepath: str) -> str:
+    """Gradio再生用にASCIIパスへコピーし、ブラウザ側のURL解決を安定させる。"""
+    if not audio_filepath or not os.path.exists(audio_filepath):
+        return audio_filepath
+
+    source_path = os.path.abspath(audio_filepath)
+    playback_dir = os.path.abspath(os.path.join("data", "audio_playback"))
+    os.makedirs(playback_dir, exist_ok=True)
+
+    _, extension = os.path.splitext(source_path)
+    extension = extension if extension else ".wav"
+    digest = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:12]
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    playback_path = os.path.join(playback_dir, f"{timestamp}_{digest}{extension}")
+    shutil.copy2(source_path, playback_path)
+
+    try:
+        files = sorted(
+            (os.path.join(playback_dir, name) for name in os.listdir(playback_dir)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for old_path in files[30:]:
+            if os.path.isfile(old_path):
+                os.remove(old_path)
+    except Exception as e:
+        print(f"--- [Audio Playback Cache] 古い再生用音声の整理に失敗: {e} ---")
+
+    return playback_path
+
+def handle_tts_provider_change(provider_display: str, room_name: str):
+    """TTSプロバイダ変更時に、モデルと声、およびその他の個別パラメータを切り替え、キャッシュから復元する。"""
     provider = config_manager.tts_provider_key_from_display(provider_display)
-    model_choices = config_manager.get_tts_model_choices(provider)
-    voice_choices = config_manager.get_tts_voice_choices(provider)
-    return (
-        gr.update(choices=model_choices, value=model_choices[0] if model_choices else None),
-        gr.update(choices=voice_choices, value=voice_choices[0] if voice_choices else None),
+    
+    # ルーム設定からプロバイダ別設定キャッシュ（tts_provider_settings）を取得する
+    override_settings = {}
+    if room_name:
+        room_config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
+        if os.path.exists(room_config_path):
+            try:
+                with open(room_config_path, "r", encoding="utf-8") as f:
+                    room_config = json.load(f)
+                override_settings = room_config.get("override_settings", {})
+            except Exception:
+                pass
+
+    # プロバイダ切り替え直後の保存を安全に行うため、このタイミングで override_settings["tts_provider"] を更新する
+    if room_name and override_settings.get("tts_provider") != provider:
+        # 共通キーの同期処理：切り替え先のキャッシュ値をロードし、共通キーへも上書き適用する
+        provider_settings = override_settings.get("tts_provider_settings", {}).get(provider, {})
+        
+        updates = {
+            "tts_provider": provider
+        }
+        # キャッシュに存在する項目を共通キーへマージ
+        for k in ["tts_model", "tts_voice", "tts_style_prompt", "tts_voice_speed", "tts_voice_pitch", "tts_voice_intonation", "tts_voice_volume", "tts_profile_name"]:
+            if k in provider_settings:
+                updates[k] = provider_settings[k]
+                
+        room_manager.update_room_config(room_name, {"override_settings": updates})
+        # 最新の override_settings を再読込
+        override_settings.update(updates)
+
+    provider_settings = override_settings.get("tts_provider_settings", {}).get(provider, {})
+
+    profile_choices = [s["name"] for s in config_manager.get_openai_settings_list()]
+    restored_profile = provider_settings.get("tts_profile_name")
+    if not restored_profile and profile_choices:
+        restored_profile = profile_choices[0]
+
+    # モデル・ボイスの選択肢を取得
+    if provider == "openai_compatible":
+        model_choices = config_manager.get_openai_compatible_tts_model_choices_for_profile(restored_profile)
+    else:
+        model_choices = config_manager.get_tts_model_choices(provider)
+
+    # 復元する値（なければデフォルト値）
+    restored_model = provider_settings.get("tts_model")
+    if not restored_model:
+        restored_model = model_choices[0] if model_choices else None
+    elif provider == "openai_compatible" and model_choices and restored_model not in model_choices:
+        restored_model = model_choices[0]
+    elif provider == "openai_compatible" and not model_choices:
+        restored_model = None
+    # カスタム値（リスト外のモデル）が保存されていた場合、選択肢に追加して復元する
+    model_choices = _ensure_value_in_choices(model_choices, restored_model)
+
+    # ローカルTTSエンジンの場合は自動で話者リストのフェッチ＆キャッシュ更新を行う
+    if provider in {"voicevox", "aivisspeech", "coeiroink"}:
+        engine_url = restored_model or (model_choices[0] if model_choices else None)
+        if engine_url:
+            try:
+                import audio_manager
+                # 短いタイムアウトで話者を取得
+                speakers_map = audio_manager.fetch_local_engine_speakers(provider, engine_url)
+                if speakers_map:
+                    config_manager.save_tts_speakers_cache(provider, speakers_map)
+            except Exception as e:
+                print(f"警告: 話者リストの自動更新に失敗しました: {e}")
+
+    if provider == "openai_compatible":
+        profile_voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(restored_profile, model_name=restored_model)
+        voice_choices = list(profile_voice_map.values())
+    else:
+        profile_voice_map = config_manager.get_tts_voice_map(provider)
+        voice_choices = list(profile_voice_map.values())
+
+    restored_voice = provider_settings.get("tts_voice")
+    # ボイスの表示名とIDの変換
+    if restored_voice and restored_voice in profile_voice_map:
+        display_voice = profile_voice_map[restored_voice]
+    elif restored_voice and restored_voice in profile_voice_map.values():
+        display_voice = restored_voice
+    else:
+        restored_voice = next(iter(profile_voice_map.keys()), None)
+        display_voice = voice_choices[0] if voice_choices else None
+
+    restored_style = provider_settings.get("tts_style_prompt", provider_settings.get("voice_style_prompt", ""))
+    
+    # 音響パラメータの初期値
+    default_params = {
+        "tts_voice_speed": 1.0,
+        "tts_voice_pitch": 0.0,
+        "tts_voice_intonation": 1.0,
+        "tts_voice_volume": 1.0
+    }
+    
+    speed = provider_settings.get("tts_voice_speed", default_params["tts_voice_speed"])
+    pitch = provider_settings.get("tts_voice_pitch", default_params["tts_voice_pitch"])
+    intonation = provider_settings.get("tts_voice_intonation", default_params["tts_voice_intonation"])
+    volume = provider_settings.get("tts_voice_volume", default_params["tts_voice_volume"])
+
+    profile_update = gr.update(
+        choices=profile_choices,
+        value=restored_profile,
+        visible=(provider == "openai_compatible")
     )
 
-def handle_play_audio_button_click(selected_message: Optional[Dict[str, str]], room_name: str, api_key_name: str):
+    return (
+        gr.update(choices=model_choices, value=restored_model),
+        gr.update(choices=voice_choices, value=display_voice),
+        gr.update(value=restored_style),
+        gr.update(value=float(speed)),
+        gr.update(value=float(pitch)),
+        gr.update(value=float(intonation)),
+        gr.update(value=float(volume)),
+        profile_update,
+    )
+
+
+def handle_refresh_speakers(room_name: str, provider_display: str, model_display: str):
+    """ローカル音声合成エンジンから話者リストを手動で取得・更新する。"""
+    provider = config_manager.tts_provider_key_from_display(provider_display)
+    if provider not in {"voicevox", "aivisspeech", "coeiroink"}:
+        gr.Warning("ローカルTTSエンジン（VOICEVOX/AivisSpeech/COEIROINK）が選択されている場合のみ更新可能です。")
+        return gr.update()
+
+    if not model_display:
+        gr.Warning("エンジンURL（モデル欄）が指定されていません。")
+        return gr.update()
+
+    gr.Info("ローカルエンジンから話者リストを取得しています...")
+    try:
+        import audio_manager
+        speakers_map = audio_manager.fetch_local_engine_speakers(provider, model_display)
+        if speakers_map:
+            config_manager.save_tts_speakers_cache(provider, speakers_map)
+            gr.Info("話者リストを更新しました。")
+            voice_choices = config_manager.get_tts_voice_choices(provider)
+            return gr.update(choices=voice_choices, value=voice_choices[0] if voice_choices else None)
+        else:
+            gr.Error("話者リストの取得に失敗しました。エンジンが起動しているか、URLが正しいか確認してください。")
+    except Exception as e:
+        gr.Error(f"エラーが発生しました: {e}")
+
+    return gr.update()
+
+
+def handle_play_tts_segment(segment_path: str, playlist_paths: Optional[List[str]] = None):
+    """分割TTSの選択された音声ファイルを再生する。"""
+    if not segment_path:
+        raise gr.Error("再生する分割音声が選択されていません。")
+    playlist_paths = playlist_paths or []
+    current_index = playlist_paths.index(segment_path) if segment_path in playlist_paths else 0
+    return gr.update(value=segment_path, visible=True), current_index
+
+
+def handle_play_next_tts_segment(playlist_paths: Optional[List[str]], current_index: int = 0):
+    """分割TTSの次の音声ファイルを自動再生する。"""
+    playlist_paths = playlist_paths or []
+    try:
+        current_index = int(current_index or 0)
+    except (TypeError, ValueError):
+        current_index = 0
+    next_index = current_index + 1
+    if next_index >= len(playlist_paths):
+        return gr.update(), current_index
+    return gr.update(value=playlist_paths[next_index], visible=True), next_index
+
+
+def handle_play_audio_button_click(selected_message: Optional[Dict[str, str]], room_name: str, api_key_name: str, playback_mode: str = "trim"):
     """
     【最終FIX版 v2】チャット履歴で選択されたAIの発言を音声合成して再生する。
-    try...except を削除し、Gradioの例外処理に完全に委ねる。
+    例外追跡用の try-except を追加。
     """
     if not selected_message:
         raise gr.Error("再生するメッセージが選択されていません。")
 
-    # 処理中はボタンを無効化
-    yield (
-        gr.update(visible=False),
-        gr.update(value="音声生成中... ▌", interactive=False),
-        gr.update(interactive=False)
-    )
+    try:
+        # 処理中はボタンを無効化
+        yield (
+            gr.update(visible=False),
+            gr.update(value="音声生成中... ▌", interactive=False),
+            gr.update(interactive=False),
+            gr.update(choices=[], value=None, interactive=False),
+            gr.update(interactive=False),
+            [],
+            0,
+        )
 
-    raw_text = utils.extract_raw_text_from_html(selected_message.get("content"))
-    print(f"--- [DEBUG:PlayAudio] Playing message content: {raw_text[:100].replace(chr(10), ' ')}")
-    text_to_speak = utils.remove_thoughts_from_text(raw_text)
+        raw_text = utils.extract_raw_text_from_html(selected_message.get("content"))
+        print(f"--- [DEBUG:PlayAudio] Playing message content: {raw_text[:100].replace(chr(10), ' ')}")
+        text_to_speak = utils.remove_thoughts_from_text(raw_text)
 
-    if not text_to_speak:
-        gr.Info("このメッセージには音声で再生できるテキストがありません。")
-        yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True)
-        return
+        if not text_to_speak:
+            gr.Info("このメッセージには音声で再生できるテキストがありません。")
+            yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True), gr.update(), gr.update(), [], 0
+            return
 
-    tts_settings = _resolve_tts_request_settings(room_name, api_key_name=api_key_name)
-    api_key = tts_settings.get("api_key")
+        tts_settings = _resolve_tts_request_settings(room_name, api_key_name=api_key_name)
+        print(
+            "--- [DEBUG:TTS] "
+            f"provider={tts_settings.get('provider')}, profile={tts_settings.get('profile_name')}, "
+            f"base_url={tts_settings.get('base_url')}, model={tts_settings.get('model')}, "
+            f"voice={tts_settings.get('voice_id')}, format={tts_settings.get('response_format')} ---"
+        )
+        provider = (tts_settings.get("provider") or "").strip().lower()
+        is_local_tts = provider in {"aivisspeech", "voicevox", "coeiroink"}
 
-    if not api_key or api_key.startswith("YOUR_API_KEY"):
-        gr.Error("TTS用APIキーが未設定または無効です。")
-        yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True)
-        return
+        if str(playback_mode or "").lower() == TTS_MODE_SPLIT:
+            max_chars = 400 if is_local_tts else 800
+        else:
+            max_chars = 300 if is_local_tts else None
 
-    from audio_manager import generate_audio_from_text
-    gr.Info(f"「{room_name}」の声で音声を生成しています...")
-    audio_filepath = generate_audio_from_text(
-        text_to_speak,
-        api_key,
-        tts_settings["voice_id"],
-        room_name,
-        tts_settings["style_prompt"],
-        tts_provider=tts_settings["provider"],
-        tts_model=tts_settings["model"],
-        base_url=tts_settings["base_url"],
-        response_format=tts_settings["response_format"],
-        extra_body=tts_settings["extra_body"],
-    )
+        text_plan = prepare_tts_text_plan(text_to_speak, playback_mode, max_chars=max_chars)
+        if text_plan.notice:
+            gr.Info(text_plan.notice)
 
-    if audio_filepath and not audio_filepath.startswith("【エラー】"):
-        audio_filepath = os.path.abspath(audio_filepath)
-        gr.Info("再生します。")
-        yield gr.update(value=audio_filepath, visible=True), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True)
-    else:
-        error_msg = audio_filepath or "音声の生成に失敗しました。"
-        gr.Error(error_msg)
-        yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True)
+        api_key = tts_settings.get("api_key")
 
-def handle_voice_preview(room_name: str, tts_provider: str, tts_model: str, selected_voice_name: str, voice_style_prompt: str, text_to_speak: str, api_key_name: str):
+        if not api_key or api_key.startswith("YOUR_API_KEY"):
+            gr.Error("TTS用APIキーが未設定または無効です。")
+            yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True), gr.update(), gr.update(), [], 0
+            return
+
+        gr.Info(f"「{room_name}」の声で音声を生成しています...")
+        valid_segments = [s for s in text_plan.segments if s.strip()]
+        if not valid_segments:
+            gr.Info("このメッセージには音声で再生できるテキストがありません。")
+            yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True), gr.update(), gr.update(), [], 0
+            return
+
+        audio_filepaths = []
+        prepared_paths = []
+        partial_error_msg = ""
+        for index, segment in enumerate(valid_segments, start=1):
+            if len(valid_segments) > 1:
+                gr.Info(f"音声を生成しています... ({index}/{len(valid_segments)})")
+            
+            # 音声生成キャッシュの確認
+            import hashlib
+            seg_hash = hashlib.md5(segment.encode("utf-8")).hexdigest()
+            voice_id = tts_settings.get("voice_id")
+            cache_key = (seg_hash, room_name, provider, voice_id)
+            cached_path = _tts_audio_cache.get(cache_key)
+            if cached_path and os.path.exists(cached_path):
+                print(f"--- [DEBUG:PlayAudio] Found cached audio file: {cached_path}")
+                audio_filepath = cached_path
+            else:
+                if is_local_tts and index > 1:
+                    # ローカルエンジン過負荷防止のディレイ
+                    time.sleep(2.0)
+
+                # 長時間の音声合成処理をスレッドで非同期実行し、
+                # メインのジェネレータスレッドは定期的に yield してタイムアウトを防ぐ
+                import threading
+                result_container = {}
+
+                def _synthesis_worker():
+                    try:
+                        res = generate_audio_with_key_rotation(segment, room_name, tts_settings)
+                        result_container["path"] = res
+                    except Exception as ex:
+                        result_container["error"] = ex
+
+                thread = threading.Thread(target=_synthesis_worker, daemon=True)
+                thread.start()
+
+                elapsed = 0
+                while thread.is_alive():
+                    time.sleep(1.0)
+                    elapsed += 1
+                    # 1秒ごとに yield して WebSocket 接続を維持
+                    # レンダリングの競合を防ぐため、待機中はボタンテキストのみを更新し、
+                    # 他のコンポーネントは gr.update() (変更なし) を送ります。
+                    yield (
+                        gr.update(),
+                        gr.update(value=f"音声生成中... ⏰ {elapsed}s", interactive=False),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                    )
+
+                if "error" in result_container:
+                    raise result_container["error"]
+
+                audio_filepath = result_container.get("path")
+
+                if audio_filepath and not str(audio_filepath).startswith("【エラー】"):
+                    _tts_audio_cache[cache_key] = str(audio_filepath)
+
+            if not audio_filepath or str(audio_filepath).startswith("【エラー】"):
+                error_msg = audio_filepath or "音声の生成に失敗しました。"
+                if text_plan.mode == TTS_MODE_SPLIT and audio_filepaths:
+                    partial_error_msg = f"{index}分割目の音声生成に失敗しました。生成済みの{len(audio_filepaths)}分割だけ再生します。"
+                    gr.Warning(partial_error_msg)
+                    print(f"--- [DEBUG:PlayAudio] Partial split playback due to TTS error: {error_msg}")
+                    break
+                gr.Error(error_msg)
+                yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True), gr.update(), gr.update(), [], 0
+                return
+
+            audio_filepaths.append(str(audio_filepath))
+            prepared_paths.append(_prepare_audio_for_gradio_playback(str(audio_filepath)))
+
+            # 随時進捗をUIへ反映（1つ目ができたら即座に再生開始）
+            segment_choices = [(f"分割 {i + 1}/{len(valid_segments)}", path) for i, path in enumerate(prepared_paths)]
+            if index == 1:
+                segment_dropdown_update = (
+                    gr.update(choices=segment_choices, value=prepared_paths[0], interactive=True)
+                    if len(valid_segments) > 1 else
+                    gr.update(choices=[], value=None, interactive=False)
+                )
+                segment_button_update = gr.update(interactive=len(valid_segments) > 1)
+                
+                yield (
+                    gr.update(value=prepared_paths[0], visible=True),
+                    gr.update(value="🔊 生成中...", interactive=False) if len(valid_segments) > 1 else gr.update(value="🔊 選択した発言を再生", interactive=True),
+                    gr.update(interactive=True),
+                    segment_dropdown_update,
+                    segment_button_update,
+                    prepared_paths.copy(),
+                    0,
+                )
+            else:
+                segment_dropdown_update = gr.update(choices=segment_choices)
+                yield (
+                    gr.update(), # プレイヤーは変更しない（再生中のはず）
+                    gr.update(),
+                    gr.update(),
+                    segment_dropdown_update,
+                    gr.update(),
+                    prepared_paths.copy(),
+                    gr.update(),
+                )
+
+        if prepared_paths:
+            final_choices = [(f"分割 {i + 1}/{len(prepared_paths)}", path) for i, path in enumerate(prepared_paths)]
+            segment_dropdown_update = (
+                gr.update(choices=final_choices, interactive=True)
+                if len(prepared_paths) > 1 else
+                gr.update(choices=[], value=None, interactive=False)
+            )
+            if len(prepared_paths) > 1:
+                gr.Info(partial_error_msg or "分割音声の生成が完了しました。")
+            yield (
+                gr.update(visible=True),
+                gr.update(value="🔊 選択した発言を再生", interactive=True),
+                gr.update(interactive=True),
+                segment_dropdown_update,
+                gr.update(interactive=len(prepared_paths) > 1),
+                prepared_paths.copy(),
+                gr.update(),
+            )
+        else:
+            error_msg = audio_filepath or "音声の生成に失敗しました。"
+            gr.Error(error_msg)
+            yield gr.update(), gr.update(value="🔊 選択した発言を再生", interactive=True), gr.update(interactive=True), gr.update(), gr.update(), [], 0
+
+    except Exception as e:
+        import traceback
+        print("--- [ERROR:PlayAudio] handle_play_audio_button_click 内で例外が発生しました ---")
+        traceback.print_exc()
+        raise e
+
+def handle_play_audio_button_click_basic(selected_message: Optional[Dict[str, str]], room_name: str, api_key_name: str, playback_mode: str = "trim"):
+    """本体UI向けに、分割TTS対応ハンドラの先頭3出力だけを返す。"""
+    for result in handle_play_audio_button_click(selected_message, room_name, api_key_name, playback_mode=playback_mode or "trim"):
+        if isinstance(result, (tuple, list)) and len(result) >= 3:
+            audio_update = result[0]
+            button_update = result[1]
+            rerun_update = result[2]
+        else:
+            audio_update = result
+            button_update = gr.update()
+            rerun_update = gr.update()
+        yield (audio_update, button_update, rerun_update)
+
+def handle_voice_preview(
+    room_name: str,
+    tts_provider: str,
+    tts_model: str,
+    selected_voice_name: str,
+    voice_style_prompt: str,
+    text_to_speak: str,
+    api_key_name: str,
+    voice_speed: float = None,
+    voice_pitch: float = None,
+    voice_intonation: float = None,
+    voice_volume: float = None,
+    tts_profile_name: str = None,
+):
     """
     【最終FIX版 v2】音声をプレビュー再生する。
     try...except を削除し、Gradioの例外処理に完全に委ねる。
@@ -9309,6 +9829,17 @@ def handle_voice_preview(room_name: str, tts_provider: str, tts_model: str, sele
         model_value=tts_model,
         voice_value=selected_voice_name,
         style_prompt=voice_style_prompt,
+        voice_speed=voice_speed,
+        voice_pitch=voice_pitch,
+        voice_intonation=voice_intonation,
+        voice_volume=voice_volume,
+        profile_value=tts_profile_name,
+    )
+    print(
+        "--- [DEBUG:TTS:Preview] "
+        f"provider={tts_settings.get('provider')}, profile={tts_settings.get('profile_name')}, "
+        f"base_url={tts_settings.get('base_url')}, model={tts_settings.get('model')}, "
+        f"voice={tts_settings.get('voice_id')}, format={tts_settings.get('response_format')} ---"
     )
     api_key = tts_settings.get("api_key")
 
@@ -9318,26 +9849,55 @@ def handle_voice_preview(room_name: str, tts_provider: str, tts_model: str, sele
         yield gr.update(visible=False), gr.update(interactive=True), gr.update(value="試聴", interactive=True)
         return
 
-    from audio_manager import generate_audio_from_text
     gr.Info(f"声「{selected_voice_name}」で音声を生成しています...")
-    audio_filepath = generate_audio_from_text(
-        text_to_speak,
-        api_key,
-        tts_settings["voice_id"],
-        room_name,
-        tts_settings["style_prompt"],
-        tts_provider=tts_settings["provider"],
-        tts_model=tts_settings["model"],
-        base_url=tts_settings["base_url"],
-        response_format=tts_settings["response_format"],
-        extra_body=tts_settings["extra_body"],
-    )
+    
+    import threading
+    import time
+    result_container = {}
+
+    def _synthesis_worker():
+        try:
+            res = generate_audio_with_key_rotation(text_to_speak, room_name, tts_settings)
+            result_container["path"] = res
+        except Exception as ex:
+            result_container["error"] = ex
+
+    thread = threading.Thread(target=_synthesis_worker, daemon=True)
+    thread.start()
+
+    elapsed = 0
+    while thread.is_alive():
+        time.sleep(1.0)
+        elapsed += 1
+        yield (
+            gr.update(),  # audio_player
+            gr.update(),  # play_audio_button
+            gr.update(value=f"生成中... ⏰ {elapsed}s", interactive=False)  # room_preview_voice_button
+        )
+
+    if "error" in result_container:
+        print(f"--- [DEBUG:Preview] スレッド内でエラーが検出されました: {result_container['error']} ---")
+        raise result_container["error"]
+
+    audio_filepath = result_container.get("path")
+    print(f"--- [DEBUG:Preview] 音声生成完了、パス: {audio_filepath} ---")
 
     if audio_filepath and not audio_filepath.startswith("【エラー】"):
-        audio_filepath = os.path.abspath(audio_filepath)
+        audio_filepath = _prepare_audio_for_gradio_playback(audio_filepath)
+        print(f"--- [DEBUG:Preview] Gradio再生用準備完了、パス: {audio_filepath} ---")
         gr.Info("プレビューを再生します。")
+        # まず値をセットして表示させる
         yield gr.update(value=audio_filepath, visible=True), gr.update(interactive=True), gr.update(value="試聴", interactive=True)
+        print("--- [DEBUG:Preview] プレビュー再生の yield 送信完了（値あり） ---")
+        
+        # Gradioフロントエンド側でオーディオ要素の再ロード・マウント処理が走るため、
+        # 描画競合（初期値へのフォールバック）を防止するために1.5秒待機し、
+        # 最後に値なしで visible=True だけを確定送信する
+        time.sleep(1.5)
+        yield gr.update(visible=True), gr.update(interactive=True), gr.update(value="試聴", interactive=True)
+        print("--- [DEBUG:Preview] 最終表示確定の yield 送信完了（値なし） ---")
     else:
+        print(f"--- [DEBUG:Preview] 音声生成エラー判定、パス: {audio_filepath} ---")
         gr.Error(audio_filepath or "音声の生成に失敗しました。")
         yield gr.update(visible=False), gr.update(interactive=True), gr.update(value="試聴", interactive=True)
 
@@ -9422,6 +9982,11 @@ This is the undeniable truth for all physical structures, objects, furniture, an
             - Daytime (morning, late_morning, afternoon): Bright natural sunlight, blue sky visible through windows, warm sun rays.
             - Evening: Golden hour, warm orange sunset colors.
             - Night/Midnight: Dark sky, moonlight or artificial lighting, stars visible.
+        - **FIREPLACE & CLIMATE CONTROL RULES**:
+            - If the Architectural Blueprint (Source 1) mentions a "fireplace", "stove", or "heater":
+                - If the Current Season is warm/hot (e.g., `summer`, `early_summer`, `late_summer`): The fire in the fireplace/stove/heater **MUST BE COMPLETELY EXTINGUISHED** (completely cold, dark, no fire, no glowing embers, silent and empty). A blazing fire in summer is strictly prohibited.
+                - If the Current Season is cold (e.g., `winter`, `late_autumn`, `early_spring`): The fireplace/stove/heater **SHOULD BE ACTIVE with a warm, glowing, cozy fire blazing inside**.
+            - If the blueprint mentions "air conditioner", "cooler", or "fan", describe them as either active (cool air blowing in summer, warm air blowing in winter) or idle/off (in mild seasons) appropriate to the season.
 
 **--- [Your Task: The Fusion] ---**
 Your task is to **merge** these two sources into a single, coherent visual description, following the absolute rules below.
@@ -9534,7 +10099,7 @@ def handle_generate_or_regenerate_scenery_image(room_name: str, api_key_name: st
         if location_id_fb:
             fallback_image_path_fb = utils.find_scenery_image(room_name, location_id_fb)
             if fallback_image_path_fb:
-                return Image.open(fallback_image_path_fb)
+                return _load_image_for_gradio(fallback_image_path_fb)
         return None
 
     # ルーム名チェック
@@ -9573,7 +10138,7 @@ def handle_generate_or_regenerate_scenery_image(room_name: str, api_key_name: st
 
     if not final_prompt:
         gr.Error("シーンディレクターAIが有効なプロンプトを生成できませんでした。")
-        if fallback_image_path: return Image.open(fallback_image_path)
+        if fallback_image_path: return _load_image_for_gradio(fallback_image_path)
         return None
 
     # --- 画像生成 ---
@@ -9593,10 +10158,10 @@ def handle_generate_or_regenerate_scenery_image(room_name: str, api_key_name: st
                 shutil.move(generated_path, final_path)
                 print(f"--- 情景画像を生成し、保存/上書きしました: {final_path} ---")
                 gr.Info("画像を生成/更新しました。")
-                return Image.open(final_path)
+                return _load_image_for_gradio(final_path)
             except Exception as move_e:
                 gr.Error(f"生成された画像の移動/上書きに失敗しました: {move_e}")
-                if fallback_image_path: return Image.open(fallback_image_path)
+                if fallback_image_path: return _load_image_for_gradio(fallback_image_path)
                 return None
         else:
             gr.Error("画像の生成には成功しましたが、一時ファイルの特定に失敗しました。")
@@ -9606,7 +10171,7 @@ def handle_generate_or_regenerate_scenery_image(room_name: str, api_key_name: st
         gr.Error(f"画像の生成に失敗しました: {clean_result}")
 
     # フォールバック
-    if fallback_image_path: return Image.open(fallback_image_path)
+    if fallback_image_path: return _load_image_for_gradio(fallback_image_path)
     return None
 
 def handle_api_connection_test(api_key_name: str):
@@ -9760,11 +10325,15 @@ def handle_room_change_for_all_tabs(room_name: str, api_key_val: str, expected_c
     locations_for_custom_scenery = _get_location_choices_for_ui(room_name)
     current_location_for_custom_scenery = utils.get_current_location(room_name)
     custom_scenery_dd_update = gr.update(choices=locations_for_custom_scenery, value=current_location_for_custom_scenery)
+    current_season_ja, current_time_ja = _get_current_time_context_ui_values(room_name)
+    custom_scenery_season_dd_update = gr.update(value=current_season_ja)
+    custom_scenery_time_dd_update = gr.update(value=current_time_ja)
 
     all_updates_tuple = (
         *chat_tab_updates, *world_builder_updates, *session_management_updates,
         rules_df_for_ui, archive_date_dd_update, *time_settings_updates,
-        ui_attachments_df, initial_active_attachments_display, custom_scenery_dd_update
+        ui_attachments_df, initial_active_attachments_display,
+        custom_scenery_dd_update, custom_scenery_season_dd_update, custom_scenery_time_dd_update
     )
 
     token_count_text = _hide_token_count_display(room_name)
@@ -10151,6 +10720,144 @@ def handle_save_moonshot_key(api_key: str):
 def handle_save_discord_webhook(webhook_url: str):
     if config_manager.save_config_if_changed("notification_webhook_url", webhook_url):
         gr.Info("Discord Webhook URLを保存しました。")
+
+def handle_weather_search(city_name: str) -> gr.update:
+    """都市名をGeocoding APIで検索し、選択肢ドロップダウンを更新する"""
+    if not city_name or not city_name.strip():
+        gr.Warning("検索する都市名を入力してください。")
+        return gr.update()
+        
+    service = WeatherService()
+    results = service.search_city(city_name)
+    if not results:
+        gr.Warning(f"「{city_name}」に一致する場所が見つかりませんでした。英語名でもお試しください。")
+        return gr.update(choices=[])
+        
+    choices = []
+    for item in results:
+        admin_part = f", {item['admin1']}" if item.get("admin1") else ""
+        label = f"{item['name']}{admin_part} ({item['country']}) - 緯度:{item['latitude']:.2f}, 経度:{item['longitude']:.2f}"
+        val = f"{item['latitude']},{item['longitude']}|{item['name']}"
+        choices.append((label, val))
+        
+    gr.Info(f"{len(results)}件の候補が見つかりました。")
+    return gr.update(choices=choices, value=choices[0][1] if choices else None)
+
+
+def handle_weather_candidate_change(candidate_val: str) -> Tuple[gr.update, gr.update]:
+    """ドロップダウン候補選択時に、経緯度表示用数値を更新する"""
+    if not candidate_val or "|" not in candidate_val:
+        return gr.update(value=None), gr.update(value=None)
+        
+    coords_part, _ = candidate_val.split("|")
+    try:
+        lat_str, lon_str = coords_part.split(",")
+        return gr.update(value=float(lat_str)), gr.update(value=float(lon_str))
+    except Exception:
+        return gr.update(value=None), gr.update(value=None)
+
+
+def handle_save_weather_settings(city_name: str, candidate_val: str, enable_context: bool, enable_scenery: bool) -> Tuple[gr.update, gr.update]:
+    """天気設定をconfig.jsonにアトミックに保存し、現在の天気プレビューとステータスメッセージを更新する"""
+    if not candidate_val or "|" not in candidate_val:
+        gr.Warning("検索結果リストから場所を選択してください。")
+        return gr.update(), "⚠️ 保存に失敗しました。場所が選択されていません。"
+        
+    coords_part, resolved_city_name = candidate_val.split("|")
+    try:
+        lat_str, lon_str = coords_part.split(",")
+        lat = float(lat_str)
+        lon = float(lon_str)
+    except Exception:
+        gr.Warning("緯度経度のパースに失敗しました。再度検索してください。")
+        return gr.update(), "⚠️ 保存に失敗しました。経緯度データが破損しています。"
+        
+    # 新しい設定マップの作成
+    weather_settings = {
+        "city_name": resolved_city_name,
+        "latitude": lat,
+        "longitude": lon,
+        "enable_persona_context": enable_context,
+        "enable_scenery_reflection": enable_scenery
+    }
+    
+    # アトミック保存
+    if config_manager.save_config_if_changed("weather_settings", weather_settings):
+        gr.Info("天気・環境連携設定を保存しました。")
+    else:
+        gr.Info("設定に変更はありませんでした。")
+        
+    # グローバル設定の再ロード
+    config_manager.load_config()
+    
+    # プレビュー生成 (即時API叩いて現在の天気を確認)
+    service = WeatherService()
+    weather_data = service.fetch_weather(lat, lon)
+    
+    if weather_data:
+        # 日出・日没ベースの時間帯と、気温ベースの季節を計算してみる
+        now_time = datetime.datetime.now().time()
+        now_month = datetime.datetime.now().month
+        
+        season_ja, _ = service.get_enhanced_season(weather_data.temperature, now_month)
+        time_ja, _ = service.get_enhanced_time_of_day(now_time, weather_data.sunrise, weather_data.sunset)
+        
+        status_md = (
+            f"### 🌤️ 現在の環境ステータス (取得成功)\n"
+            f"- **設定地域**: {resolved_city_name} (緯度: {lat:.4f}, 経度: {lon:.4f})\n"
+            f"- **現在の天気**: {weather_data.weather_description} (気温: {weather_data.temperature:.1f}℃ / 体感: {weather_data.apparent_temperature:.1f}℃)\n"
+            f"- **湿度 / 降水量**: {weather_data.humidity}% / {weather_data.precipitation}mm\n"
+            f"- **日出 / 日没**: {weather_data.sunrise} / {weather_data.sunset}\n"
+            f"- **動的季節判定**: **{season_ja}**\n"
+            f"- **動的時間帯判定**: **{time_ja}**\n"
+            f"\n*※ 30分間はキャッシュが利用され、APIリクエストを削減します。*"
+        )
+    else:
+        status_md = (
+            f"### 🌤️ 現在の環境ステータス\n"
+            f"- **設定地域**: {resolved_city_name} (緯度: {lat:.4f}, 経度: {lon:.4f})\n"
+            f"- **天気情報**: ⚠️ API取得エラー。ネットワーク接続を確認してください。\n"
+        )
+        
+    return gr.update(value=status_md), "共通設定: 最新状態を保存済み"
+
+
+def get_weather_status_preview_html() -> str:
+    """起動時またはルーム切替時の天気プレビュー表示用Markdownテキストを返す"""
+    config = config_manager.load_config_file()
+    weather_settings = config.get("weather_settings", {})
+    city_name = weather_settings.get("city_name")
+    lat = weather_settings.get("latitude")
+    lon = weather_settings.get("longitude")
+    
+    if not city_name or lat is None or lon is None:
+        return "*環境連携は未設定です。都市名を入力して検索し、保存してください。*"
+        
+    # キャッシュ経由で天気情報表示 (フリーズ防止)
+    service = WeatherService()
+    weather_data = service.get_cached_weather()
+    
+    if weather_data:
+        now_time = datetime.datetime.now().time()
+        now_month = datetime.datetime.now().month
+        season_ja, _ = service.get_enhanced_season(weather_data.temperature, now_month)
+        time_ja, _ = service.get_enhanced_time_of_day(now_time, weather_data.sunrise, weather_data.sunset)
+        
+        return (
+            f"### 🌤️ 現在の環境ステータス (キャッシュ接続)\n"
+            f"- **設定地域**: {city_name} (緯度: {lat:.4f}, 経度: {lon:.4f})\n"
+            f"- **現在の天気**: {weather_data.weather_description} (気温: {weather_data.temperature:.1f}℃ / 体感: {weather_data.apparent_temperature:.1f}℃)\n"
+            f"- **湿度 / 降水量**: {weather_data.humidity}% / {weather_data.precipitation}mm\n"
+            f"- **日出 / 日没**: {weather_data.sunrise} / {weather_data.sunset}\n"
+            f"- **動的季節判定**: **{season_ja}**\n"
+            f"- **動的時間帯判定**: **{time_ja}**\n"
+        )
+    else:
+        return (
+            f"### 🌤️ 現在の環境ステータス (未取得)\n"
+            f"- **設定地域**: {city_name} (緯度: {lat:.4f}, 経度: {lon:.4f})\n"
+            f"- **天気情報**: 現在取得できません（手動で保存ボタンを押すと再試行します）。"
+        )
 def load_system_prompt_content(room_name: str) -> str:
     if not room_name: return ""
     _, system_prompt_path, _, _, _, _, _ = get_room_files_paths(room_name)
@@ -10987,13 +11694,80 @@ def handle_open_backup_folder(room_name: str):
         gr.Error(f"フォルダを開けませんでした: {e}")
 
 # --- [ここからが追加する関数] ---
+SCENERY_SEASON_EN_TO_JA = {
+    "spring": "春",
+    "early_spring": "春",
+    "summer": "夏",
+    "early_summer": "夏",
+    "late_summer": "夏",
+    "autumn": "秋",
+    "late_autumn": "秋",
+    "winter": "冬",
+}
+SCENERY_SEASON_JA_TO_EN = {"春": "spring", "夏": "summer", "秋": "autumn", "冬": "winter"}
+SCENERY_TIME_EN_TO_JA = {
+    "early_morning": "早朝",
+    "morning": "朝",
+    "late_morning": "昼前",
+    "noon": "昼",
+    "daytime": "昼",
+    "afternoon": "昼下がり",
+    "evening": "夕方",
+    "night": "夜",
+    "midnight": "深夜",
+}
+SCENERY_TIME_JA_TO_EN = {
+    "早朝": "early_morning",
+    "朝": "morning",
+    "昼前": "late_morning",
+    "昼": "daytime",
+    "昼下がり": "afternoon",
+    "夕方": "evening",
+    "夜": "night",
+    "深夜": "midnight",
+}
+
+
+def _get_room_time_settings_dict(room_name: str) -> Dict[str, Any]:
+    """旧トップレベル形式とoverride_settings内形式の両方から時間設定を読む。"""
+    room_config = room_manager.get_room_config(room_name) or {}
+    top_level = room_config.get("time_settings")
+    if isinstance(top_level, dict):
+        return top_level
+
+    override_settings = room_config.get("override_settings", {}) or {}
+    nested = override_settings.get("time_settings")
+    if isinstance(nested, dict):
+        return nested
+
+    return {}
+
+
+def _get_current_time_context_ui_values(room_name: str) -> Tuple[str, str]:
+    """現在有効な季節・時間帯をUI表示用の日本語に変換する。"""
+    season_en, time_en = utils._get_current_time_context(room_name)
+    return (
+        SCENERY_SEASON_EN_TO_JA.get(season_en, "秋"),
+        SCENERY_TIME_EN_TO_JA.get(time_en, "夜"),
+    )
+
+
+def _load_image_for_gradio(image_path: Optional[str]):
+    """同一ファイルパス上書き後も古いプレビューを残さないよう、画像実体を読み込んで返す。"""
+    if not image_path or not os.path.exists(image_path):
+        return None
+    try:
+        with Image.open(image_path) as raw_img:
+            img = ImageOps.exif_transpose(raw_img) or raw_img
+            return img.copy()
+    except Exception as e:
+        print(f"--- [Scenery Image] 画像読み込みエラー ({image_path}): {e} ---")
+        return image_path
+
+
 def _load_time_settings_for_room(room_name: str) -> Dict[str, Any]:
     """ルームの設定ファイルから時間設定を読み込むヘルパー関数。"""
-    room_config = room_manager.get_room_config(room_name)
-    settings = (room_config or {}).get("time_settings", {})
-
-    season_map_en_to_ja = {"spring": "春", "summer": "夏", "autumn": "秋", "winter": "冬"}
-    time_map_en_to_ja = {"morning": "朝", "daytime": "昼", "evening": "夕方", "night": "夜"}
+    settings = _get_room_time_settings_dict(room_name)
 
     mode = settings.get("mode", "realtime")
 
@@ -11009,8 +11783,8 @@ def _load_time_settings_for_room(room_name: str) -> Dict[str, Any]:
 
     return {
         "mode": "リアル連動" if mode == "realtime" else "選択する",
-        "fixed_season_ja": season_map_en_to_ja.get(season_en, season_map_en_to_ja.get(default_season_en, "秋")),
-        "fixed_time_of_day_ja": time_map_en_to_ja.get(time_en, time_map_en_to_ja.get(default_time_en, "夜")),
+        "fixed_season_ja": SCENERY_SEASON_EN_TO_JA.get(season_en, SCENERY_SEASON_EN_TO_JA.get(default_season_en, "秋")),
+        "fixed_time_of_day_ja": SCENERY_TIME_EN_TO_JA.get(time_en, SCENERY_TIME_EN_TO_JA.get(default_time_en, "夜")),
     }
 
 
@@ -11030,24 +11804,24 @@ def handle_save_time_settings(room_name: str, mode: str, season_ja: str, time_of
     new_time_settings = {"mode": mode_en}
 
     if mode_en == "fixed":
-        season_map_ja_to_en = {"春": "spring", "夏": "summer", "秋": "autumn", "冬": "winter"}
-        time_map_ja_to_en = {"朝": "morning", "昼": "daytime", "夕方": "evening", "夜": "night"}
-        new_time_settings["fixed_season"] = season_map_ja_to_en.get(season_ja, "autumn")
-        new_time_settings["fixed_time_of_day"] = time_map_ja_to_en.get(time_of_day_ja, "night")
+        new_time_settings["fixed_season"] = SCENERY_SEASON_JA_TO_EN.get(season_ja, "autumn")
+        new_time_settings["fixed_time_of_day"] = SCENERY_TIME_JA_TO_EN.get(time_of_day_ja, "night")
 
     try:
         config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
         config = room_manager.get_room_config(room_name) or {}
 
         # 現在の設定と比較し、変更がなければ何もしない
-        current_time_settings = config.get("time_settings", {})
+        current_time_settings = _get_room_time_settings_dict(room_name)
         if current_time_settings == new_time_settings:
             return # 変更がないので終了
 
         config["time_settings"] = new_time_settings
 
-        with open(config_path, "w", encoding="utf-8") as f:
+        tmp_path = f"{config_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, config_path)
 
         gr.Info(f"ルーム「{room_name}」の時間設定を保存しました。")
 
@@ -11067,14 +11841,11 @@ def handle_time_settings_change_and_update_scenery(
     # --- [冪等性ガード] ---
     # まず、UIからの入力値を内部的な英語名に変換する
     mode_en = "realtime" if mode == "リアル連動" else "fixed"
-    season_map_ja_to_en = {"春": "spring", "夏": "summer", "秋": "autumn", "冬": "winter"}
-    time_map_ja_to_en = {"朝": "morning", "昼": "daytime", "夕方": "evening", "夜": "night"}
-    season_en = season_map_ja_to_en.get(season_ja, "autumn")
-    time_en = time_map_ja_to_en.get(time_of_day_ja, "night")
+    season_en = SCENERY_SEASON_JA_TO_EN.get(season_ja, "autumn")
+    time_en = SCENERY_TIME_JA_TO_EN.get(time_of_day_ja, "night")
 
     # 次に、configファイルから現在の設定を読み込む
-    current_config = room_manager.get_room_config(room_name) or {}
-    current_settings = current_config.get("time_settings", {})
+    current_settings = _get_room_time_settings_dict(room_name)
     current_mode = current_settings.get("mode", "realtime")
     current_season = current_settings.get("fixed_season", "autumn")
     current_time = current_settings.get("fixed_time_of_day", "night")
@@ -11102,13 +11873,13 @@ def handle_time_settings_change_and_update_scenery(
     # --- ここから下は、本当に設定が変更された場合のみ実行される ---
     print(f"--- UIからの時間設定変更処理開始: ルーム='{room_name}' ---")
 
+    # 1. 設定保存はAPIキー状態に依存させない
+    handle_save_time_settings(room_name, mode, season_ja, time_of_day_ja)
+
     # APIキーの有効性チェック
     api_key = config_manager.GEMINI_API_KEYS.get(api_key_name)
     if not api_key or api_key.startswith("YOUR_API_KEY"):
         return "（APIキーが設定されていません）", None
-
-    # 1. 設定を保存 (内部で差分をチェックするので冗長ではない)
-    handle_save_time_settings(room_name, mode, season_ja, time_of_day_ja)
 
     # 2. 司令塔を呼び出して情景を更新
     new_scenery_text, new_image_path = _get_updated_scenery_and_image(room_name, api_key_name)
@@ -11968,11 +12739,26 @@ def _reset_play_audio_on_failure():
     return (
         gr.update(visible=False), # audio_player
         gr.update(value="🔊 選択した発言を再生", interactive=True), # play_audio_button
-        gr.update(interactive=True) # rerun_button
+        gr.update(interactive=True), # rerun_button
+        gr.update(choices=[], value=None, interactive=False), # tts_segment_dropdown
+        gr.update(interactive=False), # play_tts_segment_button
+        [], # tts_playlist_state
+        0, # tts_playlist_index_state
+    )
+
+def _reset_play_audio_on_failure_basic():
+    """旧式の本体UI向けの音声再生失敗時リセット。"""
+    return (
+        gr.update(visible=False),
+        gr.update(value="🔊 選択した発言を再生", interactive=True),
+        gr.update(interactive=True),
     )
 
 def _reset_preview_on_failure():
     """「試聴」ボタンが失敗したときに、UIを元の状態に戻す。"""
+    print("--- [DEBUG:Preview] _reset_preview_on_failure が呼び出されました！ ---")
+    import traceback
+    traceback.print_stack()
     return (
         gr.update(visible=False), # audio_player
         gr.update(interactive=True), # play_audio_button
@@ -12190,10 +12976,8 @@ def handle_register_custom_scenery(
         return gr.update(), gr.update()
 
     try:
-        season_map = {"春": "spring", "夏": "summer", "秋": "autumn", "冬": "winter"}
-        time_map = {"早朝": "early_morning", "朝": "morning", "昼前": "late_morning", "昼下がり": "afternoon", "夕方": "evening", "夜": "night", "深夜": "midnight"}
-        season_en = season_map.get(season_ja)
-        time_en = time_map.get(time_ja)
+        season_en = SCENERY_SEASON_JA_TO_EN.get(season_ja)
+        time_en = SCENERY_TIME_JA_TO_EN.get(time_ja)
 
         if not season_en or not time_en:
             raise ValueError("季節または時間帯の変換に失敗しました。")
@@ -12926,7 +13710,8 @@ def _resolve_background_image(room_name: str, settings: dict) -> str:
         # 現在地（仮想現在地）から画像を探す
         location_id = utils.get_current_location(room_name)
         if location_id:
-            scenery_path = utils.find_scenery_image(room_name, location_id)
+            season_en, time_of_day_en = utils._get_current_time_context(room_name)
+            scenery_path = utils.find_scenery_image(room_name, location_id, season_en=season_en, time_of_day_en=time_of_day_en)
             if scenery_path:
                 return scenery_path
         # 見つからない場合はNone（背景なし）
@@ -13329,9 +14114,9 @@ def generate_room_style_css(enabled=True, font_size=15, line_height=1.6, chat_st
         import base64
         from PIL import Image, ImageOps
         import io
-
+        
         bg_image_url = ""
-
+        
         # HTTP URLならそのまま
         if bg_image.startswith("http"):
              bg_image_url = bg_image
@@ -13346,7 +14131,7 @@ def generate_room_style_css(enabled=True, font_size=15, line_height=1.6, chat_st
                         ratio = max_size / max(img.size)
                         new_size = (int(img.width * ratio), int(img.height * ratio))
                         img = img.resize(new_size, Image.Resampling.LANCZOS)
-
+        
                     buffer = io.BytesIO()
                     # JPEG変換して軽量化 (PNGだと重い場合があるが、画質優先ならPNG)
                     # ここでは元のフォーマットに近い形で、ただし透過考慮でPNG推奨
@@ -15436,34 +16221,34 @@ def handle_test_twitter_api(api_key, api_secret, access_token, access_token_secr
     else:
         return "❌ **失敗**: 認証エラーが発生しました。キーが正しいか、および App Permissions が 'Read and Write' になっているか確認してください。"
 
-def handle_load_twitter_settings(room_name):
-    """ルーム設定からTwitterの認証情報を読み込み、UIに反映させる"""
-    if not room_name:
-        return [gr.update()] * 9
-
-    import room_manager
-    room_config = room_manager.get_room_config(room_name) or {}
-    twitter_settings = room_config.get("twitter_settings", {})
-
-    enabled = twitter_settings.get("enabled", False)
-    auth_mode = twitter_settings.get("auth_mode", "browser")
-    posting_summary = twitter_settings.get("posting_summary", "")
-    posting_guidelines = twitter_settings.get("posting_guidelines", "")
-    api_config = twitter_settings.get("api_config", {})
-
-    return [
-        gr.update(value=enabled),
-        gr.update(value=auth_mode),
-        gr.update(value=posting_summary),
-        gr.update(value=posting_guidelines),
-        gr.update(value=api_config.get("api_key", "")),
-        gr.update(value=api_config.get("api_secret", "")),
-        gr.update(value=api_config.get("access_token", "")),
-        gr.update(value=api_config.get("access_token_secret", "")),
-        gr.update(visible=(auth_mode == "api"))  # APIグループの可視性
-    ]
-
-# 廃止: 下記の handle_refresh_twitter_tab (15637行目付近) が使用されています。
+# --- 重複の為、削除 ---
+#def handle_load_twitter_settings(room_name):
+#    """ルーム設定からTwitterの認証情報を読み込み、UIに反映させる"""
+#    if not room_name:
+#        return [gr.update()] * 9
+#
+#    import room_manager
+#    room_config = room_manager.get_room_config(room_name) or {}
+#    twitter_settings = room_config.get("twitter_settings", {})
+#
+#    enabled = twitter_settings.get("enabled", False)
+#    auth_mode = twitter_settings.get("auth_mode") or "api"
+#    posting_summary = twitter_settings.get("posting_summary", "")
+#    posting_guidelines = twitter_settings.get("posting_guidelines", "")
+#    api_config = twitter_settings.get("api_config", {})
+#
+#    return [
+#        gr.update(value=enabled),
+#        gr.update(value=auth_mode),
+#        gr.update(value=posting_summary),
+#        gr.update(value=posting_guidelines),
+#        gr.update(value=api_config.get("api_key", "")),
+#        gr.update(value=api_config.get("api_secret", "")),
+#        gr.update(value=api_config.get("access_token", "")),
+#        gr.update(value=api_config.get("access_token_secret", "")),
+#        gr.update(visible=(auth_mode == "api"))  # APIグループの可視性
+#    ]
+# ----------------------
 
 def _parse_csv_ids(value: str) -> List[str]:
     if not value:
@@ -15637,6 +16422,15 @@ def handle_save_discord_bot_settings(
         if not room_name:
             return gr.update(value="Botの状態: ❌ ルームが選択されていません。")
 
+        # --- 未ロード状態での上書き保存を防止 ---
+        existing_discord = config_manager.get_room_discord_bot_settings(room_name)
+        # ファイル側にトークンがあるのに、UI側から渡されたトークンが空、かつ有効化チェックも外れている場合
+        if existing_discord.get("token") and not token and not enabled:
+            # ロードを促す警告を出して中断
+            msg = "Discord設定が読み込まれていないか空です。設定を維持する場合は「設定を読み込む」ボタンを押してから操作してください。"
+            gr.Warning(msg)
+            return gr.update(value=f"Botの状態: ⚠️ 保存をキャンセルしました（未ロードの疑い）")
+
         auth_ids = _parse_csv_ids(auth_ids_str)
         allowed_channel_ids = _parse_csv_ids(allowed_channel_ids_str)
         approval_ids = _parse_csv_ids(approval_ids_str)
@@ -15763,6 +16557,547 @@ def handle_stop_line_bot():
     except Exception as e:
         logger.error(f"Failed to stop LINE bot: {e}")
         return gr.update(value=f"サーバー状態: ❌ 停止エラー ({e})")
+
+
+def handle_generate_api_gateway_token():
+    """REST API Gateway用のBearer Token候補を生成する。"""
+    token = secrets.token_urlsafe(32)
+    gr.Info("API Tokenを生成しました。保存すると有効になります。")
+    return (
+        gr.update(value=token),
+        gr.update(value=token),
+        gr.update(value="API状態: 🔑 新しいTokenを生成しました。保存すると有効になります。"),
+    )
+
+
+def handle_show_saved_api_gateway_token():
+    """保存済みREST API Gateway Tokenをコピー用欄へ表示する。"""
+    settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+    token = str(settings.get("auth_token") or "").strip()
+    if not token:
+        gr.Warning("保存済みAPI Tokenがありません。Token生成後に保存してください。")
+        return gr.update(value="")
+    gr.Info("保存済みAPI Tokenをコピー用欄に表示しました。")
+    return gr.update(value=token)
+
+
+def _run_tailscale_command(args: list[str], timeout: int = 3) -> str:
+    """Tailscale CLIの短い結果を取得する。失敗時は空文字を返す。"""
+    if not shutil.which("tailscale"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["tailscale", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return ""
+        return (result.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _get_tailscale_dns_name() -> str:
+    status_json = _run_tailscale_command(["status", "--json"], timeout=3)
+    if not status_json:
+        return ""
+    try:
+        status = json.loads(status_json)
+        dns_name = ((status.get("Self") or {}).get("DNSName") or "").strip().rstrip(".")
+        return dns_name
+    except Exception:
+        return ""
+
+
+def _get_tailscale_ipv4() -> str:
+    output = _run_tailscale_command(["ip", "-4"], timeout=2)
+    return output.splitlines()[0].strip() if output else ""
+
+
+def _get_tailscale_serve_status() -> str:
+    return _run_tailscale_command(["serve", "status"], timeout=5)
+
+
+def _get_tailscale_serve_status_json() -> dict:
+    """Tailscale ServeのJSON状態を取得する。未対応/失敗時は空dictを返す。"""
+    output = _run_tailscale_command(["serve", "status", "--json"], timeout=5)
+    if not output:
+        return {}
+    try:
+        parsed = json.loads(output)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tailscale_serve_target_patterns(port: int) -> list[str]:
+    return [
+        f"http://127.0.0.1:{port}",
+        f"https://127.0.0.1:{port}",
+        f"127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"https://localhost:{port}",
+        f"localhost:{port}",
+    ]
+
+
+def _tailscale_serve_points_to_port(serve_status: str, serve_status_json: dict, port: int) -> bool:
+    """Serve状態が現在のAPI Gatewayポートを指しているか、出力形式差を吸収して判定する。"""
+    patterns = _tailscale_serve_target_patterns(port)
+    haystacks = []
+    if serve_status:
+        haystacks.append(serve_status)
+    if serve_status_json:
+        haystacks.append(json.dumps(serve_status_json, ensure_ascii=False))
+    return any(pattern in haystack for haystack in haystacks for pattern in patterns)
+
+
+def _summarize_tailscale_serve_json(serve_status_json: dict, port: int) -> str:
+    """Serve JSONの要点を、人間が確認しやすい短い診断行へ圧縮する。"""
+    if not serve_status_json:
+        return ""
+
+    target_patterns = _tailscale_serve_target_patterns(port)
+    routes: list[str] = []
+
+    def walk(value, path: str = ""):
+        if len(routes) >= 6:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                walk(child, child_path)
+        elif isinstance(value, list):
+            for idx, child in enumerate(value):
+                child_path = f"{path}[{idx}]"
+                walk(child, child_path)
+        elif isinstance(value, str):
+            if any(pattern in value for pattern in target_patterns):
+                routes.append(f"`{path}` -> `{value}`")
+
+    walk(serve_status_json)
+    if not routes:
+        return "- Serve JSON診断: 現在のAPI port向け転送はJSON上では見つかりませんでした。"
+    return "- Serve JSON診断: " + " / ".join(routes)
+
+
+def build_api_gateway_lite_connection_help() -> str:
+    """Nexus Ark Liteの接続先とTailscale Serveコマンドを表示するMarkdownを生成する。"""
+    settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+    port = int(settings.get("port", 8000) or 8000)
+    api_enabled = bool(settings.get("enabled"))
+    dns_name = _get_tailscale_dns_name()
+    tailscale_ip = _get_tailscale_ipv4()
+    serve_status = _get_tailscale_serve_status()
+    serve_status_json = _get_tailscale_serve_status_json()
+    local_url = f"http://127.0.0.1:{port}/lite"
+    lan_url = f"http://<PCのIPアドレス>:{port}/lite"
+    tailnet_http_url = f"http://{tailscale_ip}:{port}/lite" if tailscale_ip else f"http://<Tailscale IP>:{port}/lite"
+    https_url = f"https://{dns_name}/lite" if dns_name else "https://<PCのTailscale DNS名>.ts.net/lite"
+    serve_command = f"tailscale serve --bg --https=443 http://127.0.0.1:{port}"
+    serve_configured = _tailscale_serve_points_to_port(serve_status, serve_status_json, port)
+    serve_diagnostic = _summarize_tailscale_serve_json(serve_status_json, port)
+
+    api_state = "有効" if api_enabled else "無効"
+    dns_line = f"- Tailscale DNS名: `{dns_name}`" if dns_name else "- Tailscale DNS名: 未検出（MagicDNS/HTTPS有効化後に再確認）"
+    ip_line = f"- Tailscale IP: `{tailscale_ip}`" if tailscale_ip else "- Tailscale IP: 未検出"
+    if not shutil.which("tailscale"):
+        serve_line = "- Tailscale Serve: 未確認（Tailscale CLIが見つかりません）"
+        next_action = "次にやること: Tailscaleをインストールしてログイン後、接続情報を更新してください。"
+    elif serve_configured:
+        serve_line = f"- Tailscale Serve: **設定済み**（API Gateway port `{port}` へ転送）"
+        next_action = f"次にやること: スマホで `{https_url}` を開いてください。録音も使えます。"
+    elif serve_status or serve_status_json:
+        serve_line = "- Tailscale Serve: 未設定または別ポート向けに設定済み"
+        next_action = "次にやること: 「Tailscale HTTPS設定を実行」を押すか、下のコマンドをPC側で実行してください。"
+    else:
+        serve_line = "- Tailscale Serve: 未確認（Tailscale未ログイン、権限待ち、またはHTTPS/MagicDNS未設定の可能性）"
+        next_action = "次にやること: Tailscaleのログイン状態とMagicDNS/HTTPS設定を確認し、必要なら「Tailscale HTTPS設定を実行」を押してください。"
+
+    serve_diagnostic_block = f"{serve_diagnostic}\n" if serve_diagnostic else ""
+
+    return (
+        "#### Nexus Ark Lite 接続情報\n"
+        f"- API Gateway: **{api_state}** / Port `{port}`\n"
+        f"- PC内確認: `{local_url}`\n"
+        f"- 同一Wi-Fi: `{lan_url}`\n"
+        f"- Tailscale HTTP（テキスト・画像用）: `{tailnet_http_url}`\n"
+        f"- Tailscale HTTPS（音声入力用）: `{https_url}`\n"
+        f"{dns_line}\n"
+        f"{ip_line}\n"
+        f"{serve_line}\n\n"
+        f"{serve_diagnostic_block}"
+        f"**{next_action}**\n\n"
+        "スマホの音声入力はブラウザ制約によりHTTPSが必要です。Tailscale接続では、PC側で一度だけ以下を実行してHTTPS URLを使います。\n\n"
+        f"```bash\n{serve_command}\n```\n\n"
+        "設定済みか確認する場合:\n\n"
+        "```bash\n"
+        "tailscale serve status\n"
+        "tailscale serve status --json\n"
+        "```\n"
+    )
+
+
+def build_api_gateway_security_diagnostics() -> str:
+    """API Gateway / Lite公開前に見る安全診断をMarkdownで返す。"""
+    settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+    enabled = bool(settings.get("enabled", False))
+    host = str(settings.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    port = int(settings.get("port", 8000) or 8000)
+    require_auth = bool(settings.get("require_auth", True))
+    token = str(settings.get("auth_token") or "").strip()
+    rate_limit_enabled = bool(settings.get("rate_limit_enabled", True))
+    audit_enabled = bool(settings.get("audit_enabled", True))
+    public_host = host in {"0.0.0.0", "::"} or host not in {"127.0.0.1", "localhost", "::1"}
+    dns_name = _get_tailscale_dns_name()
+    https_url = f"https://{dns_name}/lite" if dns_name else "https://<PCのTailscale DNS名>.ts.net/lite"
+
+    checks: list[str] = []
+    checks.append(f"- API Gateway: {'🟢 有効' if enabled else '⚪ 無効'} / `{host}:{port}`")
+    checks.append(f"- Token認証: {'🟢 有効' if require_auth else '🔴 無効'}")
+    checks.append(f"- Token保存: {'🟢 済み' if token else '🔴 未設定'}")
+    checks.append(f"- レート制限: {'🟢 有効' if rate_limit_enabled else '🟡 無効'}")
+    checks.append(f"- 監査ログ: {'🟢 有効' if audit_enabled else '🟡 無効'}")
+    checks.append(f"- Tailscale HTTPS候補: `{https_url}`")
+
+    warnings: list[str] = []
+    if enabled and public_host and not require_auth:
+        warnings.append("🔴 公開HostでToken認証が無効です。API Gatewayは安全のため認証付きAPIを拒否します。")
+    if enabled and require_auth and not token:
+        warnings.append("🔴 Token認証が有効ですがTokenが未設定です。Token生成後に保存してください。")
+    if enabled and public_host and require_auth and token:
+        warnings.append("🟢 同一Wi-Fi/Tailscale向けの基本設定は揃っています。インターネット直公開は避け、中継またはTailscaleを使ってください。")
+    if host == "127.0.0.1":
+        warnings.append("🟡 Hostが `127.0.0.1` のため、同一Wi-Fiのスマホからは直接接続できません。Tailscale Serve経由なら接続できます。")
+    if public_host:
+        warnings.append("ℹ️ WSL上で動かしている場合、同一Wi-Fi直結にはWindows側のportproxy/ファイアウォール設定が必要なことがあります。")
+    if not rate_limit_enabled:
+        warnings.append("🟡 レート制限が無効です。公開中継や外部ツール利用時は有効化を推奨します。")
+    if not audit_enabled:
+        warnings.append("🟡 監査ログが無効です。認証失敗や管理操作の追跡が必要な場合は有効化を推奨します。")
+
+    warning_block = "\n".join(f"- {item}" for item in warnings) if warnings else "- 🟢 重大な警告はありません。"
+    return (
+        "#### API Gateway / Lite 安全診断\n"
+        f"{chr(10).join(checks)}\n\n"
+        "#### 判定\n"
+        f"{warning_block}\n\n"
+        "#### 公開方針\n"
+        "- 安全な利用のため、同一LAN（自宅Wi-Fi内）またはTailscale（VPN/HTTPS）での利用を推奨します。\n"
+        "- インターネットへ直接公開する場合は、Token中継サーバーやCloudflare Tunnel等の中継サービスを挟んで、公開するAPIを限定してください。\n"
+    )
+
+
+def build_api_gateway_personal_use_guide() -> str:
+    """個人拡張用途向けに、API Gateway / Liteの使い方をユーザーフレンドリーに案内する。"""
+    return (
+        "#### 📱 スマホからペルソナに話しかける\n"
+        "**Nexus Ark Lite** を使うと、外出先のスマホからペルソナとチャットしたり、"
+        "音声で話しかけたり、Twitter下書きを承認したりできます。\n\n"
+        "1. 下の「API設定」でAPI Gatewayを有効にして、接続用Tokenを生成・保存します。\n"
+        "2. 「Nexus Ark Lite 接続情報」に表示されるURLをスマホで開きます。\n"
+        "3. Tokenを入力して接続すると、ペルソナとの会話が始められます。\n\n"
+        "#### 🔌 身の回りの環境をペルソナに伝える\n"
+        "**API Gateway** を使うと、Nexus Ark本体を改造せずに、"
+        "身の回りのツールやデバイスからペルソナへ状況を伝えられます。\n\n"
+        "**こんなことができます:**\n"
+        "- 🏠 **スマートホーム連携**: SwitchBotやHome Assistantから、照明のON/OFF、ドアの開閉、室温変化などをペルソナに教える\n"
+        "- 🎨 **画像生成連携**: ローカル画像生成アプリなどで生成した画像情報をペルソナに伝える\n"
+        "- 💬 **自作アプリ・通知連携**: 自作のWebアプリや通知システム、外部サービスの情報をペルソナに渡す\n"
+        "- 🖥️ **PC状態通知**: 定期スクリプトから、バックアップ完了やエラー発生をペルソナに知らせる\n\n"
+        "基本的な流れは、外部ツールからペルソナへ「こんな出来事がありました」と伝えるだけです。"
+        "会話として返答が欲しい場合はチャット送信を、状態を確認したい場合はステータス取得を使います。\n\n"
+        "具体的な接続方法やコードサンプルは、下の「外部連携リファレンス」を開いてください。\n\n"
+        "#### ⚠️ 安全に使うために\n"
+        "- 自分のPC・自宅Wi-Fi・Tailscaleなど、**自分が管理するネットワーク**で使ってください。\n"
+        "- 「API設定」の **Token認証は必ず有効** にしてください。\n"
+        "- 詳しい安全確認は下の「安全診断」に表示されます。\n"
+    )
+
+
+def handle_refresh_api_gateway_lite_connection_help():
+    """REST API / Lite接続情報を再取得する。"""
+    return gr.update(value=build_api_gateway_lite_connection_help())
+
+
+def _load_external_integration_guide() -> str:
+    """assets/guides/api_gateway_external_integration.md を読み込む。失敗時は空文字。"""
+    guide_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "guides", "api_gateway_external_integration.md")
+    try:
+        with open(guide_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def build_api_gateway_external_docs(room_name: str = "") -> str:
+    """外部連携ユーザー向けのAPI概要とガイドファイル内容を表示するMarkdownを生成する。"""
+    settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+    port = int(settings.get("port", 8000) or 8000)
+    host = (settings.get("host") or "127.0.0.1").strip()
+    local_base = f"http://127.0.0.1:{port}"
+    lan_base = f"http://<PCのIPアドレス>:{port}"
+    configured_base = f"http://{host}:{port}" if host != "0.0.0.0" else lan_base
+    auth_note = "Token必須" if settings.get("require_auth", True) else "Token認証なし（ローカル検証向け）"
+
+    # --- 動的情報ヘッダー ---
+    header = (
+        "#### 現在の接続先\n"
+        f"- 設定: `{host}:{port}` / {auth_note}\n"
+        f"- PC内URL: `{local_base}`\n"
+        f"- 同一Wi-Fi/Tailscale: `{configured_base}`\n"
+        f"- OpenAPI/Swagger: `{local_base}/docs`\n\n"
+        "---\n\n"
+    )
+
+    # --- 独立ガイドファイルの読み込み ---
+    guide_content = _load_external_integration_guide()
+    if guide_content:
+        return header + guide_content
+
+    # --- フォールバック: ガイドファイルが読めない場合の最小リファレンス ---
+    return (
+        header
+        + "#### よく使うエンドポイント\n"
+        "| 用途 | メソッド | パス |\n"
+        "| :--- | :--- | :--- |\n"
+        "| ルーム一覧 | GET | `/api/v1/rooms` |\n"
+        "| 状態取得 | GET | `/api/v1/rooms/{room_id}/status` |\n"
+        "| 履歴取得 | GET | `/api/v1/rooms/{room_id}/chat/history?limit=12` |\n"
+        "| チャット送信 | POST | `/api/v1/rooms/{room_id}/chat` |\n"
+        "| 外部イベント注入 | POST | `/api/v1/rooms/{room_id}/events` |\n"
+        "| 画像アップロード | POST | `/api/v1/rooms/{room_id}/uploads` |\n"
+        "| 記憶検索 | GET | `/api/v1/rooms/{room_id}/memory/search?query=...` |\n\n"
+        "詳しいレシピは `assets/guides/api_gateway_external_integration.md` を参照してください。\n"
+    )
+
+
+def build_external_event_template(event_type: str = "switchbot_triggered") -> str:
+    """外部イベントテスター用のJSONテンプレートを返す。"""
+    templates = {
+        "switchbot_triggered": {
+            "summary": "書斎の照明が消えました",
+            "device": "study_light",
+            "state": "off",
+        },
+        "stackchan_observed": {
+            "summary": "ｽﾀｯｸﾁｬﾝがユーザーの呼びかけを検知しました",
+            "device": "stackchan",
+            "signal": "voice_detected",
+        },
+        "stable_diffusion_result": {
+            "summary": "Stable Diffusionで背景候補を生成しました",
+            "prompt": "cozy study room at night",
+            "image_path": "C:/path/to/generated.png",
+        },
+        "sns_post_received": {
+            "summary": "疑似SNSに新しい投稿が届きました",
+            "author": "friend_ai",
+            "text": "今日は星がきれい。",
+            "url": "https://example.local/posts/123",
+        },
+        "custom": {
+            "summary": "外部ツールからの任意イベントです",
+            "details": {},
+        },
+    }
+    payload = templates.get(event_type, templates["custom"])
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def handle_external_event_type_change(event_type: str):
+    """イベント種別に合わせてテスター用JSONを差し替える。"""
+    return gr.update(value=build_external_event_template(event_type))
+
+
+def handle_refresh_external_api_gateway_panel(room_name: str):
+    """外部接続タブのAPI説明を再生成する。"""
+    return (
+        gr.update(value=build_api_gateway_security_diagnostics()),
+        gr.update(value=build_api_gateway_lite_connection_help()),
+        gr.update(value=build_api_gateway_external_docs(room_name)),
+    )
+
+
+def handle_save_external_api_gateway_settings(enabled: bool, host: str, port: int, require_auth: bool, auth_token: str, auto_start_tailscale_serve: bool, room_name: str):
+    """外部接続タブ側からREST API Gateway設定を保存し、説明も更新する。"""
+    status = handle_save_api_gateway_settings(enabled, host, port, require_auth, auth_token, auto_start_tailscale_serve)
+    token = (auth_token or "").strip()
+    return (
+        status,
+        gr.update(value=token),
+        gr.update(value=build_api_gateway_security_diagnostics()),
+        gr.update(value=build_api_gateway_lite_connection_help()),
+        gr.update(value=build_api_gateway_external_docs(room_name)),
+    )
+
+
+def handle_test_external_event(
+    room_name: str,
+    event_type: str,
+    source: str,
+    trigger_notification: bool,
+    importance: str,
+    event_data_json: str,
+):
+    """UIから汎用外部イベントを記録する。"""
+    if not room_name:
+        return gr.update(value="❌ ルームが選択されていません。")
+    try:
+        event_data = json.loads(event_data_json or "{}")
+        if not isinstance(event_data, dict):
+            return gr.update(value="❌ イベント内容JSONはオブジェクト形式で入力してください。")
+    except json.JSONDecodeError as e:
+        return gr.update(value=f"❌ JSONの形式が正しくありません: {e}")
+
+    try:
+        from api.schemas import EventRequest
+        from api.service import record_event
+
+        response = record_event(
+            room_name,
+            EventRequest(
+                event_type=(event_type or "custom").strip() or "custom",
+                source=(source or "external_ui").strip() or "external_ui",
+                trigger_notification=bool(trigger_notification),
+                importance=(importance or "normal").strip() or "normal",
+                event_data=event_data,
+            ),
+        )
+        return gr.update(
+            value=(
+                "✅ 外部イベントを記録しました。\n\n"
+                f"- status: `{response.status}`\n"
+                f"- should_interact: `{response.should_interact}`\n"
+                f"- notification_status: `{response.notification_status or ''}`\n"
+                f"- notification: `{response.notification_text or ''}`\n\n"
+                "`trigger_notification=true` でも、通知候補になるのは `importance=high/critical` のイベントだけです。\n\n"
+                "チャット欄を再読み込みすると `SYSTEM:external_event` として確認できます。"
+            )
+        )
+    except Exception as e:
+        logger.error(f"Failed to test external event: {e}")
+        return gr.update(value=f"❌ 外部イベントの記録に失敗しました: {e}")
+
+
+def handle_configure_tailscale_lite_https():
+    """Nexus Ark Lite用のTailscale Serve設定を固定コマンドで実行する。"""
+    settings = config_manager.CONFIG_GLOBAL.get("api_gateway_settings", {}) or {}
+    port = int(settings.get("port", 8000) or 8000)
+    if not shutil.which("tailscale"):
+        return (
+            gr.update(value=build_api_gateway_security_diagnostics()),
+            gr.update(value=build_api_gateway_lite_connection_help()),
+            gr.update(value="Tailscale CLIが見つかりません。PC側でTailscaleをインストールし、`tailscale serve --https=443 http://127.0.0.1:8000` を実行してください。"),
+        )
+
+    serve_status = _get_tailscale_serve_status()
+    serve_status_json = _get_tailscale_serve_status_json()
+    if _tailscale_serve_points_to_port(serve_status, serve_status_json, port):
+        dns_name = _get_tailscale_dns_name()
+        url = f"https://{dns_name}/lite" if dns_name else "https://<PCのTailscale DNS名>.ts.net/lite"
+        return (
+            gr.update(value=build_api_gateway_security_diagnostics()),
+            gr.update(value=build_api_gateway_lite_connection_help()),
+            gr.update(value=f"Tailscale HTTPSは既に設定済みです。スマホで `{url}` を開いてください。"),
+        )
+
+    command = ["tailscale", "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"]
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
+        output = "\n".join(part.strip() for part in [result.stdout, result.stderr] if part and part.strip())
+        if result.returncode == 0:
+            dns_name = _get_tailscale_dns_name()
+            url = f"https://{dns_name}/lite" if dns_name else "https://<PCのTailscale DNS名>.ts.net/lite"
+            return (
+                gr.update(value=build_api_gateway_security_diagnostics()),
+                gr.update(value=build_api_gateway_lite_connection_help()),
+                gr.update(value=f"Tailscale HTTPS設定を実行しました。スマホで `{url}` を開いてください。"),
+            )
+        message = output or "Tailscale Serve設定に失敗しました。"
+        return (
+            gr.update(value=build_api_gateway_security_diagnostics()),
+            gr.update(value=build_api_gateway_lite_connection_help()),
+            gr.update(value=f"Tailscale Serve設定に失敗しました。\n\n```text\n{message}\n```"),
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            gr.update(value=build_api_gateway_security_diagnostics()),
+            gr.update(value=build_api_gateway_lite_connection_help()),
+            gr.update(value="Tailscale Serve設定がタイムアウトしました。Tailscaleの認証/HTTPS有効化画面が待機している可能性があります。"),
+        )
+    except Exception as e:
+        return (
+            gr.update(value=build_api_gateway_security_diagnostics()),
+            gr.update(value=build_api_gateway_lite_connection_help()),
+            gr.update(value=f"Tailscale Serve設定でエラーが発生しました: {e}"),
+        )
+
+
+def handle_save_api_gateway_settings(enabled: bool, host: str, port: int, require_auth: bool, auth_token: str, auto_start_tailscale_serve: bool):
+    """REST API Gatewayの設定を保存する。"""
+    try:
+        host = (host or "").strip() or "0.0.0.0"
+        port = int(port or 8000)
+        if not (1 <= port <= 65535):
+             return gr.update(value="API状態: ❌ ポート番号は1〜65535で指定してください。")
+
+        auth_token = (auth_token or "").strip()
+        if require_auth and not auth_token:
+            return gr.update(value="API状態: ❌ 認証を有効にする場合はTokenが必要です。")
+
+        config_manager.save_api_gateway_settings(
+            enabled=enabled,
+            host=host,
+            port=port,
+            require_auth=require_auth,
+            auth_token=auth_token,
+            auto_start_tailscale_serve=auto_start_tailscale_serve,
+        )
+
+        # api.server から動的起動・停止・再起動用の関数をインポート
+        from api.server import start_server as start_api_gateway_server
+        from api.server import stop_server as stop_api_gateway_server
+
+        # 既存サーバーを確実に停止
+        try:
+            stop_api_gateway_server()
+        except Exception as stop_err:
+            logger.warning(f"Failed to stop API Gateway server: {stop_err}")
+
+        # ポート解放を少し待つ
+        import time
+        time.sleep(0.5)
+
+        if enabled:
+            try:
+                # 新しい設定でサーバーを再起動
+                start_api_gateway_server(port=port, host=host, daemon=True)
+                
+                # 必要であればTailscale Serveの自動設定も非同期で呼び出す
+                if auto_start_tailscale_serve:
+                    import shutil
+                    if shutil.which("tailscale"):
+                        import threading
+                        logger.info("Tailscale HTTPS Serve の自動設定を非同期で開始します...")
+                        threading.Thread(
+                            target=handle_configure_tailscale_lite_https,
+                            daemon=True
+                        ).start()
+                
+                return gr.update(value="API状態: 🟢 設定を保存し、API Gatewayを起動/再起動しました。")
+            except Exception as start_err:
+                logger.error(f"Failed to start API Gateway server: {start_err}")
+                return gr.update(value=f"API状態: ⚠️ 設定を保存しましたが、起動に失敗しました ({start_err})。")
+        else:
+            return gr.update(value="API状態: ⚪ 無効として保存し、API Gatewayを停止しました。")
+    except Exception as e:
+        logger.error(f"Failed to save API Gateway settings: {e}")
+        return gr.update(value=f"API状態: ❌ エラーが発生しました ({e})")
+
 
 # ===== 🧠 内的状態（Internal State）用ハンドラ =====
 
@@ -18602,6 +19937,73 @@ def get_temp_location_ui_state(room_name):
 # Twitter (X) 連携用ハンドラ
 # ==========================================
 
+TWITTER_DRAFT_PREVIEW_CACHE_DIR = os.path.join(tempfile.gettempdir(), "nexus_ark_twitter_draft_previews")
+
+
+def _normalize_file_paths(file_values) -> List[str]:
+    """gr.File の値を承認処理で使えるファイルパス配列へ正規化する。"""
+    if not file_values:
+        return []
+
+    if isinstance(file_values, (str, os.PathLike)):
+        file_values = [file_values]
+
+    paths = []
+    for item in file_values:
+        path = None
+        if isinstance(item, (str, os.PathLike)):
+            path = os.fspath(item)
+        elif isinstance(item, dict):
+            path = item.get("path") or item.get("name") or item.get("orig_name")
+        elif hasattr(item, "name"):
+            path = item.name
+
+        if path:
+            paths.append(os.fspath(path))
+
+    return paths
+
+
+def _build_twitter_media_gallery_value(file_values) -> List[str]:
+    """
+    添付プレビュー用の画像パスを生成する。
+
+    Gradio/ブラウザは同じローカルパスの画像をキャッシュしやすいため、
+    mtime/size を含むファイル名で一時コピーを作り、差し替え後のプレビューを確実に更新する。
+    """
+    preview_paths = []
+    source_paths = _normalize_file_paths(file_values)
+    if not source_paths:
+        return preview_paths
+
+    os.makedirs(TWITTER_DRAFT_PREVIEW_CACHE_DIR, exist_ok=True)
+
+    for source_path in source_paths:
+        if not source_path or not os.path.exists(source_path):
+            continue
+
+        try:
+            kind = filetype.guess(source_path)
+            if not (kind and kind.mime.startswith("image/")):
+                continue
+
+            stat = os.stat(source_path)
+            source_abs = os.path.abspath(source_path)
+            digest_src = f"{source_abs}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")
+            digest = hashlib.sha256(digest_src).hexdigest()[:16]
+            ext = Path(source_path).suffix or f".{kind.extension}"
+            preview_path = os.path.join(TWITTER_DRAFT_PREVIEW_CACHE_DIR, f"{Path(source_path).stem}_{digest}{ext}")
+
+            if not os.path.exists(preview_path):
+                shutil.copy2(source_path, preview_path)
+
+            preview_paths.append(preview_path)
+        except Exception as e:
+            print(f"--- [Twitter Draft Preview] 添付画像プレビュー生成エラー ({source_path}): {e} ---")
+
+    return preview_paths
+
+
 def handle_refresh_twitter_pending(room_name: str = None):
     """承認待ちキューの表示を更新する"""
     from twitter_manager import twitter_manager
@@ -18675,7 +20077,16 @@ def handle_load_twitter_draft_by_id(draft_id: str):
             gr.Warning(f"添付画像の一部（{missing_count}件）が見つかりません。削除された可能性があります。")
         # ---------------------------
 
-        return draft["id"], draft["filtered_content"], warnings_text, reply_preview, reply_url, reply_id, valid_media_paths, valid_media_paths
+        return (
+            draft["id"],
+            draft["filtered_content"],
+            warnings_text,
+            reply_preview,
+            reply_url,
+            reply_id,
+            valid_media_paths,
+            _build_twitter_media_gallery_value(valid_media_paths),
+        )
 
     return "", "", "", "※ 読み込めませんでした", "", "", [], []
 
@@ -18709,7 +20120,12 @@ def handle_approve_twitter_tweet(draft_id: str, edited_content: str, edited_repl
         gr.Warning(f"文字数制限超過 ({tw_length}/{limit}文字)。短縮してから承認してください。")
         return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
-    success = twitter_manager.approve_tweet(draft_id, edited_content, edited_reply_url, edited_media_paths)
+    success = twitter_manager.approve_tweet(
+        draft_id,
+        edited_content,
+        edited_reply_url,
+        _normalize_file_paths(edited_media_paths),
+    )
 
     if success:
         gr.Info("下書きを承認しました。投稿プロセスを開始します...")
@@ -18740,6 +20156,11 @@ def handle_approve_twitter_tweet(draft_id: str, edited_content: str, edited_repl
 
     gr.Error("承認に失敗しました。")
     return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+
+
+def handle_twitter_media_file_change(file_values):
+    """添付画像欄の差し替えに合わせてプレビューだけを更新する。"""
+    return _build_twitter_media_gallery_value(file_values)
 
 def handle_reject_twitter_tweet(draft_id: str):
     """下書きを却下（削除）する"""
@@ -18997,6 +20418,11 @@ def handle_twitter_history_retry(draft_id: str):
 
     return pending_df, history_df, "", gr.update(selected="twitter_post_subtab")
 
+def handle_twitter_history_retry_lite(draft_id: str):
+    """軽量Twitter承認UI向けに履歴を下書きへ戻す。"""
+    pending_df, history_df, detail_text, _ = handle_twitter_history_retry(draft_id)
+    return pending_df, history_df, detail_text
+
 def _is_blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == "")
 
@@ -19011,7 +20437,7 @@ def _twitter_save_looks_like_unloaded_defaults(
     posting_summary,
     posting_guidelines,
     auto_post,
-    approval_required_for_replies,
+    approval_for_replies,
     notify_on_approval_request,
     is_premium,
     enable_privacy_filter,
@@ -19027,7 +20453,7 @@ def _twitter_save_looks_like_unloaded_defaults(
         not _is_blank(existing.get("posting_guidelines")),
         bool(existing.get("enabled")),
         bool(existing.get("auto_post")),
-        bool(existing.get("approval_required_for_replies")),
+        bool(existing.get("approval_for_replies")),
         bool(existing.get("notify_on_approval_request")),
         bool(existing.get("is_premium")),
         bool(existing.get("fetch_thread_enabled")),
@@ -19046,7 +20472,7 @@ def _twitter_save_looks_like_unloaded_defaults(
         and _is_blank(posting_summary)
         and _is_blank(posting_guidelines)
         and bool(auto_post) is False
-        and bool(approval_required_for_replies) is False
+        and bool(approval_for_replies) is True
         and bool(notify_on_approval_request) is False
         and bool(is_premium) is False
         and bool(enable_privacy_filter) is True
@@ -19055,10 +20481,10 @@ def _twitter_save_looks_like_unloaded_defaults(
     )
 
 #def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_secret, access_token, access_token_secret, posting_summary, posting_guidelines, auto_post, notify_on_approval_request, is_premium, enable_privacy_filter, fetch_thread_enabled, thread_fetch_count):
-def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_secret, access_token, access_token_secret, posting_summary, posting_guidelines, auto_post, approval_required_for_replies, notify_on_approval_request, is_premium, enable_privacy_filter, fetch_thread_enabled, thread_fetch_count):
+def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_secret, access_token, access_token_secret, posting_summary, posting_guidelines, auto_post, approval_for_replies, notify_on_approval_request, is_premium, enable_privacy_filter, fetch_thread_enabled, thread_fetch_count):
     """Twitter連携設定を保存する"""
     print(f"DEBUG: Save Twitter settings for {room_name}")
-    print(f"DEBUG: auth_mode={auth_mode}, enabled={enabled}, auto_post={auto_post}")
+    print(f"DEBUG: auth_mode={auth_mode}, enabled={enabled}, auto_post={auto_post}, approval_replies={approval_for_replies}, approval_request={notify_on_approval_request}, is_premium={is_premium}")
     print(f"DEBUG: api_key={'exists' if api_key else 'None/Empty'}")
 
     if not room_name:
@@ -19082,7 +20508,7 @@ def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_sec
         posting_summary,
         posting_guidelines,
         auto_post,
-        approval_required_for_replies,
+        approval_for_replies,
         notify_on_approval_request,
         is_premium,
         enable_privacy_filter,
@@ -19107,7 +20533,7 @@ def handle_save_twitter_settings(room_name, enabled, auth_mode, api_key, api_sec
             "posting_summary": posting_summary or "",
             "posting_guidelines": posting_guidelines or "",
             "auto_post": bool(auto_post),
-            "approval_required_for_replies": bool(approval_required_for_replies),
+            "approval_for_replies": bool(approval_for_replies),
             "notify_on_approval_request": bool(notify_on_approval_request),
             "is_premium": bool(is_premium),
             "enable_privacy_filter": bool(enable_privacy_filter),
@@ -19189,7 +20615,7 @@ def handle_test_twitter_api(api_key, api_secret, access_token, access_token_secr
 def handle_load_twitter_settings(room_name):
     """ルーム設定からTwitterの認証情報を読み込み、UIに反映させる"""
     if not room_name:
-        return [gr.update()] * 13
+        return [gr.update()] * 17
 
     import room_manager
     room_config = room_manager.get_room_config(room_name) or {}
@@ -19202,7 +20628,7 @@ def handle_load_twitter_settings(room_name):
     posting_summary = twitter_settings.get("posting_summary", "")
     posting_guidelines = twitter_settings.get("posting_guidelines", "")
     auto_post = twitter_settings.get("auto_post", False)
-    approval_required_for_replies = twitter_settings.get("approval_required_for_replies", True)
+    approval_for_replies = twitter_settings.get("approval_for_replies", True)
     notify_on_approval_request = twitter_settings.get("notify_on_approval_request", False)
     is_premium = twitter_settings.get("is_premium", False)
     enable_privacy_filter = twitter_settings.get("enable_privacy_filter", True)
@@ -19216,7 +20642,7 @@ def handle_load_twitter_settings(room_name):
         gr.update(value=posting_summary),
         gr.update(value=posting_guidelines),
         gr.update(value=auto_post),
-        gr.update(value=approval_required_for_replies),
+        gr.update(value=approval_for_replies),
         gr.update(value=notify_on_approval_request),
         gr.update(value=api_config.get("api_key", ""), type="password"),
         gr.update(value=api_config.get("api_secret", ""), type="password"),
@@ -19762,6 +21188,24 @@ def handle_mcp_type_change(server_type):
             gr.update(visible=False),  # 引数欄を隠す
         )
 
+def handle_refresh_mcp_servers_lite():
+    """軽量UI向けにMCPサーバ一覧をDataframeへ読み込む。"""
+    config = config_manager.load_config_file()
+    settings = config.get("custom_tools_settings", {})
+    mcp_servers = settings.get("mcp_servers", [])
+    rows = [
+        [
+            server.get("enabled", True),
+            server.get("name", ""),
+            server.get("type", "stdio"),
+            server.get("command") or server.get("url", ""),
+            " ".join(server.get("args", [])),
+            "未接続",
+        ]
+        for server in mcp_servers
+    ]
+    return gr.update(value=rows)
+
 def handle_add_mcp_server(name, server_type, cmd_url, args_str, enabled):
     """MCPサーバを新規登録する"""
     if not name or not cmd_url:
@@ -19962,6 +21406,11 @@ def handle_save_plugin_code(filename, code, enabled):
         return res_msg, gr.update(value=df_data)
     except Exception as e:
         return f"❌ 保存失敗: {e}", gr.update()
+
+def handle_save_plugin_code_lite(filename, code, enabled):
+    """軽量UI向けにプラグイン保存結果とファイル一覧だけを返す。"""
+    status, _ = handle_save_plugin_code(filename, code, enabled)
+    return status, handle_refresh_local_plugin_files()
 
 def handle_create_new_plugin(filename):
     """新しいプラグインファイルを作成する"""
@@ -20465,3 +21914,219 @@ def handle_accept_disclaimer(service_name: str):
     # 状態の即時反映のために gr.update を返す
     # 1番目: アコーディオンを閉じる, 2番目: 承諾ボタンを非表示, 3番目: メインコンテンツを表示
     return gr.update(open=False), gr.update(visible=False), gr.update(visible=True)
+
+def handle_tts_profile_change(profile_name: str, room_name: str):
+    """ルーム個別設定のOpenAI互換接続プロファイルが変更された際に、
+    現在のTTS設定をプロファイル別キャッシュに保存し、
+    新プロファイルのキャッシュから設定を復元する。"""
+    model_choices = config_manager.get_openai_compatible_tts_model_choices_for_profile(profile_name)
+    default_model = model_choices[0] if model_choices else None
+    voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(profile_name, model_name=default_model)
+    voice_choices = list(voice_map.values())
+    default_voice_display = voice_choices[0] if voice_choices else None
+
+    restored_model = default_model
+    restored_voice_display = default_voice_display
+    restored_style = ""
+
+    if room_name:
+        override_settings = {}
+        room_config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
+        if os.path.exists(room_config_path):
+            try:
+                with open(room_config_path, "r", encoding="utf-8") as f:
+                    room_config = json.load(f)
+                override_settings = room_config.get("override_settings", {})
+            except Exception:
+                pass
+
+        oc_settings = override_settings.setdefault("tts_provider_settings", {}).setdefault("openai_compatible", {})
+        profile_cache = oc_settings.setdefault("_profile_cache", {})
+
+        # 現在のプロファイルの設定をキャッシュに保存（切り替え前のプロファイル名を使う）
+        old_profile = oc_settings.get("tts_profile_name")
+        if old_profile and old_profile != profile_name:
+            profile_cache[old_profile] = {
+                "tts_model": oc_settings.get("tts_model"),
+                "tts_voice": oc_settings.get("tts_voice"),
+                "voice_style_prompt": oc_settings.get("voice_style_prompt", ""),
+            }
+
+        # 新プロファイルのキャッシュから復元
+        cached = profile_cache.get(profile_name, {})
+        restored_model = cached.get("tts_model") or default_model
+        if model_choices and restored_model not in model_choices:
+            restored_model = default_model
+        elif not model_choices:
+            restored_model = None
+        voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(profile_name, model_name=restored_model)
+        voice_choices = list(voice_map.values())
+        default_voice_display = voice_choices[0] if voice_choices else None
+        restored_voice_id = cached.get("tts_voice")
+        restored_style = cached.get("voice_style_prompt", "")
+
+        if restored_voice_id and restored_voice_id in voice_map:
+            restored_voice_display = voice_map[restored_voice_id]
+        else:
+            restored_voice_id = next(iter(voice_map.keys()), None)
+            restored_voice_display = default_voice_display
+
+        # oc_settings を新プロファイルの値で更新
+        oc_settings["tts_profile_name"] = profile_name
+        oc_settings["tts_model"] = restored_model
+        oc_settings["tts_voice"] = restored_voice_id
+        oc_settings["voice_style_prompt"] = restored_style
+
+        # 共通キーの同期
+        updates = {
+            "tts_profile_name": profile_name,
+            "tts_model": restored_model,
+        }
+        updates["tts_voice"] = restored_voice_id
+        override_settings.update(updates)
+        room_manager.update_room_config(room_name, {"override_settings": override_settings})
+
+    # カスタム値をchoicesに含める
+    model_choices = _ensure_value_in_choices(model_choices, restored_model)
+    if config_manager.get_openai_profile_tts_kind(profile_name) == "custom" and restored_voice_display and restored_voice_display not in voice_choices:
+        voice_choices = voice_choices + [restored_voice_display]
+
+    return (
+        gr.update(choices=model_choices, value=restored_model),
+        gr.update(choices=voice_choices, value=restored_voice_display),
+        gr.update(value=restored_style),
+    )
+
+
+def handle_tts_model_change_for_voice_choices(
+    room_name: str,
+    provider_display: str,
+    profile_name: str,
+    model_name: str,
+):
+    """OpenAI互換TTSモデル変更時に、そのモデルで使える声だけへ候補を更新する。"""
+    provider = config_manager.tts_provider_key_from_display(provider_display)
+    if provider != "openai_compatible":
+        return gr.update()
+
+    voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(profile_name, model_name=model_name)
+    voice_choices = list(voice_map.values())
+    if not voice_map:
+        return gr.update(choices=[], value=None)
+
+    restored_voice_id = None
+    if room_name:
+        room_config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
+        if os.path.exists(room_config_path):
+            try:
+                with open(room_config_path, "r", encoding="utf-8") as f:
+                    room_config = json.load(f)
+                overrides = room_config.get("override_settings", {})
+                provider_settings = overrides.get("tts_provider_settings", {}).get("openai_compatible", {})
+                restored_voice_id = provider_settings.get("tts_voice") or overrides.get("tts_voice")
+            except Exception:
+                restored_voice_id = None
+
+    if restored_voice_id in voice_map:
+        display_voice = voice_map[restored_voice_id]
+    else:
+        restored_voice_id = next(iter(voice_map.keys()), None)
+        display_voice = next(iter(voice_map.values()), None)
+
+    if room_name and restored_voice_id:
+        room_config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
+        overrides = {}
+        if os.path.exists(room_config_path):
+            try:
+                with open(room_config_path, "r", encoding="utf-8") as f:
+                    overrides = json.load(f).get("override_settings", {})
+            except Exception:
+                overrides = {}
+        provider_settings = overrides.setdefault("tts_provider_settings", {})
+        openai_compatible_settings = provider_settings.setdefault("openai_compatible", {})
+        openai_compatible_settings["tts_model"] = model_name
+        openai_compatible_settings["tts_voice"] = restored_voice_id
+        room_manager.update_room_config(
+            room_name,
+            {
+                "override_settings": {
+                    "tts_model": model_name,
+                    "tts_voice": restored_voice_id,
+                    "tts_provider_settings": provider_settings,
+                }
+            },
+        )
+
+    return gr.update(choices=voice_choices, value=display_voice)
+
+
+def handle_fetch_openai_compatible_tts_models(
+    room_name: str,
+    provider_display: str,
+    profile_name: str,
+):
+    """OpenAI互換プロファイルからTTSモデル/声候補を取得し、プロファイルへキャッシュする。"""
+    provider = config_manager.tts_provider_key_from_display(provider_display)
+    if provider != "openai_compatible":
+        gr.Warning("TTSモデル取得はOpenAI互換プロファイル選択時に使用できます。")
+        return gr.update(), gr.update()
+    if not profile_name:
+        gr.Warning("OpenAI互換プロファイルが選択されていません。")
+        return gr.update(), gr.update()
+
+    setting = config_manager.get_openai_setting_by_name(profile_name)
+    if not setting:
+        gr.Warning(f"プロファイル「{profile_name}」が見つかりません。")
+        return gr.update(), gr.update()
+
+    base_url = setting.get("base_url") or ""
+    api_key = setting.get("api_key") or ""
+    capabilities = config_manager.fetch_openai_compatible_tts_capabilities(profile_name, base_url, api_key)
+    models = capabilities.get("models") or []
+    voice_cache = capabilities.get("voice_cache") or {}
+    kind = capabilities.get("kind")
+
+    config_manager.save_openai_profile_tts_cache(profile_name, models, voice_cache)
+
+    if not models:
+        if kind == "no_tts":
+            gr.Warning(f"プロファイル「{profile_name}」は既知の非TTSプロファイルです。TTS対応のプロファイルを選択してください。")
+        else:
+            gr.Warning(f"プロファイル「{profile_name}」からTTSモデルを取得できませんでした。")
+        return gr.update(choices=[], value=None), gr.update(choices=[], value=None)
+
+    selected_model = models[0]
+    voice_map = config_manager.get_openai_compatible_tts_voice_map_for_profile(profile_name, base_url, selected_model)
+    voice_choices = list(voice_map.values())
+    selected_voice_id = next(iter(voice_map.keys()), None)
+    selected_voice_display = next(iter(voice_map.values()), None)
+
+    if room_name:
+        room_config_path = os.path.join(constants.ROOMS_DIR, room_name, "room_config.json")
+        overrides = {}
+        if os.path.exists(room_config_path):
+            try:
+                with open(room_config_path, "r", encoding="utf-8") as f:
+                    overrides = json.load(f).get("override_settings", {})
+            except Exception:
+                overrides = {}
+        provider_settings = overrides.setdefault("tts_provider_settings", {})
+        openai_compatible_settings = provider_settings.setdefault("openai_compatible", {})
+        openai_compatible_settings["tts_profile_name"] = profile_name
+        openai_compatible_settings["tts_model"] = selected_model
+        if selected_voice_id:
+            openai_compatible_settings["tts_voice"] = selected_voice_id
+        updates = {
+            "tts_profile_name": profile_name,
+            "tts_model": selected_model,
+            "tts_provider_settings": provider_settings,
+        }
+        if selected_voice_id:
+            updates["tts_voice"] = selected_voice_id
+        room_manager.update_room_config(room_name, {"override_settings": updates})
+
+    gr.Info(f"プロファイル「{profile_name}」のTTSモデル候補を更新しました（{len(models)}件）。")
+    return (
+        gr.update(choices=models, value=selected_model),
+        gr.update(choices=voice_choices, value=selected_voice_display),
+    )

@@ -58,13 +58,50 @@ def generate_scenery_context(
         from utils import get_season, get_time_of_day, load_scenery_cache, save_scenery_cache
         import hashlib
         import datetime
+        from weather_service import WeatherService
 
         now = datetime.datetime.now()
-        effective_season = season_en or get_season(now.month)
-        effective_time_of_day = time_of_day_en or get_time_of_day(now.hour)
+        
+        # 設定のロード
+        config = config_manager.load_config_file()
+        weather_settings = config.get("weather_settings", {})
+        enable_scenery = weather_settings.get("enable_scenery_reflection", False)
+        
+        weather_data = None
+        weather_code = "none"
+        enhanced_season_en = None
+        enhanced_time_en = None
+        
+        if enable_scenery:
+            try:
+                lat = weather_settings.get("latitude")
+                lon = weather_settings.get("longitude")
+                if lat is not None and lon is not None:
+                    service = WeatherService()
+                    # キャッシュから優先取得
+                    weather_data = service.get_cached_weather()
+                    if not weather_data:
+                        weather_data = service.fetch_weather(lat, lon)
+                        
+                    if weather_data:
+                        weather_code = str(weather_data.weather_code)
+                        # 動的な体感季節・日出日没ベースの時間帯を判定
+                        _, enhanced_season_en = service.get_enhanced_season(weather_data.temperature, now.month)
+                        _, enhanced_time_en = service.get_enhanced_time_of_day(now.time(), weather_data.sunrise, weather_data.sunset)
+            except Exception as we:
+                print(f"--- [Scenery Weather Warning] 天気データ取得失敗 (フォールバックします): {we} ---")
+
+        # 外部指定がない場合は、動的判定 -> 従来判定の順でフォールバック
+        effective_season = season_en or enhanced_season_en or get_season(now.month)
+        effective_time_of_day = time_of_day_en or enhanced_time_en or get_time_of_day(now.hour)
 
         content_hash = hashlib.md5(space_def.encode('utf-8')).hexdigest()[:8]
-        cache_key = f"{current_location_name}_{content_hash}_{effective_season}_{effective_time_of_day}"
+        
+        # キャッシュキー設計: 天気設定が有効なら天気コードを付加する
+        if enable_scenery and weather_code != "none":
+            cache_key = f"{current_location_name}_{content_hash}_{effective_season}_{effective_time_of_day}_{weather_code}"
+        else:
+            cache_key = f"{current_location_name}_{content_hash}_{effective_season}_{effective_time_of_day}"
 
         # プレースホルダーキー（未設定状態）の判定
         is_placeholder_key = not api_key or api_key == "YOUR_API_KEY_HERE" or api_key.startswith("AIzaSyB-") # デフォルト同梱の期限切れキー等
@@ -101,7 +138,12 @@ def generate_scenery_context(
         if not space_def.startswith("（"):
             try:
                 # プロンプトの構築
-                season_map_en_to_ja = {"spring": "春", "summer": "夏", "autumn": "秋", "winter": "冬"}
+                season_map_en_to_ja = {
+                    "spring": "春", "early_spring": "早春",
+                    "summer": "夏", "early_summer": "初夏", "late_summer": "残暑",
+                    "autumn": "秋", "late_autumn": "晩秋",
+                    "winter": "冬"
+                }
                 season_ja = season_map_en_to_ja.get(effective_season, "不明な季節")
                 
                 time_map_en_to_ja = {
@@ -110,9 +152,22 @@ def generate_scenery_context(
                 }
                 time_of_day_ja = time_map_en_to_ja.get(effective_time_of_day, "不明な時間帯")
 
+                # 天気プロンプトの構成
+                weather_info_prompt = ""
+                if weather_data and enable_scenery:
+                    weather_info_prompt = (
+                        f"【情報源3：現在のリアル天気（居住地連動）】\n"
+                        f"- 天気: {weather_data.weather_description}\n"
+                        f"- 気温: {weather_data.temperature:.1f}℃ (体感気温: {weather_data.apparent_temperature:.1f}℃)\n"
+                        f"- 湿度: {weather_data.humidity}%\n"
+                        f"- 降水量: {weather_data.precipitation}mm\n\n"
+                        f"※窓の外に見える空の色や光の差し込み方、部屋を満たす空気感（暖かい、肌寒い、湿っているなど）に、このリアル天気のニュアンスを自然かつ豊かに織り交ぜて描写してください。\n"
+                    )
+
                 scenery_prompt = (
                     "あなたは、与えられた情報源から、一つのまとまった情景を描き出す情景描写の専門家です。\n\n"
                     f"【情報源1：時間・季節】\n- 時間帯: {time_of_day_ja}\n- 季節: {season_ja}\n\n"
+                    f"{weather_info_prompt}"
                     f"【情報源2：空間設定と設置アイテム】\n---\n{space_def}\n---\n\n"
                     "【あなたのタスク】\n"
                     "情報源を統合し、その場のリアルな雰囲気を伝える**最終的な情景描写の文章のみを、2〜3文で生成してください。**\n\n"
@@ -124,7 +179,13 @@ def generate_scenery_context(
                     "- **あなたの思考過程や判断理由は、絶対に出力に含めないでください。**\n"
                     "- 具体的な時刻（例：「23時42分」）は文章に含めないでください。\n"
                     "- 人物やキャラクターの描写は絶対に含めないでください。\n"
-                    "- 五感に訴えかける、**空気感まで伝わるような**精緻で写実的な描写を重視してください。"
+                    "- 五感に訴えかける、**空気感まで伝わるような**精緻で写実的な描写を重視してください。\n\n"
+                    "【冷暖房・熱源設備の描写制御ルール】\n"
+                    "- 空間設定（情報源2）に「暖炉」「ストーブ」「ヒーター」などの暖房熱源が描写されている場合：\n"
+                    "  - 気温が20.0℃以上、あるいは体感季節が「夏」「初夏」「残暑」の時は、それらは絶対に「火は消えて静かに冷めている」「休止している」と火が消えた冷たい状態として描写してください（夏場に暖炉が燃え盛る描写は厳禁です）。\n"
+                    "  - 気温が15.0℃未満、あるいは体感季節が「冬」「晩秋」「早春」の時は、「赤々と火が灯っている」「心地よい温もりをもたらしている」と稼働している様子を描写してください。\n"
+                    "- 空間設定に「エアコン」「扇風機」「クーラー」などが描写されている場合：\n"
+                    "  - 気温や季節に応じて、適切に「涼しい風を送り出している」「暖かな空気を循環させている」、あるいは穏やかな気候の時は「静かにオフになっている（佇んでいる）」と自然に稼働状態を切り替えて描写してください。"
                 )
 
                 # LLMFactoryの統合的なリトライ・ローテーション機能を呼び出す

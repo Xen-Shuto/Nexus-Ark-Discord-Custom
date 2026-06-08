@@ -449,7 +449,8 @@ class TwitterManager:
             import room_manager
             room_config = room_manager.get_room_config(room_name) or {}
             twitter_settings = room_config.get("override_settings", {}).get("twitter_settings", {})
-            return twitter_settings.get("auto_post", False)
+            #return twitter_settings.get("auto_post", False)
+            return (twitter_settings.get("auto_post", False) and not twitter_settings.get("approval_for_replies", True))
         except Exception:
             return False
 
