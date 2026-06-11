@@ -1,4 +1,4 @@
-const CACHE_NAME = "nexus-ark-lite-v55";
+const CACHE_NAME = "nexus-ark-lite-v57";
 const ASSETS = [
   "/lite",
   "/lite/",

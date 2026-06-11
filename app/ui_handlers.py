@@ -2233,7 +2233,7 @@ def handle_initial_load(room_name: str = None, expected_count: int = 246, reques
     if last_api_key_from_config not in valid_key_names:
         safe_initial_api_key = valid_key_names[0]
     # ワーキングメモリの初期化 (v3)
-    wm_slots_update, wm_content_update = _get_working_memory_updates(safe_initial_room)
+    wm_slots_update, wm_content_update, _ = _get_working_memory_updates(safe_initial_room)
     t_step = _perf_log("handle_initial_load: _get_working_memory_updates", t_step)
 
     # --- 2. 司令塔として、他のハンドラのロジックを呼び出してUI更新値を生成 ---

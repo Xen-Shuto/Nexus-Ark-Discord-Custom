@@ -53,6 +53,8 @@ DEFAULT_ALARM_API_HISTORY_TURNS = 10
 # --- 自律行動設定 ---
 MIN_AUTONOMOUS_INTERVAL_MINUTES = 120  # 自律行動の無操作判定時間のデフォルト（分）
 DEFAULT_SCHEDULE_COOLDOWN_MINUTES = 60  # schedule_next_action ツールのクールダウン/最小間隔のデフォルト（分）
+MAX_AUTONOMOUS_INTERVAL_MINUTES = 10080  # quietプリセットと同じ7日（分）
+MAX_SCHEDULE_COOLDOWN_MINUTES = 10080  # quietプリセットと同じ7日（分）
 
 # --- 「本日分」ログ設定 ---
 MIN_TODAY_LOG_FALLBACK_TURNS = 20  # エピソード記憶作成後の最低表示・送信往復数

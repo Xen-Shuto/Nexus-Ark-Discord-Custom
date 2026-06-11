@@ -39,7 +39,7 @@ class ToolRegistry:
             "start_autonomy_timeline", "record_autonomy_step", "complete_autonomy_timeline",
             "list_procedures", "read_procedure", "save_procedure", "create_procedure_from_timeline",
             "read_capability_policy", "request_capability_approval", "record_capability_audit",
-            "send_user_notification", "send_discord_message", "send_discord_image",
+            "send_user_notification", "send_discord_message", "send_discord_image", "get_discord_authorized_channels",
             "recommend_music",
             "read_creative_notes", "plan_creative_notes_edit",
             "read_research_notes", "plan_research_notes_edit",
@@ -205,7 +205,7 @@ class ToolRegistry:
             ],
             "music": ["recommend_music"],
             "procedure": ["list_procedures", "read_procedure", "save_procedure", "create_procedure_from_timeline"],
-            "discord": ["send_discord_message", "send_discord_image"],
+            "discord": ["send_discord_message", "send_discord_image", "get_discord_authorized_channels"],
             "watchlist": ["add_to_watchlist", "remove_from_watchlist", "get_watchlist", "check_watchlist", "update_watchlist_interval"],
             "items": [
                 "list_my_items", "consume_item", "gift_item_to_user", "create_food_item",

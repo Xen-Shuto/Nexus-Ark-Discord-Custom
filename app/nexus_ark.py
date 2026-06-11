@@ -2435,7 +2435,7 @@ try:
                                     interactive=True
                                 )
                                 room_autonomous_inactivity_slider = gr.Slider(
-                                    minimum=10, maximum=1440, step=10, value=120,
+                                    minimum=10, maximum=constants.MAX_AUTONOMOUS_INTERVAL_MINUTES, step=10, value=120,
                                     label="無操作判定時間（分）",
                                     info="最後の会話からこの時間が経過すると、AIが「何かすべきことはないか」と思考を開始します。",
                                     interactive=True
@@ -2447,7 +2447,7 @@ try:
                                     info="OFFにすると、AIが schedule_next_action ツールで自らタイマーを設定することを禁止します。"
                                 )
                                 room_schedule_cooldown_slider = gr.Slider(
-                                    minimum=10, maximum=180, step=10, value=60,
+                                    minimum=10, maximum=constants.MAX_SCHEDULE_COOLDOWN_MINUTES, step=10, value=60,
                                     label="自律行動タイマーの最小間隔・クールダウン（分）",
                                     info="AI自身がタイマーを予約する際、最低でもこの時間だけ間隔を空けるように制限します。",
                                     interactive=True
@@ -6985,7 +6985,8 @@ try:
         save_key_event.then(
             fn=ui_handlers.handle_initial_load,
             inputs=None,
-            outputs=initial_load_outputs
+            outputs=initial_load_outputs,
+            show_progress="hidden"
         )
 
         # Gemini APIキー削除
@@ -7001,7 +7002,8 @@ try:
         delete_key_event.then(
             fn=ui_handlers.handle_initial_load,
             inputs=None,
-            outputs=initial_load_outputs
+            outputs=initial_load_outputs,
+            show_progress="hidden"
         )
 
 

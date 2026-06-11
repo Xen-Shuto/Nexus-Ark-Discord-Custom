@@ -64,7 +64,7 @@ from tools.developer_tools import list_project_files, read_project_file
 from tools.introspection_tools import manage_open_questions, manage_goals
 from tools.roblox_tools import send_roblox_command, roblox_build
 from tools.twitter_tools import draft_tweet, post_tweet, check_twitter_updates
-from tools.discord_tools import send_discord_message, send_discord_image
+from tools.discord_tools import send_discord_message, send_discord_image, get_discord_authorized_channels
 from tools.music_tools import recommend_music
 from tools.roblox_screenshot import capture_roblox_screenshot
 from tools.roblox_webhook import get_spatial_data
@@ -153,7 +153,7 @@ all_tools = [
     # --- Twitter (X) ツール ---
     draft_tweet, post_tweet, check_twitter_updates,
     # --- Discord連携ツール ---
-    send_discord_message, send_discord_image,
+    send_discord_message, send_discord_image, get_discord_authorized_channels,
     # --- 音楽推薦ツール ---
     recommend_music
 ]
@@ -167,7 +167,7 @@ side_effect_tools = [
     "update_active_purpose", "propose_purpose_change", "approve_purpose_change",
     "update_research_thread",
     "set_personal_alarm", "set_timer", "set_pomodoro_timer",
-    "schedule_next_action", "send_discord_message", "send_discord_image",
+    "schedule_next_action", "send_discord_message", "send_discord_image", "get_discord_authorized_channels"
     "reflect_after_action", "start_autonomy_timeline", "record_autonomy_step", "complete_autonomy_timeline",
     "save_procedure", "create_procedure_from_timeline",
     "request_capability_approval", "record_capability_audit",
@@ -760,6 +760,7 @@ def _should_skip_retrieval_locally(query_source: str) -> bool:
 
     明確に過去記憶・知識・事実確認を求めていそうな発話はスキップしない。
     短い相槌や感情表現だけを即時スキップ対象にする。
+    固有名詞（カタカナ3文字以上）が含まれる場合はスキップしない。
     """
     text = (query_source or "").strip()
     if not text:
@@ -773,6 +774,14 @@ def _should_skip_retrieval_locally(query_source: str) -> bool:
     ]
     lower_text = text.lower()
     if any(marker in lower_text for marker in retrieval_markers):
+        return False
+
+    # カタカナ3文字以上の固有名詞が含まれていたらスキップしない（人名・地名等）
+    if re.search(r'[ァ-ヴー]{3,}', text):
+        return False
+
+    # 鉤括弧で囲まれた語句があればスキップしない（引用・固有名）
+    if re.search(r'「.+?」', text):
         return False
 
     normalized = re.sub(r"[\s　、。,.!！?？…ー〜~]+", "", lower_text)
@@ -791,7 +800,7 @@ def _should_skip_retrieval_locally(query_source: str) -> bool:
     return len(normalized) <= 12 and any(marker in normalized for marker in affective_markers)
 
 
-def _invoke_retrieval_decision_with_timeout(llm, messages: list, timeout_seconds: float = 8.0):
+def _invoke_retrieval_decision_with_timeout(llm, messages: list, timeout_seconds: float = 15.0):
     import concurrent.futures
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -803,6 +812,109 @@ def _invoke_retrieval_decision_with_timeout(llm, messages: list, timeout_seconds
         raise TimeoutError(f"検索要否判定がタイムアウトしました ({timeout_seconds:.0f}秒)") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _extract_search_queries(query_source: str, room_name: str) -> dict:
+    """
+    ユーザー発言からRAGクエリ、キーワード、意図を
+    ルールベースで瞬時に抽出する。LLM不要・タイムアウトなし。
+    LLMタイムアウト時のフォールバックとして使用し、
+    記憶想起スキップを防止する。
+
+    Returns:
+        {
+            "rag_query": str,       # 意味検索用クエリ
+            "keyword_query": str,   # 完全一致検索用キーワード（スペース区切り）
+            "intent": str,          # emotional/factual/temporal/relational
+        }
+    """
+    text = (query_source or "").strip()
+    if not text:
+        return {"rag_query": "", "keyword_query": "", "intent": constants.DEFAULT_INTENT}
+
+    # --- RAGクエリ: ユーザー発言をそのまま使用（末尾記号除去、長すぎる場合は切り詰め） ---
+    rag_query = re.sub(r'[。、！？!?…~〜]+$', '', text).strip()
+    if len(rag_query) > 300:
+        rag_query = rag_query[:300]
+
+    # --- キーワード抽出 ---
+    keywords = set()
+
+    # 1. カタカナ連続3文字以上（人名・地名・作品名等の固有名詞）
+    katakana_matches = re.findall(r'[ァ-ヴー]{3,}', text)
+    for match in katakana_matches:
+        # 一般的なカタカナ語を除外（検索ノイズ軽減）
+        common_katakana = {
+            "テスト", "メッセージ", "コメント", "データ", "ファイル",
+            "システム", "エラー", "チェック", "スタート", "ストップ",
+            "パスワード", "サーバー", "クリア", "キャンセル", "リセット",
+        }
+        if match not in common_katakana:
+            keywords.add(match)
+
+    # 2. 鉤括弧内の語句
+    bracket_matches = re.findall(r'「(.+?)」', text)
+    for match in bracket_matches:
+        # 15文字以下の単語/フレーズのみ、かつ句読点や改行・スペースを含まないものを対象とする
+        if 2 <= len(match) <= 15 and not any(c in match for c in ["、", "。", "\n", " "]):
+            keywords.add(match)
+
+    # 3. 英字連続2文字以上（英語の固有名詞等）
+    alpha_matches = re.findall(r'[A-Za-z]{2,}', text)
+    for match in alpha_matches:
+        # 一般的な英単語を除外
+        common_english = {
+            "ok", "no", "yes", "hi", "the", "is", "it", "to", "in",
+            "of", "and", "or", "for", "on", "at", "by", "an",
+        }
+        if match.lower() not in common_english:
+            keywords.add(match)
+
+    # 4. エンティティ記憶 _index.json のエントリ名・別名と照合
+    try:
+        em_manager = EntityMemoryManager(room_name)
+        index = em_manager._ensure_index()
+        for meta in index.get("entities", {}).values():
+            if not isinstance(meta, dict) or meta.get("status") == "archived":
+                continue
+            names_to_check = [meta.get("canonical_name", "")]
+            names_to_check.extend(meta.get("aliases", []))
+            for name in names_to_check:
+                # 15文字以下の固有名詞・キーワードのみを抽出対象とするガード
+                if name and 2 <= len(name) <= 15 and name in text:
+                    # 句読点やスペース、改行を含むものはキーワードとして不適切なので除外
+                    if not any(c in name for c in ["、", "。", "\n", " "]):
+                        keywords.add(name)
+    except Exception as e:
+        print(f"  - [Retrieval Fallback] エンティティ記憶照合エラー（無視）: {e}")
+
+    keyword_query = " ".join(sorted(keywords)) if keywords else ""
+
+    # --- 意図分類 ---
+    intent = constants.DEFAULT_INTENT
+    temporal_markers = ["いつ", "前に", "以前", "去年", "昨日", "先月", "先週", "この前", "あの時", "昔"]
+    factual_markers = ["教えて", "何", "調べ", "確認", "どう", "仕組み", "方法", "理由"]
+    emotional_markers = ["好き", "嬉しい", "寂しい", "悲しい", "怖い", "楽しい", "辛い", "嫌"]
+
+    lower_text = text.lower()
+
+    # エンティティ記憶の人名・固有名がキーワードに含まれていれば relational
+    if keywords:
+        intent = "relational"
+    if any(m in lower_text for m in temporal_markers):
+        intent = "temporal"
+    elif any(m in lower_text for m in factual_markers):
+        intent = "factual"
+    elif any(m in lower_text for m in emotional_markers):
+        intent = "emotional"
+
+    # INTENT_WEIGHTS に存在しない場合はデフォルトにフォールバック
+    if intent not in constants.INTENT_WEIGHTS:
+        intent = constants.DEFAULT_INTENT
+
+    print(f"  - [Retrieval Fallback] ルールベースクエリ: RAG='{rag_query[:50]}...' KEYWORD='{keyword_query}' INTENT={intent}")
+    return {"rag_query": rag_query, "keyword_query": keyword_query, "intent": intent}
+
 
 def retrieval_node(state: AgentState):
     perf_start = time.time()
@@ -867,44 +979,33 @@ def retrieval_node(state: AgentState):
     #         print(f"  - [Emotion] 感情検出でエラー（無視）: {emotion_e}")
     # --- ユーザー感情分析廃止ここまで ---
 
-    # 2. クエリ生成AI（Flash Lite）による判断
+    # 2. クエリ生成: ルールベース（最低保証） + LLM（精度向上）のハイブリッド
     api_key = state['api_key']
     room_name = state['room_name']
 
-    # 高速なモデルを使用
+    # ① ルールベースでベースラインクエリを瞬時に抽出
+    baseline = _extract_search_queries(query_source, room_name)
+    rag_query = baseline["rag_query"]
+    keyword_query = baseline["keyword_query"]
+    intent = baseline["intent"]
+    llm_enhanced = False
+
+    # ② LLMによる精度向上（間に合えば上書き、タイムアウト時はルールベースで続行）
     # 【マルチモデル対応】内部モデル設定（混合編成）に基づいてモデルを取得
     processing_model_name = _get_configured_internal_model_name("processing")
-    #llm_flash = LLMFactory.create_chat_model(
-    #    api_key=api_key,
-    #    generation_config={},
-    #    internal_role="processing"
-    #)
-    # temperatureを0.0から0.1に引き上げ、サーバー側のビームサーチデッドロックを防ぐ
-    llm_flash = LLMFactory.create_chat_model(
-        api_key=api_key,
-        generation_config={"temperature": 0.1},
-        internal_role="processing"
-    )
+    try:
+        llm_flash = LLMFactory.create_chat_model(
+            api_key=api_key,
+            generation_config={},
+            internal_role="processing"
+        )
+        processing_model_name = _get_llm_model_name(llm_flash, processing_model_name)
 
-    # 不要なツール関連の内部クラッシュ（500）を防ぐため、AFCを完全に無効化する
-    if "gemini" in str(llm_flash).lower():
-        try:
-            from google.genai import types as genai_types
-            # tools=[] を明示的にバインドし、AFC設定も完全に無効化する
-            #afc_config = genai_types.AutomaticFunctionCallingConfig(disable=True)
-            #llm_flash = llm_flash.bind(automatic_function_calling=afc_config)
-            llm_flash = llm_flash.bind(tools=[], automatic_function_calling={"disable": True})
-        except Exception:
-            pass
-
-    processing_model_name = _get_llm_model_name(llm_flash, processing_model_name)
-
-    # プロンプトの改善（System/Human分離）
-    system_prompt = """あなたは、情報の抽出と検索クエリ生成の専門家です。
+        system_prompt = """あなたは、情報の抽出と検索クエリ生成の専門家です。
 ユーザーの発言から、指定されたフォーマットに従って「検索キーワード」と「意図(INTENT)」のみを抽出してください。
 解説、前置き、思考プロセスは絶対に含めないでください。出力は、指定された3行の形式、または「NONE」のみである必要があります。"""
 
-    human_prompt = f"""以下のユーザーの発言を分析し、検索クエリを生成してください。
+        human_prompt = f"""以下のユーザーの発言を分析し、検索クエリを生成してください。
 
 【ユーザーの発言】
 {query_source}
@@ -914,14 +1015,23 @@ RAG: [意味検索用キーワード]
 KEYWORD: [完全一致検索用キーワード（または NONE）]
 INTENT: [emotional/factual/technical/temporal/relational]
 
+【検索要否の判定ルール】
+1. 以下の場合は積極的に検索を行い、上記の【出力形式】（3行）で出力してください：
+   - 人名、施設名、地名、システム名、特定のイベントなどの固有名詞が含まれる場合
+   - ユーザーの体験談、近況報告、出来事の共有（「〜に行った」「〜があった」「〜した」など）
+   - 過去の文脈、思い出、以前の会話に言及している場合（「前に話した」「以前〜だった」「〜だっけ？」など）
+   - 感情の吐露や悩み（「〜で落ち込んでいる」「〜が楽しい」など）
+   - 技術的な質問、仕様、設定、手順について尋ねる場合
+
+2. 以下の「極めて軽微なやり取り」の場合にのみ 'NONE' とのみ出力してください：
+   - 単純な挨拶のみ（「こんにちは」「ただいま」「おはよ」など）
+   - 短い相槌や同意、返答のみ（「なるほど」「そうだね」「はい」「わかった」など）
+
 【ルール】
 - 解説は一切不要。
-- 文字列 'RAG:', 'KEYWORD:', 'INTENT:' で始まる3行のみを出力せよ。
-- 検索が不要な場合は 'NONE' とのみ出力せよ。
+- 文字列 'RAG:', 'KEYWORD:', 'INTENT:' で始まる3行のみ、または 'NONE' のみを出力せよ。
 """
 
-    try:
-        # メッセージリスト形式で送信
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_prompt)
@@ -931,17 +1041,17 @@ INTENT: [emotional/factual/technical/temporal/relational]
         decision_response = ""
         for attempt in range(3):
             try:
-                response_obj = _invoke_retrieval_decision_with_timeout(llm_flash, messages, timeout_seconds=8.0)
+                response_obj = _invoke_retrieval_decision_with_timeout(llm_flash, messages, timeout_seconds=15.0)
                 decision_response = utils.get_content_as_string(response_obj).strip()
+                llm_enhanced = True
                 break
             except TimeoutError as e:
-                print(f"  - [Retrieval Timeout] {e} 検索なしで続行します。")
-                print(f"--- [PERF] retrieval_node total: {time.time() - perf_start:.4f}s ---")
-                return {"retrieved_context": ""}
+                # ★ タイムアウト時: ルールベース結果で検索を続行（スキップしない）
+                print(f"  - [Retrieval Timeout] {e} ルールベースクエリで検索を続行します。")
+                break  # LLM を諦めてルールベースで続行
             except Exception as e:
                 err_str = str(e).upper()
                 is_503 = "503" in err_str or "UNAVAILABLE" in err_str or "OVERLOADED" in err_str
-                # 429 または 503 リトライ上限の場合は raise して上位の invoke_nexus_agent_stream でローテーションさせる
                 is_429 = isinstance(e, google_exceptions.ResourceExhausted) or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
 
                 if is_429 or (is_503 and attempt == 2):
@@ -953,48 +1063,59 @@ INTENT: [emotional/factual/technical/temporal/relational]
                     print(f"  - [Retrieval Warning] 503 UNAVAILABLE detected in retrieval_node. Retrying locally (attempt {attempt+1}/3)...")
                     time.sleep(2 * (attempt + 1))
                     continue
-                raise e
+                # その他のエラー: ルールベースで続行
+                print(f"  - [Retrieval LLM Error] {e} ルールベースクエリで検索を続行します。")
+                break
+    except Exception as llm_init_e:
+        # LLMモデル初期化自体の失敗: ルールベースで続行
+        print(f"  - [Retrieval LLM Init Error] {llm_init_e} ルールベースクエリで検索を続行します。")
 
-        # Initialize variables for results
-        rag_query = ""
-        keyword_query = ""
-        intent = constants.DEFAULT_INTENT
-
-        # Check for "NONE" decision early
+    # LLM結果のパースと上書き
+    if llm_enhanced and decision_response:
+        # LLMが「NONE」と判断した場合でも、ルールベースにキーワードがあれば検索続行
         if "NONE" in decision_response.upper() and len(decision_response) < 10:
-            print("  - [Retrieval] 判断: 検索不要 (AI判断)")
-            print(f"--- [PERF] retrieval_node total: {time.time() - perf_start:.4f}s ---")
-            return {"retrieved_context": ""}
-
-        # 正規表現による柔軟なパース
-        rag_match = re.search(r"RAG:\s*(.+)", decision_response, re.IGNORECASE)
-        kw_match = re.search(r"KEYWORD:\s*(.+)", decision_response, re.IGNORECASE)
-        intent_match = re.search(r"INTENT:\s*(\w+)", decision_response, re.IGNORECASE)
-
-        if rag_match:
-            rag_query = rag_match.group(1).strip()
-        if kw_match:
-            kw_part = kw_match.group(1).strip()
-            if kw_part.upper() != "NONE":
-                keyword_query = kw_part
-        if intent_match:
-            intent_part = intent_match.group(1).strip().lower()
-            if intent_part in constants.INTENT_WEIGHTS:
-                intent = intent_part
-
-        # 後方互換: RAG:がない場合は全体をRAGクエリとして扱う
-        if not rag_query and decision_response.upper() != "NONE":
-            rag_query = decision_response
-
-        print(f"  - [Retrieval] RAGクエリ: '{rag_query}'")
-        if keyword_query:
-            print(f"  - [Retrieval] キーワードクエリ: '{keyword_query}'")
+            if keyword_query:
+                print("  - [Retrieval] LLM判断: 検索不要 → ルールベースにキーワードあり、検索続行")
+            else:
+                print("  - [Retrieval] 判断: 検索不要 (AI判断)")
+                print(f"--- [PERF] retrieval_node total: {time.time() - perf_start:.4f}s ---")
+                return {"retrieved_context": ""}
         else:
-            print(f"  - [Retrieval] キーワードクエリ: なし")
-        print(f"  - [Retrieval] Intent: {intent}")
+            # 正規表現による柔軟なパース → ルールベース結果を上書き
+            rag_match = re.search(r"RAG:\s*(.+)", decision_response, re.IGNORECASE)
+            kw_match = re.search(r"KEYWORD:\s*(.+)", decision_response, re.IGNORECASE)
+            intent_match = re.search(r"INTENT:\s*(\w+)", decision_response, re.IGNORECASE)
 
-        results = []
+            if rag_match:
+                rag_query = rag_match.group(1).strip()
+            if kw_match:
+                kw_part = kw_match.group(1).strip()
+                if kw_part.upper() != "NONE":
+                    # LLMのキーワードとルールベースのキーワードをマージ
+                    llm_keywords = set(kw_part.split())
+                    baseline_keywords = set(keyword_query.split()) if keyword_query else set()
+                    merged = llm_keywords | baseline_keywords
+                    keyword_query = " ".join(sorted(merged)) if merged else ""
+            if intent_match:
+                intent_part = intent_match.group(1).strip().lower()
+                if intent_part in constants.INTENT_WEIGHTS:
+                    intent = intent_part
 
+            # 後方互換: RAG:がない場合は全体をRAGクエリとして扱う
+            if not rag_query and decision_response.upper() != "NONE":
+                rag_query = decision_response
+
+    source_label = "LLM" if llm_enhanced else "ルールベース"
+    print(f"  - [Retrieval] RAGクエリ ({source_label}): '{rag_query}'")
+    if keyword_query:
+        print(f"  - [Retrieval] キーワードクエリ ({source_label}): '{keyword_query}'")
+    else:
+        print(f"  - [Retrieval] キーワードクエリ: なし")
+    print(f"  - [Retrieval] Intent ({source_label}): {intent}")
+
+    results = []
+
+    try:
         import config_manager
         # 現在の設定を取得 (JIT読み込み推奨だが、頻度が高いのでCONFIG_GLOBALでも可。ここでは安全のためloadする)
         current_config = config_manager.load_config_file()
@@ -1150,13 +1271,8 @@ INTENT: [emotional/factual/technical/temporal/relational]
             internal_model = locals().get("processing_model_name") or _get_configured_internal_model_name("processing")
             print(f"  - [Retrieval Error] Quota limit hit (429) for {internal_model}. Re-raising for rotation. {e}")
             raise utils.ModelSpecificResourceExhausted(e, internal_model)
-        
-        # 500エラーやタイムアウトが発生しても、メインの対話を止めないようフォールバックする
-        #print(f"  - [Retrieval Error] 検索処理中にエラー: {e}")
-        #traceback.print_exc()
-        print(f"  - [Retrieval Error] 検索処理中に一時的なエラーが発生しました。検索なしで続行します: {e}")
-        if state.get("debug_mode", False):
-            traceback.print_exc()
+        print(f"  - [Retrieval Error] 検索処理中にエラー: {e}")
+        traceback.print_exc()
         print(f"--- [PERF] retrieval_node total: {time.time() - perf_start:.4f}s ---")
         return {"retrieved_context": ""}
 
@@ -1809,6 +1925,7 @@ def context_generator_node(state: AgentState):
         "request_capability": "使いたい能力カテゴリをシステムに要求する",
         "send_discord_message": "許可されたDiscordチャンネルへメッセージや画像を送信する",
         "send_discord_image": "許可されたDiscordチャンネルへメッセージや画像を送信する",
+        "get_discord_authorized_channels": "許可されたDiscordチャンネルの一覧を取得する",
         "draft_tweet": "Twitter/X投稿の下書きを作成し、ユーザー承認キューに入れる（実投稿はしない）",
         "post_tweet": "承認済みTwitter/X下書きを実投稿する",
         "check_twitter_updates": "Twitter/Xのタイムライン・メンション・通知を確認する",

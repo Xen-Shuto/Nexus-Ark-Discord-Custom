@@ -1,7 +1,7 @@
 from typing import Any, List, Optional
 
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from autonomy_context_manager import AutonomyContextManager
 
@@ -144,10 +144,12 @@ def start_autonomy_timeline(
 
 
 class RecordAutonomyStepArgs(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     room_name: str = Field(..., description="対象のルーム名")
-    timeline_id: str = Field(..., description="start_autonomy_timelineで得たtimeline_id")
-    step_type: str = Field(..., description="observe / orient / decide / act / reflect のいずれか")
-    summary: str = Field(..., description="このステップで何を観測・判断・決定・実行・反省したかの短い要約")
+    timeline_id: str = Field("", description="start_autonomy_timelineで得たtimeline_id。未指定時は自動開始する")
+    step_type: str = Field("", description="observe / orient / decide / act / reflect のいずれか。未指定時は入力内容から推定する")
+    summary: str = Field("", description="このステップで何を観測・判断・決定・実行・反省したかの短い要約")
     details: Any = Field("", description="追加詳細。文字列、配列、JSONオブジェクトを指定可能")
     selected_action: str = Field("", description="decide/actで選んだ行動")
     tool_name: str = Field("", description="actで使ったツール名")
@@ -158,12 +160,81 @@ class RecordAutonomyStepArgs(BaseModel):
     action_memory_ref: str = Field("", description="Action Memoryと相互参照するための補助メモや時刻")
 
 
+def _infer_record_step_type(step_type: str, payload: dict) -> str:
+    """record_autonomy_stepの旧式・省略引数からstep_typeを補完する。"""
+    normalized = str(step_type or "").strip().lower()
+    aliases = {
+        "observation": "observe",
+        "sense": "observe",
+        "thinking": "orient",
+        "reasoning": "orient",
+        "plan": "decide",
+        "decision": "decide",
+        "execute": "act",
+        "execution": "act",
+        "result": "reflect",
+        "reflection": "reflect",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in {"observe", "orient", "decide", "act", "reflect"}:
+        return normalized
+
+    if payload.get("tool_name") or payload.get("tool_result_summary") or payload.get("result_summary"):
+        return "act"
+    if payload.get("selected_action") or payload.get("action") or payload.get("decision"):
+        return "decide"
+    if payload.get("reasoning") or payload.get("analysis") or payload.get("category"):
+        return "orient"
+    if payload.get("outcome_summary") or payload.get("next_action"):
+        return "reflect"
+    return "observe"
+
+
+def _coerce_record_step_summary(summary: str, payload: dict) -> str:
+    """必須summary欠落時に、モデルが出しやすい別名や旧形式から短い要約を作る。"""
+    if summary:
+        return str(summary)
+
+    for key in [
+        "action_summary",
+        "result_summary",
+        "outcome_summary",
+        "observation",
+        "reasoning",
+        "decision",
+        "selected_action",
+        "intent",
+        "instruction",
+        "content",
+        "text",
+        "message",
+        "note",
+        "query",
+    ]:
+        value = payload.get(key)
+        if value:
+            return str(value)
+
+    category = payload.get("category")
+    if category:
+        return f"自律行動中に {category} カテゴリの能力要求を検討した"
+
+    compact_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"room_name", "timeline_id", "step_type", "details"} and value not in ("", None)
+    }
+    if compact_payload:
+        return f"自律行動ステップを記録した: {compact_payload}"
+    return "自律行動ステップを記録した"
+
+
 @tool(args_schema=RecordAutonomyStepArgs)
 def record_autonomy_step(
     room_name: str,
-    timeline_id: str,
-    step_type: str,
-    summary: str,
+    timeline_id: str = "",
+    step_type: str = "",
+    summary: str = "",
     details: Any = "",
     selected_action: str = "",
     tool_name: str = "",
@@ -172,13 +243,45 @@ def record_autonomy_step(
     working_memory_slot: str = "",
     goal_id: str = "",
     action_memory_ref: str = "",
+    **extra: Any,
 ) -> str:
     """
     自律行動タイムラインへ observe/orient/decide/act/reflect の型付きステップを追記する。
     Action Memoryだけでは残しきれない「なぜそう動いたか」を保存するために使う。
     """
     try:
-        record = AutonomyContextManager(room_name).append_step(
+        payload = {
+            "timeline_id": timeline_id,
+            "step_type": step_type,
+            "summary": summary,
+            "details": details,
+            "selected_action": selected_action,
+            "tool_name": tool_name,
+            "tool_result_summary": tool_result_summary,
+            "thread_id": thread_id,
+            "working_memory_slot": working_memory_slot,
+            "goal_id": goal_id,
+            "action_memory_ref": action_memory_ref,
+            **extra,
+        }
+        step_type = _infer_record_step_type(step_type, payload)
+        summary = _coerce_record_step_summary(summary, payload)
+        if not selected_action:
+            selected_action = str(extra.get("action") or extra.get("decision") or "")
+        if not tool_result_summary:
+            tool_result_summary = str(extra.get("result_summary") or extra.get("outcome_summary") or "")
+
+        manager = AutonomyContextManager(room_name)
+        if not timeline_id:
+            start_record = manager.start_timeline(
+                trigger=str(extra.get("trigger") or "autonomy_step_rescue"),
+                query=str(extra.get("query") or extra.get("intent") or extra.get("instruction") or summary),
+                motivation=str(extra.get("motivation") or ""),
+                source=str(extra.get("source") or "record_autonomy_step"),
+            )
+            timeline_id = start_record.get("timeline_id", "")
+
+        record = manager.append_step(
             timeline_id=timeline_id,
             step_type=step_type,
             summary=summary,

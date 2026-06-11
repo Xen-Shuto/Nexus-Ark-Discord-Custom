@@ -9,6 +9,78 @@ import config_manager
 import utils
 import gemini_api # 既存のGemini設定ロジックを再利用するため
 
+
+def _anthropic_model_deprecates_temperature(model_name: str) -> bool:
+    """Claude 4系以降はtemperature指定が400になるモデルがあるため送信しない。"""
+    normalized = (model_name or "").lower()
+    if not normalized.startswith("claude"):
+        return False
+    return "claude-3" not in normalized
+
+
+def _build_anthropic_client_kwargs(
+    model_name: str,
+    api_key: str,
+    temperature: float,
+    max_retries: int = 0,
+    max_tokens: int = 4096,
+    streaming: bool = True,
+    model_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    kwargs = {
+        "model_name": model_name,
+        "anthropic_api_key": api_key,
+        "max_tokens": max_tokens,
+        "max_retries": max_retries,
+        "streaming": streaming,
+        "model_kwargs": model_kwargs or {},
+    }
+    if _anthropic_model_deprecates_temperature(model_name):
+        print(f"  - [Anthropic] temperature is not sent for {model_name} because this model rejects it.")
+    else:
+        kwargs["temperature"] = temperature
+    return kwargs
+
+
+def _is_openai_official_base_url(base_url: str | None) -> bool:
+    return "api.openai.com" in (base_url or "").lower()
+
+
+def _openai_model_uses_default_sampling(model_name: str, base_url: str | None) -> bool:
+    normalized = (model_name or "").lower()
+    return _is_openai_official_base_url(base_url) and normalized.startswith("gpt-5")
+
+
+def _build_chat_openai_kwargs(
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: Any = None,
+    max_retries: int = 0,
+    streaming: bool = True,
+    model_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    kwargs = {
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model_name,
+        "max_tokens": max_tokens,
+        "max_retries": max_retries,
+        "streaming": streaming,
+    }
+    if model_kwargs is not None:
+        kwargs["model_kwargs"] = model_kwargs
+
+    if _openai_model_uses_default_sampling(model_name, base_url):
+        print(f"  - [OpenAI] temperature/top_p are not sent for {model_name}; this model uses default sampling.")
+    else:
+        kwargs["temperature"] = temperature
+        kwargs["top_p"] = top_p
+    return kwargs
+
+
 class LLMFactory:
     @staticmethod
     def create_chat_model(
@@ -97,12 +169,12 @@ class LLMFactory:
                 if not anthropic_api_key:
                     raise ValueError("Anthropic provider requires an API key.")
                 from langchain_anthropic import ChatAnthropic
-                return ChatAnthropic(
+                return ChatAnthropic(**_build_anthropic_client_kwargs(
                     model_name=sanitized_model_name,
-                    anthropic_api_key=anthropic_api_key,
+                    api_key=anthropic_api_key,
                     temperature=temperature,
-                    top_p=top_p
-                )
+                    streaming=False,
+                ))
             elif active_provider == "openai" or active_provider == "openai_official":
                 # 指定されたプロファイルの設定を取得
                 openai_setting = config_manager.get_openai_setting_by_name(internal_profile_name)
@@ -118,15 +190,15 @@ class LLMFactory:
                 if active_provider == "openai_official":
                     base_url = "https://api.openai.com/v1"
                 
-                return ChatOpenAI(
+                return ChatOpenAI(**_build_chat_openai_kwargs(
                     base_url=base_url,
                     api_key=openai_setting.get("api_key") or "dummy",
-                    model=sanitized_model_name,
+                    model_name=sanitized_model_name,
                     temperature=openai_setting.get("temperature", temperature),
                     top_p=openai_setting.get("top_p", top_p),
                     max_tokens=openai_setting.get("max_tokens"),
                     streaming=True
-                )
+                ))
             else:
                 # 互換性維持: active_provider がプロファイルの可能性（旧形式）
                 openai_setting = config_manager.get_openai_setting_by_name(active_provider)
@@ -161,16 +233,16 @@ class LLMFactory:
                 elif provider_name == "Moonshot AI" or "moonshot" in base_url:
                     if target_temp != 1.0: target_temp = 1.0
 
-                return ChatOpenAI(
+                return ChatOpenAI(**_build_chat_openai_kwargs(
                     base_url=base_url,
                     api_key=openai_api_key,
-                    model=sanitized_model_name,
+                    model_name=sanitized_model_name,
                     temperature=target_temp,
                     top_p=target_top_p,
                     max_tokens=max_tokens,
                     max_retries=max_retries,
                     streaming=True
-                )
+                ))
         
         # --- 以下は既存ロジック（internal_role未指定時） ---
         
@@ -348,17 +420,17 @@ class LLMFactory:
             print(f"  - Base URL: {base_url}")
             print(f"  - Model: {internal_model_name}")
 
-            return ChatOpenAI(
+            return ChatOpenAI(**_build_chat_openai_kwargs(
                 base_url=base_url,
                 api_key=openai_api_key,
-                model=internal_model_name,
+                model_name=internal_model_name,
                 temperature=target_temp,
                 top_p=target_top_p,
                 max_tokens=max_tokens,
                 max_retries=max_retries,
                 streaming=True,
                 model_kwargs=model_kwargs
-            )
+            ))
 
         # --- Anthropic ---
         elif active_provider == "anthropic":
@@ -393,19 +465,17 @@ class LLMFactory:
                     
             from langchain_anthropic import ChatAnthropic
             
-            # Anthropic は temperature と top_p の同時指定を許可しない場合があるため、
-            # 優先度の高い temperature のみを指定するように修正。
-            # (UIで両方が指定されていても、Anthropicの制約に従い片方のみを送信する)
-            return ChatAnthropic(
+            # Anthropic は top_p との同時指定や、一部モデルでtemperature指定自体を拒否する。
+            # UI値は保持しつつ、APIへ送信可能なパラメータだけに絞る。
+            return ChatAnthropic(**_build_anthropic_client_kwargs(
                 model_name=internal_model_name,
-                anthropic_api_key=anthropic_api_key,
+                api_key=anthropic_api_key,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                # top_p=top_p, # 同時指定不可のためコメントアウト
                 max_retries=max_retries,
                 streaming=True,
-                model_kwargs=model_kwargs
-            )
+                model_kwargs=model_kwargs,
+            ))
 
         else:
             raise ValueError(f"Unknown provider: {active_provider}")

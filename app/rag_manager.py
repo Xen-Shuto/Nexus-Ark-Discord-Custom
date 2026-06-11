@@ -1701,7 +1701,7 @@ class RAGManager:
                             db.add_documents(batch)
                         
                         yield (batch_num, total_batches, f"処理中: {batch_num}/{total_batches} バッチ完了")
-                        if self.embedding_mode == "api":
+                        if self.embedding_mode != "local":
                             # [2026-04-28] 待機時間を延長 (2s->5s)
                             time.sleep(5)
                         break
@@ -1756,7 +1756,7 @@ class RAGManager:
                                 yield (batch_num, total_batches, f"エラー: バッチ{batch_num}をスキップ")
                                 print(f"      ! このバッチをスキップします。最終エラー: {e}")
                                 traceback.print_exc()
-                            if self.embedding_mode == "api":
+                            if self.embedding_mode != "local":
                                 time.sleep(5)
                             break
                         attempt += 1
@@ -1853,7 +1853,30 @@ class RAGManager:
                     search_start = time.time()
                     dynamic_results = dynamic_db.similarity_search_with_score(query, k=k)
                     print(f"--- [PERF] RAGManager.search: dynamic similarity_search took: {time.time() - search_start:.4f}s ---")
-                    results_with_scores.extend(dynamic_results)
+                    
+                    # [2026-06-10 改善] インテントが日常会話、時間軸、関係性、感情的な会話（temporal, relational, emotional）の場合、
+                    # システム仕様書やマニュアルなどの開発ドキュメントが混入してコンテキストを汚染するのを防ぐため、
+                    # メタデータの source（ファイル名）がシステム仕様書に合致するドキュメントを除外する。
+                    # ユーザーが自作した思い出ファイルなどは日常会話でも除外されずに検索・想起されます。
+                    if intent in ["temporal", "relational", "emotional"]:
+                        system_spec_files = {
+                            "memory_system_specification.md",
+                            "nexus_ark_specification.md",
+                            "ai_development_guidelines.md",
+                            "gradio_notes.md",
+                            "ui_implementation_patterns.md",
+                            "settings_persistence_guidelines.md"
+                        }
+                        filtered_dynamic_results = []
+                        for doc, score in dynamic_results:
+                            source_file = doc.metadata.get("source", "").lower()
+                            if source_file in system_spec_files:
+                                print(f"  - [RAG Filter] Intent is '{intent}'. Filtered out system specification document: '{source_file}'")
+                            else:
+                                filtered_dynamic_results.append((doc, score))
+                        results_with_scores.extend(filtered_dynamic_results)
+                    else:
+                        results_with_scores.extend(dynamic_results)
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "ResourceExhausted" in err_str:

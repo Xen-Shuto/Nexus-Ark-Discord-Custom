@@ -34,6 +34,7 @@ const state = {
 
 const VOICE_RECORDING_MAX_MS = 60000;
 const RECENT_SUBMIT_GUARD_MS = 3000;
+const PENDING_RESEND_GRACE_MS = 3000;
 
 const els = {
   apiBaseInput: document.querySelector("#api-base-input"),
@@ -127,6 +128,46 @@ function writePendingSend(value) {
   } else {
     localStorage.removeItem("nexusLite.pendingSend");
   }
+}
+
+function updatePendingSendPatch(patch) {
+  if (!state.pendingSend) {
+    return null;
+  }
+  const updated = {
+    ...state.pendingSend,
+    ...patch
+  };
+  writePendingSend(updated);
+  return updated;
+}
+
+function pendingAgeMs(pending) {
+  const timestamp = Date.parse(pending?.sentAt || "");
+  return Number.isFinite(timestamp) ? Date.now() - timestamp : Number.POSITIVE_INFINITY;
+}
+
+function selectedFileSignature(file) {
+  if (!file) {
+    return null;
+  }
+  return {
+    name: file.name || "",
+    size: Number(file.size || 0)
+  };
+}
+
+function canReleaseUnconfirmedPending(pending) {
+  if (!pending || pending.roomId !== state.roomId) {
+    return false;
+  }
+  if (pending.confirmation !== "not_found") {
+    return false;
+  }
+  if (pendingAgeMs(pending) < PENDING_RESEND_GRACE_MS) {
+    return false;
+  }
+  return true;
 }
 
 function markPendingResponseNotificationWanted() {
@@ -1401,6 +1442,11 @@ function updateSendConfirmation(messages) {
     return message.role === "user" && String(message.content || "").trim() === pending.message;
   });
   if (sentIndex < 0) {
+    updatePendingSendPatch({
+      confirmation: "not_found",
+      checkedAt: new Date().toISOString(),
+      notFoundCount: (Number(pending.notFoundCount) || 0) + 1
+    });
     setSyncStatus("前回の送信はまだ履歴で確認できません。");
     return;
   }
@@ -1420,6 +1466,10 @@ function updateSendConfirmation(messages) {
     setSyncStatus("前回の応答を確認しました。");
     return;
   }
+  updatePendingSendPatch({
+    confirmation: "sent",
+    checkedAt: new Date().toISOString()
+  });
   setSyncStatus("前回の送信は記録済みです。応答待ちの可能性があります。");
 }
 
@@ -1982,7 +2032,12 @@ async function sendMessage(event) {
       setSyncStatus("前回の送信結果を確認できません。通信状態を確認してください。");
     }
     if (state.pendingSend && state.pendingSend.roomId === state.roomId) {
-      return;
+      if (canReleaseUnconfirmedPending(state.pendingSend)) {
+        appendMessage("system", "前回の送信は履歴に見つかりませんでした。保留状態を解除して送信します。");
+        writePendingSend(null);
+      } else {
+        return;
+      }
     }
   }
   state.sending = true;
@@ -1991,6 +2046,8 @@ async function sendMessage(event) {
     id: clientMessageId,
     roomId: state.roomId,
     message,
+    file: selectedFileSignature(selectedFile),
+    confirmation: "sending",
     notifyOnResponse: document.hidden || !document.hasFocus(),
     sentAt: new Date().toISOString()
   });

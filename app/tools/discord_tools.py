@@ -1,7 +1,6 @@
 from typing import Optional, List
 from langchain_core.tools import tool
 
-
 @tool
 def send_discord_message(message: str, room_name: str, channel_id: Optional[str] = None, image_paths: Optional[List[str]] = None) -> str:
     """
@@ -36,7 +35,6 @@ def send_discord_message(message: str, room_name: str, channel_id: Optional[str]
     except Exception as e:
         return f"Discord送信に失敗しました: {e}"
 
-
 @tool
 def send_discord_image(message: str, image_paths: List[str], room_name: str, channel_id: Optional[str] = None) -> str:
     """
@@ -66,3 +64,19 @@ def send_discord_image(message: str, image_paths: List[str], room_name: str, cha
         return f"Discord画像送信に失敗しました: {result.get('error', '不明なエラー')}"
     except Exception as e:
         return f"Discord画像送信に失敗しました: {e}"
+
+# --- AI用独自ツール ---
+@tool
+def get_discord_authorized_channels(room_name: str) -> str:
+    """
+    このペルソナがDiscordへメッセージを送信することが許可されているチャンネルのリスト（名前とID）を取得します。
+    自律行動中に、どのチャンネルへ報告や画像送信が可能かを確認するために使用してください。
+
+    Args:
+        room_name: (システムで自動入力)
+    """
+    try:
+        import discord_manager
+        return discord_manager.get_authorized_channels_list(room_name)
+    except Exception as e:
+        return f"エラー: チャンネルリストを取得できませんでした。{e}"

@@ -221,6 +221,9 @@ __marimo__/
 ##############################################################
 # NexusArk独自
 #############################################################
+app/*.bak
+app/agent/*.bak
+app/tools/*.bak
 app/backups/
 app/characters/*
 #!app/characters/_shared/
@@ -231,6 +234,7 @@ app/characters/_shared/memory/procedures/*
 !app/characters/_shared/memory/procedures/autonomy_reflect_and_close.md
 !app/characters/_shared/memory/procedures/sample_safe_context_update.md
 !app/characters/_shared/memory/procedures/skill_creation_duplicate_check.md
+app/data/
 app/metadata/
 app/.memos/
 app/.gemini_key_states.json

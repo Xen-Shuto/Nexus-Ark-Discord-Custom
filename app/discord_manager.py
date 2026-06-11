@@ -100,21 +100,22 @@ _group_command_claims_lock = threading.Lock()
 # --- [追加] Discord専用 共通運用ルール ---
 DISCORD_COMMON_INSTRUCTION = """
 【Discord運用ルール】
-1. 画像の生成と表示について:
+1. メッセージの体裁と長さ:
+   - チャットとしての読みやすさとリズムを重視し、キャラクターの設定を遵守した上で、簡潔で自然な応答を心がけてください。
+   - 特別な理由がない限り、1つのメッセージが長大になりすぎないよう、適宜内容を整理して伝えてください。
+
+2. 画像の生成と表示について:
    - 画像を表示させたい場合は、必ず `generate_image` 等のツールを先に実行し、その結果得られた正確なファイルパスを使用してください。
    - ツールを実行せずに「予想されるパス」を回答に記述しても、システム側で画像を正しく添付することができません。
    - 確実な画像送信のため、ツールの出力結果（[VIEW_IMAGE: パス] 等）をそのまま回答に含めるようにしてください。
-"""
-#DISCORD_COMMON_INSTRUCTION = """
-#【Discord運用ルール】
-#1. 画像の表示:
-#   - あなたが画像を生成（generate_imageツール等）したり、画像ファイルを指定したりした場合、そのファイルパスを必ず回答本文の中に `[VIEW_IMAGE: パス]` の形式、あるいはMarkdown形式 `![image](パス)` で含めてください。
-#   - パスが含まれていないと、システムは画像をDiscordに添付することができません。
-#
-#2. 返信の制御:
-#   - 特定の発言に対して明確に「返信（リプライ）」機能を使いたい場合は、回答のどこかに `<action:reply/>` と記述してください。
-#"""
 
+3. 任意のチャンネルへの送信:
+   - デフォルト以外の特定のチャンネルにメッセージや画像を送りたい場合は、`send_discord_message` 等のツールを使用し、引数 `channel_id` に対象のIDを指定してください。
+   - 送信にはBotがそのチャンネルに参加しており、送信権限を持っている必要があります。
+
+4. 返信（リプライ）の制御:
+   - 特定の発言に対して明確に「返信（リプライ）」機能を使いたい場合は、回答のどこかに `<action:reply/>` と記述してください。通常、メンションやあなたへの返信には自動的にリプライが使われます。
+"""
 
 # 後方互換用。旧コードやUIが参照しても落ちないように残す。
 _bot_thread: Optional[threading.Thread] = None
@@ -509,7 +510,11 @@ class _InteractionMessageAdapter:
         self.id = interaction.id
         self.attachments = []
 
-    async def reply(self, content: str = "", **kwargs):
+    # --- 応答方式の変更 ---
+    #async def reply(self, content: str = "", **kwargs):
+    async def reply(self, content: str = "", as_reply: bool = True, **kwargs):
+        """スラッシュコマンド等のインタラクションへの応答。as_replyは互換性のために保持"""
+    # ----------------------
         kwargs = _discord_send_kwargs(**kwargs)
         if self.interaction.response.is_done():
             await self.interaction.followup.send(content, **kwargs)
@@ -527,7 +532,11 @@ class _ChannelReplyAdapter:
         self.id = None
         self.attachments = []
 
-    async def reply(self, content: str = "", **kwargs):
+    # --- 応答方式の変更 ---
+    #async def reply(self, content: str = "", **kwargs):
+    async def reply(self, content: str = "", as_reply: bool = True, **kwargs):
+        """チャンネルへの直接送信。as_replyがTrueでもリプライ先がない場合は通常送信"""
+    # ----------------------
         kwargs = _discord_send_kwargs(**kwargs)
         await self.channel.send(content, **kwargs)
 
@@ -1122,7 +1131,53 @@ class NexusDiscordClient(discord.Client):
     def _is_mentioned(self, message: discord.Message) -> bool:
         if self.user and self.user.mentioned_in(message):
             return True
-        return self._is_own_mention_in_content(message.content or "")
+        # --- メンションまたは名前呼びで反応 ---
+        #return self._is_own_mention_in_content(message.content or "")
+        if message.mention_everyone:
+            return True
+        if self._is_own_mention_in_content(message.content or ""):
+            return True
+        # 名前（表示名）が本文に含まれているか判定
+        if self.room_name:
+            display_name = _room_display_name(self.room_name)
+            if display_name and display_name in (message.content or ""):
+                return True
+        # 自分のロールがメンションされているか判定
+        if message.guild and message.role_mentions:
+            me = message.guild.me
+            # Bot自身が持っているロールのいずれかが、メッセージのロールメンションに含まれているか
+            if any(role in message.role_mentions for role in me.roles):
+                return True
+        return False
+
+    # --- 応答方式の変更 ---
+    def _is_other_bot_named_in_content(self, content: str) -> bool:
+        """自分以外のBotの名前が本文に含まれているか判定"""
+        if not content:
+            return False
+        my_room = self.room_name
+        with _sessions_lock:
+            for session in _bot_sessions.values():
+                other_room = session.get("room_name")
+                # 自分自身はスキップ
+                if not other_room or other_room == my_room:
+                    continue
+                other_name = _room_display_name(other_room)
+                if other_name and other_name in content:
+                    return True
+        return False
+
+    def _is_direct_reply_to_me(self, message: discord.Message) -> bool:
+        """メッセージが自分（Bot）への直接的なリプライかどうかを判定"""
+        if not message.reference or not message.reference.message_id:
+            return False
+        # キャッシュから親メッセージを確認
+        ref_msg = message.reference.cached_message
+        if ref_msg:
+            return ref_msg.author.id == (self.user.id if self.user else None)
+        # キャッシュにない場合はリプライ先があること自体を重視（あるいはfetch_messageが必要だが、ここでは簡易化）
+        return False
+    # ----------------------
 
     def _channel_response_mode(self, message: discord.Message) -> str:
         channel_id = str(message.channel.id)
@@ -1140,11 +1195,41 @@ class NexusDiscordClient(discord.Client):
         mode = self._channel_response_mode(message)
         if mode == "ignore":
             return False
-        if self._is_mentioned(message):
-            return True
-        if content.startswith("/"):
-            return mode == "always"
+        # --- 応答方式の変更 ---
+        #if self._is_mentioned(message):
+        #    return True
+        #if content.startswith("/"):
+        #    return mode == "always"
+        #return mode == "always"
+        # ----------------------
+        me_mentioned = self._is_mentioned(message)
+        # 1. ユーザーおよびロールメンションによる判定
+        my_id = getattr(self.user, 'id', None)
+        # 自分以外のBotユーザーへのメンションがある場合
+        if message.mentions:
+            if not any(m.id == my_id for m in message.mentions) and any(m.bot for m in message.mentions):
+                return False  # 自分以外への明示的なメンション
+        # 自分の持っていないロールへのメンションがある場合
+        if message.guild and message.role_mentions:
+            me = message.guild.me
+            my_roles = set(me.roles)
+            # 言及されたロールの中に、自分が持っているロールが一つもない場合
+            if not any(role in my_roles for role in message.role_mentions):
+                # かつ、自分への個人メンションや名前呼びも無いなら、それは他者宛てとみなす
+                if not me_mentioned:
+                    return False
+
+        # 2. 名前呼びによる判定
+        if me_mentioned:
+            return True # 自分の名前が呼ばれた
+
+        # 3. 自分以外のBotの名前が本文にある場合、Alwaysモードでも反応しない
+        if self._is_other_bot_named_in_content(message.content):
+            return False
+
+        # 4. メンションも名前呼びも（誰に対しても）無い場合（独り言や一般会話）はモードに従う
         return mode == "always"
+        # ----------------------
 
     def _should_handle_unmentioned_help(self, message: discord.Message, command_content: str) -> bool:
         if self.scope != "room":
@@ -1200,8 +1285,57 @@ class NexusDiscordClient(discord.Client):
             await self.handle_log_command(message, command_content)
             return
 
+        # --- 応答方式の変更 ---
+        #async with self.message_lock:
+        #    await self.handle_chat(message)
+        # 自分へのメンション、または自分の発言へのリプライか
+        # (メンション、名前呼び、ロール呼び、@everyone、または自分の発言へのリプライ)
+        is_direct = self._is_mentioned(message) or self._is_direct_reply_to_me(message)
         async with self.message_lock:
-            await self.handle_chat(message)
+            await self.handle_chat(message, is_direct=is_direct)
+        # ----------------------
+
+
+    # --- リアクションに反応 ---
+    async def on_reaction_add(self, reaction: discord.Reaction, user: discord.Member):
+        """リアクションが追加された際の処理"""
+        if user.bot:
+            return
+        # メッセージが自分（このBot）のもの、または関連する会話か確認
+        message = reaction.message
+        my_id = getattr(self.user, 'id', None)
+        if not message.author.id == my_id:
+            # 自分が宛先のメッセージでなければ無視（必要に応じて調整）
+            if not self._is_mentioned(message):
+                return
+
+        if not self._authorized_user_ids() or str(user.id) not in [str(aid) for aid in self._authorized_user_ids()]:
+            return
+        if not self._is_channel_allowed(message):
+            return
+
+        room_name = self._get_room_name()
+        if not room_name:
+            return
+
+        # AIへの入力としてリアクション情報を構成
+        display_name = getattr(user, "display_name", user.name)
+        reaction_content = (
+            f"（システム通知：ユーザー「{display_name}」があなたのメッセージにリアクション「{reaction.emoji}」を付けました。\n"
+            "このリアクションに対して、必要であれば返信してください。\n"
+            "もし返信が不要、あるいは沈黙が適切だと判断した場合は、必ず `[SILENCE]` とだけ出力してください。`[SILENCE]` と出力された場合、ユーザーには何も送信されません。）"
+        )
+        
+        print(f"--- [Discord Bot] リアクション検知 (Room: {room_name}): {reaction.emoji} by {display_name} ---")
+        
+        # 擬似的なメッセージとしてチャット処理に回す
+        adapter = _ChannelReplyAdapter(message.channel, user, content=reaction_content)
+        async with self.message_lock:
+            # --- 応答方式の変更 ---
+            #await self._submit_discord_user_content(room_name, reaction_content, [], adapter, source_label="Discord Reaction")
+            await self._submit_discord_user_content(room_name, reaction_content, [], adapter, source_label="Discord Reaction", is_direct=False)
+            # ----------------------
+    # --------------------------
 
     async def handle_room_command(self, message: discord.Message, content: Optional[str] = None):
         if self.scope == "room":
@@ -1660,7 +1794,10 @@ class NexusDiscordClient(discord.Client):
         if reason:
             logger.info(f"Discord voice input stopped: {reason}")
 
-    async def handle_chat(self, message: discord.Message):
+    # --- 応答方式の変更 ---
+    #async def handle_chat(self, message: discord.Message):
+    async def handle_chat(self, message: discord.Message, is_direct: bool = False):
+    # ----------------------
         room_name = self._get_room_name()
         if not room_name:
             await message.reply("⚠️ ルームが設定されていません。Web UIでルームを選択するか、共通Botで `/room` コマンドを使用してください。")
@@ -1700,7 +1837,10 @@ class NexusDiscordClient(discord.Client):
                     except Exception as e:
                         logger.error(f"Attachment download error: {attachment.filename}, {e}")
 
-        await self._submit_discord_user_content(room_name, user_content, attachments_paths, message, source_label="Discord")
+        # --- 応答方式の変更 ---
+        #await self._submit_discord_user_content(room_name, user_content, attachments_paths, message, source_label="Discord")
+        await self._submit_discord_user_content(room_name, user_content, attachments_paths, message, source_label="Discord", is_direct=is_direct)
+        # ----------------------
 
     async def _submit_discord_user_content(
         self,
@@ -1709,6 +1849,7 @@ class NexusDiscordClient(discord.Client):
         attachments_paths: List[str],
         reply_target,
         source_label: str = "Discord",
+        is_direct: bool = False,  # --- 応答方式の変更 ---
     ):
         log_file, _, _, _, _, _, _ = room_manager.get_room_files_paths(room_name)
         timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d (%a) %H:%M:%S")
@@ -1718,7 +1859,10 @@ class NexusDiscordClient(discord.Client):
         except Exception as e:
             logger.error(f"Logging error: {e}")
 
-        await self._execute_ai_interaction(room_name, user_content, attachments_paths, reply_target)
+        # --- 応答方式の変更 ---
+        #await self._execute_ai_interaction(room_name, user_content, attachments_paths, reply_target)
+        await self._execute_ai_interaction(room_name, user_content, attachments_paths, reply_target, is_direct=is_direct)
+        # ----------------------
 
     async def _handle_voice_audio_segment(self, session: Dict[str, Any], audio_path: str, user, duration: float):
         if self.voice_input_session is not session or not session.get("active"):
@@ -1971,7 +2115,10 @@ class NexusDiscordClient(discord.Client):
         utils.save_message_to_log(log_file, "## USER:user", full_user_log_entry)
 
         await message.reply(f"🔄 直前の応答を破棄し、再生成を開始します... (Room: {room_name})")
-        await self._execute_ai_interaction(room_name, clean_user_content, found_attachments, message)
+        # --- 応答方式の変更 ---
+        #await self._execute_ai_interaction(room_name, clean_user_content, found_attachments, message)
+        await self._execute_ai_interaction(room_name, clean_user_content, found_attachments, message, is_direct=True)
+        # ----------------------
 
     async def handle_twitter_command(self, message: discord.Message, content: Optional[str] = None):
         room_name = self._get_room_name()
@@ -2164,7 +2311,8 @@ class NexusDiscordClient(discord.Client):
             timestamp = f"\n\n{datetime.datetime.now().strftime('%Y-%m-%d (%a) %H:%M:%S')} | {utils.sanitize_model_name(actual_model_name)} | Discord Group"
             _append_group_entry_to_logs(group_log_path or shared_history_log_path, participants, f"## AGENT:{room_name}", content_str + timestamp)
 
-        final_text = utils.clean_persona_text(full_response)
+        # 表示用のテキストから日時を除去
+        final_text = utils.clean_persona_text(utils.remove_ai_timestamp(full_response))
         img_matches = re.findall(r"\[(?:VIEW_IMAGE|GENERATED_IMAGE):\s*(.*?)\]", full_response)
         image_paths = [img_path.strip() for img_path in img_matches if os.path.exists(img_path.strip())]
         return final_text, image_paths
@@ -2183,6 +2331,18 @@ class NexusDiscordClient(discord.Client):
             channel = client.get_channel(int(channel_id))
             if channel is None:
                 channel = await client.fetch_channel(int(channel_id))
+
+            # --- 権限のある任意のチャンネルにメッセージ送信 ---
+            # Discord側の送信権限チェック
+            permissions = channel.permissions_for(channel.guild.me)
+            if not permissions.send_messages:
+                logger.warning(f"Permission denied: cannot send message to {channel_id}")
+                return
+            if image_paths and not permissions.attach_files:
+                logger.warning(f"Permission denied: cannot attach files to {channel_id}")
+                return
+            # --------------------------------------------------
+
             parts = _chunk_text(response_text) if response_text else [""]
             for idx, part in enumerate(parts):
                 files = [discord.File(path) for path in image_paths if os.path.exists(path)] if idx == 0 else None
@@ -2211,7 +2371,10 @@ class NexusDiscordClient(discord.Client):
             files = [discord.File(path) for path in image_paths if os.path.exists(path)] if idx == 0 else None
             await fallback_channel.send(part, **_discord_send_kwargs(files=files if files else None))
 
-    async def _execute_ai_interaction(self, room_name: str, user_content: str, attachments_paths: List[str], reply_target: discord.Message):
+    # --- 応答方式の変更 ---
+    #async def _execute_ai_interaction(self, room_name: str, user_content: str, attachments_paths: List[str], reply_target: discord.Message):
+    async def _execute_ai_interaction(self, room_name: str, user_content: str, attachments_paths: List[str], reply_target, is_direct: bool = False):
+    # ----------------------
         log_file, _, _, _, _, _, _ = room_manager.get_room_files_paths(room_name)
         internal_state_before = None
         try:
@@ -2267,6 +2430,13 @@ class NexusDiscordClient(discord.Client):
                     if mode == "values" and payload.get("model_name"):
                         captured_model_name = payload.get("model_name")
 
+                # --- リアクションに反応 ---
+                # 反応不要（SILENCE）判定
+                if "[SILENCE]" in (full_response or ""):
+                    print(f"[DEBUG_DISCORD] AI selected SILENCE. No message sent.")
+                    return
+                # --------------------------
+
                 if full_response:
                     content_str = utils.remove_ai_timestamp(full_response)
                     persona_emotion_pattern = r"<persona_emotion\s+category=[\"'](\w+)[\"']\s+intensity=[\"']([0-9.]+)[\"']\s*/>"
@@ -2302,7 +2472,8 @@ class NexusDiscordClient(discord.Client):
 
                 #final_text = utils.clean_persona_text(full_response)
                 # --- 画像パスを検知したら添付画像に置換 ---
-                final_text = full_response
+                # 最初にタイムスタンプを除去してから処理を開始する
+                final_text = utils.remove_ai_timestamp(full_response or "")
                 generated_images = []
                 hallucinated_paths = []
 
@@ -2339,10 +2510,24 @@ class NexusDiscordClient(discord.Client):
                 # 独自タグとMarkdown画像タグを消去（または📸に置換）
                 final_text = re.sub(patterns['internal'], ' 📸 ', final_text, flags=re.IGNORECASE)
                 final_text = re.sub(patterns['markdown'], ' 📸 ', final_text)
-                
+
+                # --- 応答方式の変更 ---
+                # AIの意志（タグ）によるリプライ強制
+                force_reply = False
+                if "<action:reply/>" in final_text:
+                    force_reply = True
+                    final_text = final_text.replace("<action:reply/>", "")
+                # ----------------------
+
                 # クリーニングと体裁調整
                 final_text = utils.clean_persona_text(final_text).strip()
                 final_text = re.sub(r'\s*📸\s*', ' 📸 ', final_text).strip()
+
+                # --- 応答方式の変更 ---
+                # リプライを使うか通常送信か判定
+                # (自分へのメンション/返信がある場合、またはAIがタグを出力した場合にリプライ)
+                should_reply = is_direct or force_reply
+                # ----------------------
                 # ------------------------------------------
 
                 # 予測されたパスがあった場合、ログに警告を記録してAIに次回の反省を促す（思考の有無に関わらず実行）
@@ -2373,12 +2558,35 @@ class NexusDiscordClient(discord.Client):
                     parts = _chunk_text(final_text)
                     for idx, part in enumerate(parts):
                         files = [discord.File(path) for path in generated_images if os.path.exists(path)] if idx == 0 else None
-                        await reply_target.reply(part, **_discord_send_kwargs(files=files if files else None))
+                        # --- 応答方式の変更 ---
+                        #await reply_target.reply(part, **_discord_send_kwargs(files=files if files else None))
+                        if should_reply and hasattr(reply_target, "reply"):
+                            await reply_target.reply(part, **_discord_send_kwargs(files=files if files else None))
+                        else:
+                            # 通常送信（アダプター経由またはchannel.send）
+                            target_channel = getattr(reply_target, "channel", reply_target)
+                            await target_channel.send(part, **_discord_send_kwargs(files=files if files else None))
+                        # ----------------------
                 elif generated_images:
                     files = [discord.File(path) for path in generated_images if os.path.exists(path)]
-                    await reply_target.reply(files=files)
+                    # --- 応答方式の変更 ---
+                    #await reply_target.reply(files=files)
+                    if should_reply and hasattr(reply_target, "reply"):
+                        await reply_target.reply(files=files)
+                    else:
+                        target_channel = getattr(reply_target, "channel", reply_target)
+                        await target_channel.send(files=files)
+                    # ----------------------
                 else:
-                    await reply_target.reply("（AIからの応答が空でした）")
+                    # --- 応答方式の変更 ---
+                    #await reply_target.reply("（AIからの応答が空でした）")
+                    # 空応答の場合。reply_targetがadapterかMessageかで挙動を合わせる
+                    if hasattr(reply_target, "reply"):
+                        await reply_target.reply("（AIからの応答が空でした）")
+                    else:
+                        target = getattr(reply_target, "channel", reply_target)
+                        await target.send("（AIからの応答が空でした）")
+                    # ----------------------
 
                 try:
                     from motivation_manager import MotivationManager
@@ -2540,9 +2748,26 @@ def send_message_to_room(room_name: str, message_text: str, channel_id: Optional
 
     async def _send():
         client = session["client"]
-        channel = client.get_channel(int(target_channel_id))
-        if channel is None:
-            channel = await client.fetch_channel(int(target_channel_id))
+        # --- 権限のある任意のチャンネルにメッセージ送信 ---
+        #channel = client.get_channel(int(target_channel_id))
+        #if channel is None:
+        #    channel = await client.fetch_channel(int(target_channel_id))
+        # --------------------------------------------------
+        # チャンネル取得と権限チェックの強化
+        try:
+            channel = client.get_channel(int(target_channel_id))
+            if channel is None:
+                channel = await client.fetch_channel(int(target_channel_id))
+        except (discord.NotFound, discord.Forbidden, ValueError):
+            raise Exception(f"指定されたチャンネル(ID:{target_channel_id})が見つからないか、アクセス権限がありません。")
+
+        # Discord側の権限チェック
+        permissions = channel.permissions_for(channel.guild.me)
+        if not permissions.send_messages:
+            raise Exception(f"チャンネル「{getattr(channel, 'name', target_channel_id)}」でメッセージを送信する権限がありません。")
+        if image_paths and not permissions.attach_files:
+            raise Exception(f"チャンネル「{getattr(channel, 'name', target_channel_id)}」でファイルを添付する権限がありません。")
+        # --------------------------------------------------
         
         async with channel.typing():
             # --- 画像パスを検知したら添付画像に置換 ---
@@ -2562,7 +2787,8 @@ def send_message_to_room(room_name: str, message_text: str, channel_id: Optional
                 elif p:
                     hallucinated_paths.append(p)
 
-            clean_content = message_text or ""
+            # 送信前にタイムスタンプを除去
+            clean_content = utils.remove_ai_timestamp(message_text or "")
 
             print(f"\n[DEBUG_DISCORD] [SEND] AI_RAW_RESPONSE:\n{clean_content[0:100]}\n")  # DEBUG
 
@@ -2622,6 +2848,39 @@ def send_message_to_room(room_name: str, message_text: str, channel_id: Optional
     except Exception as e:
         logger.error(f"Discord autonomous send failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
+
+# --- AI用独自ツール ---
+def get_authorized_channels_list(room_name: str) -> str:
+    """AIツール向け：このペルソナが送信を許可されているチャンネルIDと名前のリストを返す"""
+    settings = config_manager.get_room_discord_bot_settings(room_name)
+    allowed_ids = _parse_id_list(settings.get("allowed_channel_ids"))
+    
+    if not allowed_ids:
+        return "現在、特定の許可チャンネルリストは設定されていません（デフォルトチャンネルのみ、または全解放の設定です）。"
+
+    session = _get_room_bot_session(room_name)
+    if not session:
+        return f"許可設定されているIDリスト: {', '.join(allowed_ids)} (Botがオフラインのため名前を取得できません)"
+
+    async def _resolve():
+        client = session["client"]
+        lines = []
+        for cid in allowed_ids:
+            try:
+                # キャッシュから取得、なければフェッチ
+                ch = client.get_channel(int(cid)) or await client.fetch_channel(int(cid))
+                perms = ch.permissions_for(ch.guild.me)
+                status = "送信可能" if perms.send_messages else "権限不足(送信不可)"
+                lines.append(f"- #{ch.name} (ID: {cid}) [{status}]")
+            except Exception:
+                lines.append(f"- 不明なチャンネル (ID: {cid}) [アクセス不可]")
+        return "\n".join(lines) if lines else "許可リストは空です。"
+
+    future = asyncio.run_coroutine_threadsafe(_resolve(), session["loop"])
+    try:
+        return future.result(timeout=15)
+    except Exception as e:
+        return f"許可チャンネル名の取得中にエラーが発生しました: {e}\n設定されているID: {', '.join(allowed_ids)}"
 
 # --- Twitterの下書きをDiscordから承認 ---
 def send_twitter_approval_request(room_name: str, draft_id: str, content: str, media_paths: Optional[List[str]] = None) -> Dict[str, Any]:
