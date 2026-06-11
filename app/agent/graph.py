@@ -167,7 +167,7 @@ side_effect_tools = [
     "update_active_purpose", "propose_purpose_change", "approve_purpose_change",
     "update_research_thread",
     "set_personal_alarm", "set_timer", "set_pomodoro_timer",
-    "schedule_next_action", "send_discord_message", "send_discord_image", "get_discord_authorized_channels"
+    "schedule_next_action", "send_discord_message", "send_discord_image", "get_discord_authorized_channels",
     "reflect_after_action", "start_autonomy_timeline", "record_autonomy_step", "complete_autonomy_timeline",
     "save_procedure", "create_procedure_from_timeline",
     "request_capability_approval", "record_capability_audit",
@@ -3112,6 +3112,16 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
                 generation_config=state['generation_config'],
                 room_name=room_name
             )
+
+            # 【500 INTERNAL対策】ファイル編集タスクではツール呼び出しを完全に無効化する
+            if "gemini" in str(llm_persona).lower():
+                try:
+                    from google.genai import types as genai_types
+                    afc_config = genai_types.AutomaticFunctionCallingConfig(disable=True)
+                    # tools=[] を明示的にバインドし、AFC設定を無効化
+                    llm_persona = llm_persona.bind(tools=[], automatic_function_calling=afc_config)
+                except Exception:
+                    pass
 
             tried_keys = set()
             clean_key_name = config_manager.get_key_name_by_value(current_api_key)
