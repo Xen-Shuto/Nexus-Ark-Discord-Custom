@@ -2325,7 +2325,10 @@ def agent_node(state: AgentState):
             f"({original_tool_chars} -> {compressed_tool_chars} chars, -{saved_chars})"
         )
 
-    messages_for_agent = [final_system_prompt_message] + history_messages_for_agent
+    # 履歴が長すぎると 500 Internal Error の原因になるため、最新の30件に制限して安定化を図る
+    #messages_for_agent = [final_system_prompt_message] + history_messages_for_agent
+    MAX_HISTORY_FOR_STABILITY = 30
+    messages_for_agent = [final_system_prompt_message] + history_messages_for_agent[-MAX_HISTORY_FOR_STABILITY:]
 
     # [Size Log] 会話履歴のサイズ計測
     history_chars = sum(len(m.content) if isinstance(m.content, str) else 0 for m in history_messages_for_agent)
@@ -3353,7 +3356,9 @@ def _execute_single_tool_inner(state: AgentState, tool_call: dict, current_signa
                 except Exception as e:
                     err_str = str(e).upper()
                     is_429 = isinstance(e, google_exceptions.ResourceExhausted) or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
-                    is_503 = "503" in err_str or "UNAVAILABLE" in err_str or isinstance(e, (google_exceptions.ServiceUnavailable, google_exceptions.InternalServerError))
+                    # 500 INTERNAL も一時的な負荷エラーとしてリトライ対象に含める
+                    #is_503 = "503" in err_str or "UNAVAILABLE" in err_str or isinstance(e, (google_exceptions.ServiceUnavailable, google_exceptions.InternalServerError))
+                    is_503 = "503" in err_str or "500" in err_str or "UNAVAILABLE" in err_str or isinstance(e, (google_exceptions.ServiceUnavailable, google_exceptions.InternalServerError))
 
                     if is_429:
                         # 有料キーの判定

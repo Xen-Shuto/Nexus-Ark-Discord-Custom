@@ -723,6 +723,8 @@ class TwitterDraftView(discord.ui.View):
         self.draft_id = draft_id
         self.room_name = room_name
         
+        self._processing = False  # 連打・重複処理防止フラグ
+        
         # 各ボタンに一意のcustom_idを設定することで、再起動後もdiscord.pyがどのViewか識別できる
         self.approve_button.custom_id = f"tw_approve:{draft_id}"
         self.reject_button.custom_id = f"tw_reject:{draft_id}"
@@ -730,9 +732,16 @@ class TwitterDraftView(discord.ui.View):
 
     @discord.ui.button(label="詳細", style=discord.ButtonStyle.secondary)
     async def show_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.response.is_done():
+            return
         try:
+            # 詳細表示は元のメッセージをいじらず、自分にだけ見えるメッセージで出す
+            await interaction.response.defer(ephemeral=True, thinking=True)
             from twitter_manager import twitter_manager
             twitter_manager.reload()
+            
+            # 元のメッセージの内容を保持（存在チェック用）
+            current_content = interaction.message.content
             
             # 下書き存在確認
             pending = twitter_manager.get_pending_list()
@@ -740,11 +749,11 @@ class TwitterDraftView(discord.ui.View):
             
             # 下書きが既に存在しない場合、メッセージを書き換えてボタンを消す
             if not draft:
-                content = interaction.message.content
+                content = current_content
                 # テキストの重複追記を防ぐための補助的なチェック
                 if not any(x in content for x in ["（処理済み）", "投稿済み", "却下しました"]):
                     content += "\n\n（ブラウザ等で処理済み）"
-                await interaction.response.edit_message(content=content, view=None)
+                await interaction.followup.edit_message(message_id=interaction.message.id, content=content, view=None)
                 return
             
             # 存在する場合は処理を続行
@@ -755,19 +764,30 @@ class TwitterDraftView(discord.ui.View):
             if draft.get("media_paths"):
                 detail += f"\n**画像:** {len(draft.get('media_paths'))}枚"
             
-            await interaction.response.send_message(detail, ephemeral=True)
+            await interaction.followup.send(detail, ephemeral=True)
         except Exception as e:
-            logger.error(f"Twitter show button error: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"⚠️ 詳細取得に失敗しました: {e}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"⚠️ 詳細取得に失敗しました: {e}", ephemeral=True)
+            logger.error(f"Twitter show button error: {e}", exc_info=True)
+            await interaction.followup.send(f"⚠️ 詳細取得に失敗しました: {e}", ephemeral=True)
 
     @discord.ui.button(label="承認して投稿", style=discord.ButtonStyle.green)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # 存在チェックを行う前に defer すると「Botは考えています」が出るため、
         # 状態を確認してから defer もしくは edit を行う
+        if self._processing or interaction.response.is_done():
+            return
+        self._processing = True
+
+        # 元のメッセージ内容を事前に保持
+        current_content = interaction.message.content
+
         try:
+            # 連打対策：処理開始時にボタンを無効化
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
+            # 保留中メッセージを出す
+            await interaction.response.edit_message(view=self)
+
             from twitter_manager import twitter_manager
             twitter_manager.reload()
             
@@ -777,21 +797,26 @@ class TwitterDraftView(discord.ui.View):
             
             # 下書きが既に存在しない場合、メッセージを書き換えてボタンを消す
             if not draft:
-                content = interaction.message.content
+                content = current_content
                 if not any(x in content for x in ["（処理済み）", "投稿済み", "却下しました"]):
                     content += "\n\n（ブラウザ等で処理済み）"
-                await interaction.response.edit_message(content=content, view=None)
+                await interaction.edit_original_response(content=content, view=None)
                 return
 
-            # 存在する場合は処理を続行（保留中メッセージを出す）
-            await interaction.response.defer(thinking=True)
-            room_name = self.room_name or draft.get("room_name")
+            # 存在する場合は処理を続行
+            target_room = self.room_name or draft.get("room_name")
             
             # 非同期で投稿処理を実行（他のボットイベントを止めない）
             def _post_task():
-                if not twitter_manager.approve_tweet(self.draft_id):
-                    return {"success": False, "error": "承認処理に失敗しました。"}
-                return twitter_manager.execute_post(self.draft_id, room_name)
+                #if not twitter_manager.approve_tweet(self.draft_id):
+                #    return {"success": False, "error": "承認処理に失敗しました。"}
+                #return twitter_manager.execute_post(self.draft_id, room_name)
+                try:
+                    if not twitter_manager.approve_tweet(self.draft_id):
+                        return {"success": False, "error": "承認処理に失敗しました。"}
+                    return twitter_manager.execute_post(self.draft_id, target_room)
+                except Exception as ex:
+                    return {"success": False, "error": str(ex)}
 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, _post_task)
@@ -799,21 +824,41 @@ class TwitterDraftView(discord.ui.View):
             if result.get("success"):
                 url = result.get("url", "不明なURL")
                 # 成功時、元のプレビューを残してステータスを追記
-                content = interaction.message.content
+                content = current_content
                 if "投稿済み" not in content:
                     content += f"\n\n✅ Twitter投稿済み: {url}"
-                await interaction.edit_original_response(content=content, view=None)
+                await interaction.edit_original_response(content=content, view=None) # Viewを削除
             else:
                 twitter_manager.move_back_to_drafts(self.draft_id)
-                await interaction.followup.send(f"❌ Twitter投稿に失敗しました: {result.get('error', '不明なエラー')}")
+                # 失敗時はボタンを再有効化
+                for item in self.children:
+                    if isinstance(item, discord.ui.Button):
+                        item.disabled = False
+                self._processing = False
+                await interaction.edit_original_response(view=self)
+                await interaction.followup.send(f"❌ Twitter投稿に失敗しました: {result.get('error', '不明なエラー')}", ephemeral=True)
 
         except Exception as e:
+            self._processing = False
             logger.error(f"Twitter approve button error: {e}", exc_info=True)
             await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
 
     @discord.ui.button(label="却下", style=discord.ButtonStyle.red)
     async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._processing or interaction.response.is_done():
+            return
+        self._processing = True
+
+        # 元のメッセージ内容を保持
+        current_content = interaction.message.content
+
         try:
+            # 連打対策：処理開始時にボタンを無効化
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
+            await interaction.response.edit_message(view=self)
+
             from twitter_manager import twitter_manager
             twitter_manager.reload()
             
@@ -823,26 +868,23 @@ class TwitterDraftView(discord.ui.View):
             
             # 下書きが既に存在しない場合、メッセージを書き換えてボタンを消す
             if not draft:
-                content = interaction.message.content
+                content = current_content
                 if not any(x in content for x in ["（処理済み）", "投稿済み", "却下しました"]):
                     content += "\n\n（ブラウザ等で処理済み）"
-                await interaction.response.edit_message(content=content, view=None)
+                await interaction.edit_original_response(content=content, view=None)
                 return
 
             # 存在する場合は処理を続行
             twitter_manager.reject_tweet(self.draft_id)
             # 却下成功時、元のメッセージを残してステータスを追記
-            content = interaction.message.content
+            content = current_content
             if "却下しました" not in content:
                 content += f"\n\n🗑️ 下書き `{self.draft_id}` を却下しました。"
-            await interaction.response.edit_message(content=content, view=None)
+            await interaction.edit_original_response(content=content, view=None)
 
         except Exception as e:
             logger.error(f"Twitter reject button error: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"⚠️ 却下処理に失敗しました: {e}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"⚠️ 却下処理に失敗しました: {e}", ephemeral=True)
+            await interaction.followup.send(f"⚠️ 却下処理に失敗しました: {e}", ephemeral=True)
 
     @classmethod
     def from_custom_id(cls, custom_id: str):
