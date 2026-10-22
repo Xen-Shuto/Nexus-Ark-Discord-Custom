@@ -139,21 +139,25 @@ class ItemManager:
                 return consumed_item_data
         return None
 
-    def transfer_item(self, item_id: str, from_user: bool = True) -> bool:
+    def transfer_item(self, item_id: str, from_user: bool = True, amount: int = 1) -> bool:
         """
         アイテムを相手に添付（譲渡）する。
-        送り主の所持数を1減らし、受取人のインベントリに全データを追加する（最初は情報を秘匿する想定）。
+        送り主の所持数を指定個数減らし、受取人のインベントリに同数追加する（最初は情報を秘匿する想定）。
         """
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return False
         sender_inventory = self._load_inventory(from_user)
         receiver_inventory = self._load_inventory(not from_user)
         
         target_item = None
         for item in sender_inventory.get("items", []):
             if item.get("id") == item_id:
+                if item.get("amount", 0) < amount:
+                    return False
                 target_item = dict(item) # コピーを作成して送る
                 
-                # 送り主から減算
-                item["amount"] -= 1
+                # 送り主から指定個数を減算
+                item["amount"] -= amount
                 if item["amount"] <= 0:
                     sender_inventory["items"].remove(item)
                 break
@@ -164,13 +168,13 @@ class ItemManager:
             
         # 受取人側への追加準備
         # 受取人にとっては「貰い物」であり、最初は中身を知らない状態にする
-        target_item["amount"] = 1
+        target_item["amount"] = amount
         target_item["is_new"] = True 
         
         # 既に同じアイテム（ID共通）を持っていればスタックを加算
         existing_item = next((i for i in receiver_inventory.get("items", []) if i.get("id") == target_item["id"]), None)
         if existing_item:
-            existing_item["amount"] += 1
+            existing_item["amount"] += amount
             existing_item["is_new"] = True # 新たに貰ったのでNEWフラグを立て直す
         else:
             receiver_inventory["items"].append(target_item)

@@ -704,7 +704,7 @@ else:
 class TwitterDraftView(discord.ui.View):
     """Persistent buttons; authority and room ownership are checked at click time."""
 
-    def __init__(self, draft_id: str, all_disabled: bool = False):
+    def __init__(self, draft_id: str):
         super().__init__(timeout=None)
         for action, label, style in (
             ("approve", "承認して投稿", discord.ButtonStyle.success),
@@ -712,7 +712,6 @@ class TwitterDraftView(discord.ui.View):
             ("show", "詳細表示", discord.ButtonStyle.secondary),
         ):
             button = discord.ui.Button(label=label, style=style, custom_id=f"tw_{action}:{draft_id}")
-            button.disabled = all_disabled
 
             async def callback(interaction, action=action):
                 client = interaction.client
@@ -725,15 +724,18 @@ class TwitterDraftView(discord.ui.View):
                         pending_actions = client._twitter_draft_busy = set()
                     closed = getattr(client, "_twitter_closed_messages", None)
                     if closed is None:
-                        closed = client._twitter_closed_messages = set()
+                        closed = client._twitter_closed_messages = {}
                     if draft_id in pending_actions:
                         await message.reply("この下書きは処理中です。完了までお待ちください。", ephemeral=True)
                         return
 
-                    async def close_buttons():
-                        closed.add(source.id)
+                    async def close_buttons(status=None):
+                        closed.setdefault(source.id, status or "（この下書きは承認待ちではありません。）")
                         try:
-                            await source.edit(view=TwitterDraftView(draft_id, all_disabled=True))
+                            await source.edit(
+                                content=f"Twitter下書き `{draft_id}`\n{closed[source.id]}",
+                                view=None, allowed_mentions=discord.AllowedMentions.none(),
+                            )
                         except discord.HTTPException:
                             logger.exception("Twitter approval button update failed (message=%s)", source.id)
 
@@ -744,7 +746,9 @@ class TwitterDraftView(discord.ui.View):
                     pending_actions.add(draft_id)
                     try:
                         result = await client.handle_twitter_command(message, command)
-                        if result in ("closed", "missing"):
+                        if result == "closed":
+                            await close_buttons("（承認されました。）" if action == "approve" else "（否認されました。）")
+                        elif result == "missing":
                             await close_buttons()
                         return result
                     finally:

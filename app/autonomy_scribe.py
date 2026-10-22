@@ -20,7 +20,7 @@ def draft_reflection(
     final_response_text: str,
     tool_history: List[Dict[str, Any]],
     motivation_log: Dict[str, Any] | None = None,
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float | None = None,
 ) -> Dict[str, Any]:
     """Draft a reflect_after_action-compatible record using the internal processing model."""
     clean_response = utils.remove_thoughts_from_text(final_response_text or "").strip()
@@ -49,12 +49,20 @@ def draft_reflection(
         )
         return utils.extract_text_from_llm_content(response.content)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    # ローカル推論に固定10秒の期限を重ねると、完成した結果まで破棄してしまう。
+    # 既定では共通ファクトリの通信エラー／リトライ処理に委ねる。
+    if timeout_seconds is None:
+        raw = _invoke()
+    else:
+        executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(_invoke)
         try:
             raw = future.result(timeout=timeout_seconds)
         except TimeoutError as exc:
             raise TimeoutError("autonomy scribe timed out") from exc
+        finally:
+            # 実行中の通信は中断できないが、明示した期限の後に終了待ちを重ねない。
+            executor.shutdown(wait=False, cancel_futures=True)
 
     parsed = _extract_json_object(raw)
     return _normalize_reflection(parsed)

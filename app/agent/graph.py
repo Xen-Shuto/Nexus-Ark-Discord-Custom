@@ -334,7 +334,11 @@ def _is_agent_service_unavailable_error(error: Exception, *, is_429: bool = Fals
 
 def _is_agent_prompt_too_long_error(error: Exception) -> bool:
     err_str = str(error).lower()
-    return "prompt is too long" in err_str or "prompt too long" in err_str
+    return any(marker in err_str for marker in (
+        "prompt is too long", "prompt too long", "exceed_context_size_error",
+        "context_length_exceeded", "exceeds the available context size",
+        "maximum context length",
+    ))
 
 
 def _is_model_image_unsupported_error(error: Exception) -> bool:
@@ -1083,6 +1087,21 @@ def _should_skip_retrieval_locally(query_source: str) -> bool:
     # ごく短い感情だけの返答は検索判断LLMを挟まない。
     affective_markers = ["好き", "嬉しい", "寂しい", "眠い", "疲れた", "安心", "怖い"]
     return len(normalized) <= 12 and any(marker in normalized for marker in affective_markers)
+
+
+def _invoke_agent_llm_with_timeout(llm, messages: list, timeout_seconds: float = 900.0):
+    """期限超過後にexecutorの終了待ちでブロックしない。実行中の通信は中断できない。"""
+    import concurrent.futures
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(llm.invoke, messages)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"LLM応答タイムアウト ({timeout_seconds:g}秒)") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _invoke_retrieval_decision_with_timeout(llm, messages: list, timeout_seconds: float = 15.0):
@@ -3564,14 +3583,9 @@ def agent_node(state: AgentState):
                         # [2026-02-19 FIX] タイムアウト付きinvoke（API無応答によるハング防止）
                         import concurrent.futures
                         _LLM_INVOKE_TIMEOUT = 900  # Local LLM等の長文処理対策で延長 (300 -> 900秒)
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(llm_or_llm_with_tools.invoke, messages_for_agent)
-                            try:
-                                response_direct = future.result(timeout=_LLM_INVOKE_TIMEOUT)
-                            except concurrent.futures.TimeoutError:
-                                print(f"--- [警告] LLM invoke がタイムアウトしました ({_LLM_INVOKE_TIMEOUT}s) ---")
-                                future.cancel()
-                                raise TimeoutError(f"LLM応答タイムアウト ({_LLM_INVOKE_TIMEOUT}秒)")
+                        response_direct = _invoke_agent_llm_with_timeout(
+                            llm_or_llm_with_tools, messages_for_agent, _LLM_INVOKE_TIMEOUT,
+                        )
 
                         # Gemini 3 Flash (Thinking Mode) は content をリストで返すことがある。
                         # ここで text だけへ破壊的に正規化すると、後段の
@@ -3747,6 +3761,10 @@ def agent_node(state: AgentState):
                         continue
                     print(f"--- [DEBUG] 画像除去後も画像非対応エラーが継続。上位へ戻します({err_str})。 ---")
                     raise e
+
+                if isinstance(e, TimeoutError):
+                    # 実行中の通信を中断できないため、同じ要求を重ねて再送しない。
+                    raise
 
                 if is_prompt_too_long:
                     print(f"--- [DEBUG] Prompt too long 例外を検知しました。リトライせず上位へ戻します({err_str})。 ---")

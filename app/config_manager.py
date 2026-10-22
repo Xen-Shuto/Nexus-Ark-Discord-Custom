@@ -2886,6 +2886,9 @@ def get_effective_internal_model(role: str) -> Tuple[str, str, str]:
     Returns:
         (provider_cat, model_name, profile_name) のタプル
     """
+    if role not in {"processing", "summarization", "supervisor", "translation"}:
+        raise ValueError(f"Unknown internal model role: {role!r}")
+
     settings = get_internal_model_settings()
     
     # ロールごとのキーマッピング

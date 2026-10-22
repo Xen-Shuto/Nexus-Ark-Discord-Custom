@@ -6,6 +6,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, H
 from langchain_openai import ChatOpenAI
 # from langchain_anthropic import ChatAnthropic # 遅延読み込みに変更
 import config_manager
+import constants
 import utils
 import gemini_api # 既存のGemini設定ロジックを再利用するため
 
@@ -95,6 +96,7 @@ class LLMFactory:
         internal_role: str = None,  # [Phase 2] "processing", "summarization", "supervisor"
         delegation_model_override: tuple[str, str, str] | None = None,
         gemini_cached_content: str | None = None,
+        internal_model_override: tuple[str, str, str] | None = None,
     ):
         """
         現在の設定(active_provider)に基づいて、適切なLangChain ChatModelインスタンスを生成して返す。
@@ -113,6 +115,7 @@ class LLMFactory:
             internal_role: [Phase 2] 内部処理のロール。"processing", "summarization", "supervisor"のいずれか。
                           指定すると、config.jsonの内部モデル設定に基づいてプロバイダとモデルを自動選択。
             delegation_model_override: 委任実行モデルの三つ組上書き。(provider_cat, model, profile)
+            internal_model_override: この呼び出しだけの内部モデル指定。設定ファイルは変更しない。
         """
         config_manager.load_config() 
         
@@ -124,7 +127,7 @@ class LLMFactory:
                 if not res:
                     raise ValueError("Delegation execution model is not configured.")
             else:
-                res = config_manager.get_effective_internal_model(internal_role)
+                res = internal_model_override or config_manager.get_effective_internal_model(internal_role)
             active_provider, effective_model_name, internal_profile_name = res
             
             print(f"--- [LLM Factory] 内部モデル設定（混合編成）適用: {internal_role} ---")
@@ -532,20 +535,8 @@ class LLMFactory:
         """
         settings = config_manager.get_internal_model_settings()
         
-        provider_key_map = {
-            "processing": "processing_provider",
-            "summarization": "summarization_provider",
-            "supervisor": "supervisor_provider",
-            "translation": "translation_provider",
-        }
-        
-        if internal_role and internal_role in provider_key_map:
-            provider_key = provider_key_map[internal_role]
-            primary_provider, _, _ = config_manager.get_effective_internal_model(internal_role)
-        else:
-            provider_key = "provider"
-            primary_provider = settings.get("provider", "google")
-            
+        primary_provider, model_name, profile_name = config_manager.get_effective_internal_model(internal_role)
+
         fallback_enabled = settings.get("fallback_enabled", True)
         fallback_order = settings.get("fallback_order", ["google"])
         
@@ -559,26 +550,26 @@ class LLMFactory:
         errors = []
         for provider in providers_to_try:
             try:
-                # プロバイダを一時的に上書きして試行
-                original_provider = settings.get(provider_key)
-                settings[provider_key] = provider
-                config_manager.save_config_if_changed("internal_model_settings", settings)
-                
+                # フォールバックはこの呼び出しだけに適用し、共通設定を保存・変更しない。
+                # 主プロバイダでは、既存のモデル指定をそのまま使う。
+                call_kwargs = dict(kwargs)
+                if provider != primary_provider:
+                    fallback_model_name = model_name
+                    if provider == "google":
+                        # ローカル／他社モデル名をGeminiに送らない。
+                        fallback_model_name = (
+                            constants.SUMMARIZATION_MODEL if internal_role == "summarization"
+                            else constants.INTERNAL_PROCESSING_MODEL
+                        )
+                    call_kwargs["internal_model_override"] = (provider, fallback_model_name, profile_name)
                 print(f"[LLM Factory] Trying provider: {provider} (Role: {internal_role})")
                 model = LLMFactory.create_chat_model(
                     internal_role=internal_role,
                     room_name=room_name,
                     temperature=temperature,
-                    **kwargs
+                    **call_kwargs
                 )
-                
-                # 成功したらプロバイダを元に戻す
-                if original_provider is not None:
-                    settings[provider_key] = original_provider
-                else:
-                    settings.pop(provider_key, None)
-                config_manager.save_config_if_changed("internal_model_settings", settings)
-                
+
                 return model
                 
             except Exception as e:

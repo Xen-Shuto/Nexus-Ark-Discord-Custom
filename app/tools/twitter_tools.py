@@ -121,13 +121,29 @@ def _collect_tweet_dedup_candidates(room_name: str) -> List[Dict[str, Any]]:
 
 
 def _get_tweet_dedup_embeddings(room_name: str):
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
     import constants
-    import utils
 
     settings = config_manager.get_internal_model_settings()
+    effective_settings = config_manager.get_effective_settings(room_name)
+    if effective_settings.get("embedding_mode", "api") == "local":
+        from rag_manager import get_local_embedding_model
+        return get_local_embedding_model(settings.get("embedding_model", "multilingual-e5-small"))
+
     model_name = utils.sanitize_model_name(settings.get("embedding_model", constants.EMBEDDING_MODEL))
-    api_key = config_manager.get_active_gemini_api_key(room_name, model_name=model_name)
+    provider = settings.get("embedding_provider", "google")
+    if provider == "openai":
+        from langchain_openai import OpenAIEmbeddings
+        profile = config_manager.get_active_openai_setting()
+        if not profile:
+            raise RuntimeError("Embedding OpenAI profile is not configured")
+        return OpenAIEmbeddings(
+            model=model_name,
+            openai_api_key=profile.get("api_key") or "dummy",
+            openai_api_base=profile.get("base_url"),
+        )
+
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    api_key = config_manager.get_active_gemini_api_key(None, model_name=model_name)
     if not api_key:
         raise RuntimeError("Gemini embedding API key is not configured")
     return GoogleGenerativeAIEmbeddings(

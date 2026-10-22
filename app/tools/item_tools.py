@@ -99,6 +99,8 @@ def place_item_to_location(item_id: str, location_name: str, room_name: str, fur
     try:
         im = ItemManager(room_name)
         # アイテム名取得（ログ用）
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return "エラー: 個数は1以上の整数を指定してください。"
         target = im.get_item(item_id, is_user=False)
         item_name = target.get('name', item_id) if target else item_id
         
@@ -146,6 +148,8 @@ def examine_item(item_id: str, room_name: str) -> str:
     try:
         im = ItemManager(room_name)
         # 1. 所持品から探す
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return "エラー: 個数は1以上の整数を指定してください。"
         target = im.get_item(item_id, is_user=False)
         
         # 2. なければ現在の場所から探す
@@ -274,10 +278,12 @@ def gift_item_to_user(item_id: str, room_name: str, amount: int = 1) -> str:
     try:
         im = ItemManager(room_name)
         # 譲渡前にアイテム名を取得しておく
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return "エラー: 個数は1以上の整数を指定してください。"
         target = im.get_item(item_id, is_user=False)
         item_name = target.get('name', item_id) if target else item_id
         
-        success = im.transfer_item(item_id, from_user=False)
+        success = im.transfer_item(item_id, from_user=False, amount=amount)
         if success:
             try:
                 import utils
@@ -293,7 +299,7 @@ def gift_item_to_user(item_id: str, room_name: str, amount: int = 1) -> str:
         return f"エラー: 譲渡処理中に例外が発生しました: {e}"
 
 @tool
-def create_food_item(name: str, category: str, base_description: str, room_name: str, amount: int = 1, image_prompt: Optional[str] = None, description: Optional[str] = None) -> str:
+def create_food_item(name: str, category: str, base_description: str = "", room_name: str = "", amount: int = 1, image_prompt: Optional[str] = None, description: Optional[str] = None) -> str:
     """
     新しい食べ物アイテムを作成して自分のインベントリに追加します。
     ※相手から「プレゼントされたもの」を食べる場合は、新しく作成するのではなく list_my_items で既存のアイテムを探して consume_item を実行してください。
@@ -305,6 +311,10 @@ def create_food_item(name: str, category: str, base_description: str, room_name:
     image_prompt: (オプション) アイテムの外観画像をAIで生成するための英語の指示文。指定すると画像が添付されます。
     """
     try:
+        if not room_name:
+            return "エラー: ルーム名が必要です。"
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return "エラー: 個数は1以上の整数を指定してください。"
         # エイリアス対応
         actual_description = base_description or description
         if not actual_description:
@@ -317,10 +327,8 @@ def create_food_item(name: str, category: str, base_description: str, room_name:
         api_key_name = config_manager.CONFIG_GLOBAL.get("last_api_key_name") or config_manager.initial_api_key_name_global
         api_key_val = config_manager.GEMINI_API_KEYS.get(api_key_name)
         
-        if not api_key_val:
-             return "エラー: Gemini APIキーが設定されていません。"
         
-        prompt_text = f"名前: {name}\nカテゴリ: {category}\n詳細: {base_description}"
+        prompt_text = f"名前: {name}\nカテゴリ: {category}\n詳細: {actual_description}"
         json_data = generate_food_item_profile(prompt_text, api_key_val)
         
         if not json_data:
@@ -355,7 +363,7 @@ def create_food_item(name: str, category: str, base_description: str, room_name:
         return f"エラー: 作成処理中に例外が発生しました: {e}"
 
 @tool
-def create_standard_item(name: str, category: str, base_description: str, room_name: str, amount: int = 1, image_prompt: Optional[str] = None, description: Optional[str] = None) -> str:
+def create_standard_item(name: str, category: str, base_description: str = "", room_name: str = "", amount: int = 1, image_prompt: Optional[str] = None, description: Optional[str] = None) -> str:
     """
     アクセサリー、服飾、雑貨、家具、道具などの通常アイテム（非食べ物）を作成して自分のインベントリに追加します。
     ※相手から「プレゼントされたもの」を身につけたり使用する場合は、新しく作成するのではなく list_my_items で既存のアイテムを探して examine_item 等を実行してください。
@@ -367,6 +375,10 @@ def create_standard_item(name: str, category: str, base_description: str, room_n
     image_prompt: (オプション) アイテムの外観画像をAIで生成するための英語の指示文。
     """
     try:
+        if not room_name:
+            return "エラー: ルーム名が必要です。"
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return "エラー: 個数は1以上の整数を指定してください。"
         # エイリアス対応
         actual_description = base_description or description
         if not actual_description:
@@ -379,10 +391,8 @@ def create_standard_item(name: str, category: str, base_description: str, room_n
         api_key_name = config_manager.CONFIG_GLOBAL.get("last_api_key_name") or config_manager.initial_api_key_name_global
         api_key_val = config_manager.GEMINI_API_KEYS.get(api_key_name)
         
-        if not api_key_val:
-             return "エラー: APIキーが設定されていません。"
         
-        prompt_text = f"名前: {name}\nカテゴリ: {category}\n詳細: {base_description}"
+        prompt_text = f"名前: {name}\nカテゴリ: {category}\n詳細: {actual_description}"
         json_data = generate_standard_item_profile(prompt_text, api_key_val)
         
         if not json_data:
@@ -419,8 +429,8 @@ def create_standard_item(name: str, category: str, base_description: str, room_n
 def create_and_gift_item(
     name: str,
     category: str,
-    base_description: str,
-    room_name: str,
+    base_description: str = "",
+    room_name: str = "",
     item_type: str = "food",
     amount: int = 1,
     image_prompt: Optional[str] = None,
@@ -441,6 +451,10 @@ def create_and_gift_item(
     gift_to_user: True なら作成後すぐに相手に贈呈します（デフォルト: True）。
     """
     try:
+        if not room_name:
+            return "エラー: ルーム名が必要です。"
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return "エラー: 個数は1以上の整数を指定してください。"
         # エイリアス対応
         actual_description = base_description or description
         if not actual_description:
@@ -451,8 +465,6 @@ def create_and_gift_item(
         api_key_name = config_manager.CONFIG_GLOBAL.get("last_api_key_name") or config_manager.initial_api_key_name_global
         api_key_val = config_manager.GEMINI_API_KEYS.get(api_key_name)
 
-        if not api_key_val:
-            return "エラー: APIキーが設定されていません。"
 
         prompt_text = f"名前: {name}\nカテゴリ: {category}\n詳細: {actual_description}"
 
@@ -492,7 +504,7 @@ def create_and_gift_item(
 
         # 贈呈処理
         if gift_to_user:
-            transfer_ok = im.transfer_item(item_id, from_user=False)
+            transfer_ok = im.transfer_item(item_id, from_user=False, amount=amount)
             if transfer_ok:
                 try:
                     import utils

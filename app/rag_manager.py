@@ -34,6 +34,25 @@ _local_embedding_cache = weakref.WeakValueDictionary()
 _local_embedding_lock = threading.Lock()
 
 
+def get_local_embedding_model(raw_model_name: str):
+    """RAGと投稿類似判定で同じローカルモデル・キャッシュを共有する。"""
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+
+    aliases = {
+        "multilingual-e5-small": "intfloat/multilingual-e5-small",
+        "multilingual-e5-base": "intfloat/multilingual-e5-base",
+        "multilingual-e5-large": "intfloat/multilingual-e5-large",
+        "paraphrase-multilingual-MiniLM-L12-v2": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    }
+    model_id = aliases.get(raw_model_name, raw_model_name)
+    with _local_embedding_lock:
+        embeddings = _local_embedding_cache.get(model_id)
+        if embeddings is None:
+            embeddings = HuggingFaceEmbeddings(model_name=model_id)
+            _local_embedding_cache[model_id] = embeddings
+    return embeddings
+
+
 def _parse_episodic_date_range(metadata: Dict) -> Optional[Tuple[date, date]]:
     """
     episodic_memory の date メタデータからカバー日付範囲を取り出す。
@@ -583,31 +602,9 @@ class RAGManager:
         
         if self.embedding_mode == "local":
             try:
-                # 非常に重いライブラリをここで初めて呼ぶ
-                from langchain_community.embeddings import HuggingFaceEmbeddings
-                
                 settings = config_manager.get_internal_model_settings()
                 raw_model_name = settings.get("embedding_model", "multilingual-e5-small")
-                
-                # E5などの有名モデルはフルパスにマッピング
-                if raw_model_name == "multilingual-e5-small":
-                    hf_model_id = "intfloat/multilingual-e5-small"
-                elif raw_model_name == "multilingual-e5-base":
-                    hf_model_id = "intfloat/multilingual-e5-base"
-                elif raw_model_name == "multilingual-e5-large":
-                    hf_model_id = "intfloat/multilingual-e5-large"
-                elif raw_model_name == "paraphrase-multilingual-MiniLM-L12-v2":
-                    hf_model_id = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-                else:
-                    hf_model_id = raw_model_name
-                
-                print(f"[RAGManager] ローカルエンベディングモデルをロード中: {hf_model_id}")
-                with _local_embedding_lock:
-                    embeddings = _local_embedding_cache.get(hf_model_id)
-                    if embeddings is None:
-                        embeddings = HuggingFaceEmbeddings(model_name=hf_model_id)
-                        _local_embedding_cache[hf_model_id] = embeddings
-                    self.actual_embeddings[task_type] = embeddings
+                self.actual_embeddings[task_type] = get_local_embedding_model(raw_model_name)
                 print(f"[RAGManager] ローカルエンベディング ({self._get_embedding_model_id()}) を初期化しました")
             except Exception as e:
                 # 警告を強調

@@ -12,16 +12,7 @@ def generate_standard_item_profile(base_info: str, api_key: Optional[str] = None
     ユーザーの短いテキスト（例: "アンティークな懐中時計"）や画像から、
     通常アイテム（非食べ物）の詳細情報をLLMを用いて生成する。
     """
-    if not api_key:
-        import config_manager
-        key_name = config_manager.CONFIG_GLOBAL.get("last_api_key_name") or config_manager.initial_api_key_name_global
-        if key_name:
-            api_key = config_manager.GEMINI_API_KEYS.get(key_name)
-        
-    if not api_key:
-        logger.error("APIキーが設定されていないため、アイテムの自動生成に失敗しました。")
-        return None
-
+    # APIキーの要否と選択は、内部モデル設定を扱う共通ファクトリに委ねる。
     try:
         from llm_factory import LLMFactory
         from langchain_core.messages import HumanMessage
@@ -80,7 +71,7 @@ def generate_standard_item_profile(base_info: str, api_key: Optional[str] = None
         
         # [Phase 4] リトライ・キーローテーション機能を持つ共通メソッドを使用
         response, used_key = LLMFactory.invoke_internal_llm(
-            internal_role="internal_processing",
+            internal_role="processing",
             prompt=messages,
             temperature=0.8,
             api_key=api_key

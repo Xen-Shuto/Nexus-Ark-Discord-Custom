@@ -15979,8 +15979,6 @@ def handle_generate_food_item(name, category, base_info, amount, image_path):
         from src.features._recipe_generator import generate_food_item_profile
         # APIキー取得
         api_key_name = config_manager.CONFIG_GLOBAL.get("last_api_key_name") or config_manager.initial_api_key_name_global
-        if not api_key_name:
-             return [gr.update(value="エラー: Gemini APIキーが設定されていません。", visible=True)] + [gr.update()] * 19
         api_key_val = config_manager.GEMINI_API_KEYS.get(api_key_name)
 
         # プロンプト用のベース情報を作成
